@@ -366,6 +366,7 @@ def run(
         "phase": "repeatability",
         "started_at": p3_start,
     }
+    new_cid = None
     try:
         new_cid = _restart_container(image, container_name, ports, certs_dir, conf_file, config_path)
         print(f"[verifier:{_run_id}] Restarted: {new_cid[:12]} — waiting 5s ...")
@@ -454,3 +455,8 @@ def run(
             "thresholds_config": thresholds_config,
             "notes": f"Phase 3 restart failed: {e}",
         }
+    finally:
+        if new_cid:
+            subprocess.run(["docker", "stop", new_cid], capture_output=True, timeout=30)
+            subprocess.run(["docker", "rm",   new_cid], capture_output=True, timeout=30)
+            print(f"  [builder:{_run_id}] Phase 3 container {new_cid[:12]} removed.")

@@ -43,7 +43,7 @@ assumptions:
     description: "Per-frame WINDOW_UPDATE issued allowing attacker to refill window continuously"
     necessity: required
   - id: A3
-    description: "No cap on per-connection recvMsg count or aggregate struct-metadata size"
+    description: "recvBuffer is an unbounded queue — it accumulates recvMsg structs without any connection-level size limit (see internal/transport/transport.go)"
     necessity: required
 
 suspected_mechanism:

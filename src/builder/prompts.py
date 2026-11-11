@@ -81,11 +81,19 @@ Given a target server product, version, and entry point (protocol + port), gener
   2. The standard `coredns/coredns` Docker image does NOT include the `doh` plugin.
      Do NOT use `doh`. Do NOT use `grpc` as a server listener.
   3. To serve DNS-over-TLS, the zone prefix MUST start with `tls://` — without it
-     CoreDNS ignores the `tls` directive and listens as plain TCP DNS (probe will fail):
+     CoreDNS ignores the `tls` directive and listens as plain TCP DNS (probe will fail).
+  4. Use the built-in `erratic` plugin as the backend INSTEAD of `forward . 8.8.8.8`.
+     `erratic` responds to all queries with NOERROR (no external DNS dependency) and
+     accepts a `delay` parameter to hold each query goroutine for a fixed duration.
+     This makes tests reliable in isolated environments and deterministic under load.
+     Use `erratic { delay 5s }` for goroutine/memory accumulation attacks.
+     Use `erratic` (no delay) for latency or connection-count attacks.
   ```
   tls://.:443 {
       tls /certs/server.crt /certs/server.key
-      forward . 8.8.8.8 8.8.4.4
+      erratic {
+          delay 5s
+      }
       log
       errors
   }

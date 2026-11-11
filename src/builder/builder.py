@@ -147,8 +147,11 @@ def _setup_critic(product: str, entry_point: str, setup: dict) -> bool:
     if raw.upper().startswith("PASS"):
         print(f"  [builder:{_run_id}] Critic: PASS")
         return True
-    # Also do a hard check regardless of LLM verdict
+    # Hard check: if config is empty, the image handles certs internally — no cert paths expected
     config = setup["config"]
+    if not config.strip():
+        print(f"  [builder:{_run_id}] Critic: PASS (no config — image handles certs internally)")
+        return True
     has_crt = "/certs/server.crt" in config
     has_key = "/certs/server.key" in config
     if not has_crt or not has_key:

@@ -16,6 +16,13 @@ For each SpecRequirement:
 For each Assumption:
 - Read the relevant code and determine: confirmed | refuted | unclear
 - Cite verbatim code snippets and file:line references
+- VERDICT SEMANTICS for absence/unbounded assumptions:
+  * If the assumption states something IS present (e.g., "recvBuffer is unbounded"):
+    "confirmed" = you found code proving it; "refuted" = code has a cap/limit
+  * If the assumption states something IS ABSENT (e.g., "no rate limit", "no cap"):
+    "confirmed" = you verified the absence (no such check exists); "refuted" = you found such a check
+  * Finding a comment or symbol name that says "unbounded" or "no limit" CONFIRMS an absence assumption
+    — it does NOT refute it
 
 CRITICAL EVIDENCE RULES:
 - A ComplianceGap requires the CALL SITE where enforcement should occur, not just the absence of a constant
