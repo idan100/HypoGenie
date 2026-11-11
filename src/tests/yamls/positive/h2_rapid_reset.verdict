@@ -4,7 +4,7 @@ CVE: CVE-2023-44487
 ATTACK: Rapid HEADERS+RST_STREAM cycles exhaust server goroutine/handler pool
 DOS_CLASS: resource_exhaustion
 
-TARGET_IMAGE: caddy:2.7.6
+TARGET_IMAGE: caddy:2.7.4
 TARGET_PORT: 443/tcp
 TLS: self-signed (infra/certs/)
 CLIENT_TOOL: h2
@@ -14,7 +14,9 @@ FINDING_TYPE: SecurityDesignGap
 PROOF_METHOD: metric
 PROOF_METRIC: cpu_pct
 PROOF_THRESHOLD: +50pp for 5s
-PROOF_NOTES: Manually verified by sending 10,000 HEADERS+RST_STREAM cycles to golang/net v0.17.0
-             HTTP/2 server over 30s. CPU went from ~2% to ~95%, goroutine count grew without
-             bound. Server stopped responding to probe requests after ~15s. Fixed in v0.17.1
-             via per-connection RST_STREAM rate limit (100/s).
+PROOF_NOTES: PENDING — no live exploit run against caddy:2.7.4 / golang/net v0.14.0 has been
+             performed. The CPU and goroutine measurements previously cited were taken against a
+             patched image (caddy:2.7.5 / golang/net v0.17.0) and cannot be attributed to the
+             vulnerable target. Run the pipeline against caddy:2.7.4 to obtain actual measurements.
+             Expected: CPU spike ≥50pp, goroutine growth, unreachability within 30s. Fixed in
+             golang/net v0.17.0 via per-connection RST_STREAM rate limit (100/s).

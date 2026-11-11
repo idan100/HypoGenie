@@ -7,10 +7,11 @@ hypothesis:
     concurrent-streams reset limit.
 
     This hypothesis attempts the same HEADERS+RST_STREAM rapid-reset attack
-    against nginx 1.25.3, which applies the patch. The patched version limits
-    the number of streams that can be reset per connection per second via the
-    http2_max_requests and stream_reset_timeout directives (default: 100 resets
-    per connection). The attack should NOT trigger DoS on the patched version.
+    against nginx 1.25.3, which applies the patch. The patched version tracks
+    an internal stream-reset counter per connection inside ngx_http_v2_module.c.
+    When the counter exceeds the hard-coded limit (default: 200 resets), nginx
+    sends GOAWAY and closes the connection. The attack should NOT trigger DoS
+    on the patched version.
 
     Assumptions:
     - A1: nginx 1.25.3 has NOT applied the RST_STREAM rate-limit patch.

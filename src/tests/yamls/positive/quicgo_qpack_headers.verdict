@@ -4,7 +4,7 @@ CVE: CVE-2025-64702
 ATTACK: QPACK-compressed HEADERS with 15x wire-to-heap amplification bypasses MaxHeaderBytes
 DOS_CLASS: memory
 
-TARGET_IMAGE: caddy:2.7.6
+TARGET_IMAGE: hypogenie/http3-server:v0.56.0
 TARGET_PORT: 443/udp
 TLS: self-signed (infra/certs/)
 CLIENT_TOOL: aioquic
@@ -14,9 +14,10 @@ FINDING_TYPE: ComplianceGap
 PROOF_METHOD: metric
 PROOF_METRIC: mem_mb
 PROOF_THRESHOLD: +100 MB RSS
-PROOF_NOTES: Verified against quic-go v0.56.0 HTTP/3 server. Sent 500 concurrent HTTP/3
-             streams each with 4 KB QPACK-compressed headers decompressing to ~60 KB.
-             MaxHeaderBytes=16384 (wire) was satisfied but decoded heap allocations reached
-             30 GB/s. Server OOM-killed after 8 seconds. The enforcement gap is in
-             http3/server.go readRequestHeader(). Fixed in v0.57.0 by rechecking decoded
-             size. Post-cutoff.
+PROOF_NOTES: PENDING — previous measurements were obtained against caddy:2.7.6, which ships
+             quic-go v0.40.0, not v0.56.0. The vulnerable behavior (decoded-size check absent)
+             differs between versions and those measurements cannot be attributed to the
+             correct target. A dedicated HTTP/3 fixture (infra/http3-server/) with quic-go
+             v0.56.0 is required. Run the pipeline against hypogenie/http3-server:v0.56.0
+             to obtain actual measurements. The enforcement gap is in http3/server.go
+             readRequestHeader(). Fixed in v0.57.0. Post-cutoff.

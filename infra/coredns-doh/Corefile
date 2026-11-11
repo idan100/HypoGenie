@@ -1,0 +1,17 @@
+.:53 {
+    bind 0.0.0.0
+    log
+    errors
+    forward . 8.8.8.8 8.8.4.4
+    cache
+}
+
+.:443 {
+    bind 0.0.0.0
+    log
+    errors
+    tls /certs/server.crt /certs/server.key
+    doh
+    forward . 8.8.8.8 8.8.4.4
+    cache
+}

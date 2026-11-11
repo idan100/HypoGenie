@@ -33,7 +33,7 @@ target:
   version: v1.68.1
   protocol: HTTP/2
   entry_point: "TCP port 443, gRPC over HTTP/2 over TLS"
-  docker_image: "nginx:1.25.3"
+  docker_image: "hypogenie/grpcgo-server:v1.68.1"
 
 assumptions:
   - id: A1

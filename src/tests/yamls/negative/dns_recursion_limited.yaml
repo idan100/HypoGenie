@@ -40,13 +40,15 @@ assumptions:
     description: "1,000 concurrent deep CNAME queries exhaust goroutine pool"
     necessity: favorable
 
+static_analysis_only: true
+
 suspected_mechanism:
   - step: 1
-    action: "Craft DNS response with CNAME chain of depth 100"
+    action: "Requires a mock authoritative DNS server returning CNAME chains of depth 100 — not available in isolated Docker environment"
   - step: 2
-    action: "CoreDNS depth guard triggers at hop 10 — returns SERVFAIL"
+    action: "CoreDNS depth guard (statically verified in codebase) triggers at hop 10 — returns SERVFAIL"
   - step: 3
-    action: "No resource accumulation; goroutines released immediately"
+    action: "No resource accumulation; goroutines released immediately — static INFEASIBLE expected"
 
 rfc_sections:
   - rfc: RFC 1034

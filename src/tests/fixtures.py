@@ -73,7 +73,7 @@ quic_spec_reqs = [
     ),
 ]
 
-# ── Phase 2 output: verdicts + findings from Gap Finder on golang/net v0.17.0 ─
+# ── Phase 2 output: verdicts + findings from Gap Finder on golang/net v0.14.0 ─
 quic_verdicts = [
     AssumptionVerdict(
         assumption_id="A1",

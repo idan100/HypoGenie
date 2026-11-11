@@ -4,10 +4,11 @@ hypothesis:
     concurrency. The HTTP/2 Rapid Reset mechanism relies on a server granting
     new stream credit faster than it reclaims resources from reset streams.
 
-    Caddy v2.8.4 applies a per-connection stream-reset rate limit introduced
-    after CVE-2023-44487 disclosures. The fix adds a configurable maximum number
-    of stream resets per second per connection (default: 200/s). Exceeding this
-    limit causes Caddy to send GOAWAY and close the connection.
+    Caddy v2.8.4 applies a per-connection QUIC RESET_STREAM rate limit (RFC 9000
+    §19.4) introduced after CVE-2023-44487 disclosures. The fix tracks inbound
+    RESET_STREAM frames per connection (distinct from HTTP/2 RST_STREAM) and
+    applies a configurable maximum (default: 200/s). Exceeding this limit causes
+    Caddy to send GOAWAY and close the connection.
 
     This hypothesis tests the same QUIC/HTTP/3 rapid-reset mechanism against the
     patched version. All three required assumptions are expected to be refuted by

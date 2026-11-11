@@ -34,7 +34,7 @@ target:
   version: v0.56.0
   protocol: QUIC
   entry_point: "UDP port 443, HTTP/3 over QUIC"
-  docker_image: "caddy:2.7.6"
+  docker_image: "hypogenie/http3-server:v0.56.0"
 
 assumptions:
   - id: A1
@@ -62,8 +62,8 @@ rfc_sections:
     section: "4.2.2"
     dos_relevance: "MUST NOT allow peer to cause excessive memory allocation for field sections"
   - rfc: RFC 9204
-    section: "3.2"
-    dos_relevance: "QPACK static table compression ratios and decoder memory usage"
+    section: "7"
+    dos_relevance: "QPACK Security Considerations — decoder MUST limit memory for dynamic table and decoded field sections"
 
 related_work:
   - type: cve

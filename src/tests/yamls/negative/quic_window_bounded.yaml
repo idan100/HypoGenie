@@ -5,10 +5,10 @@ hypothesis:
     and then stop consuming data, forcing the sender to buffer unbounded data while
     waiting for window credit.
 
-    quic-go v0.45.0 introduced a maximum send-buffer cap that is enforced regardless
+    quic-go v0.44.0 introduced a maximum send-buffer cap that is enforced regardless
     of the peer-advertised window size. The cap prevents the sender from buffering
     more than 10 MB per connection even if the receiver advertises a 1 GB window.
-    This defense is present in quic-go v0.45.0 and later.
+    This defense is present in quic-go v0.44.0 and later.
 
     Assumptions:
     - A1: quic-go buffers outgoing data up to the peer-advertised window
@@ -21,7 +21,7 @@ hypothesis:
 
 target:
   repo: https://github.com/quic-go/quic-go
-  version: v0.45.0
+  version: v0.44.0
   protocol: QUIC
   entry_point: "UDP port 443, HTTP/3 over QUIC"
   docker_image: "caddy:2.8.4"
