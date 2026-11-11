@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from statistics import mean
 from typing import Callable
 
@@ -40,47 +41,91 @@ def _safe_mean(lst):
     return mean(vals) if vals else 0.0
 
 
-def _check_thresholds(baseline: dict, attack: dict) -> list[str]:
-    """Return list of triggered threshold names."""
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _check_thresholds(baseline: dict, attack: dict) -> tuple[list[str], dict]:
+    """
+    Return (triggered_list, details_dict).
+    details_dict has per-threshold numeric values for the verdict report.
+    """
     triggered = []
+    details: dict = {}
 
     baseline_cpu  = _safe_mean(baseline["cpu_pct"])
     baseline_mem  = _safe_mean(baseline["mem_mb"])
     baseline_lat  = _safe_mean(baseline["latency_ms"]) or 1.0
 
     # CPU: delta >= 50pp for >= 5 consecutive seconds
+    max_consec_cpu = 0
     consec = 0
+    attack_cpu_mean = _safe_mean(attack["cpu_pct"])
     for c in attack["cpu_pct"]:
         if c - baseline_cpu >= _CPU_DELTA_PP:
             consec += 1
+            max_consec_cpu = max(max_consec_cpu, consec)
             if consec >= _CPU_SUSTAIN_S:
                 triggered.append("cpu")
                 break
         else:
             consec = 0
+    details["cpu"] = {
+        "baseline_mean_pct": round(baseline_cpu, 2),
+        "attack_mean_pct":   round(attack_cpu_mean, 2),
+        "delta_pp":          round(attack_cpu_mean - baseline_cpu, 2),
+        "threshold_delta_pp": _CPU_DELTA_PP,
+        "max_consecutive_above_threshold_s": max_consec_cpu,
+        "sustain_required_s": _CPU_SUSTAIN_S,
+        "triggered": "cpu" in triggered,
+    }
 
     # Memory: peak - baseline_mean >= 100 MB
-    if attack["mem_mb"]:
-        if max(attack["mem_mb"]) - baseline_mem >= _MEM_DELTA_MB:
-            triggered.append("memory")
+    attack_mem_peak = max(attack["mem_mb"]) if attack["mem_mb"] else 0.0
+    mem_delta = attack_mem_peak - baseline_mem
+    if mem_delta >= _MEM_DELTA_MB:
+        triggered.append("memory")
+    details["memory"] = {
+        "baseline_mean_mb": round(baseline_mem, 2),
+        "attack_peak_mb":   round(attack_mem_peak, 2),
+        "delta_mb":         round(mem_delta, 2),
+        "threshold_delta_mb": _MEM_DELTA_MB,
+        "triggered": "memory" in triggered,
+    }
 
     # Latency: attack_mean >= 5× baseline_mean
     lat_vals = [v for v in attack["latency_ms"] if v is not None]
-    if lat_vals and _safe_mean(lat_vals) >= _LAT_RATIO * baseline_lat:
+    attack_lat_mean = _safe_mean(lat_vals)
+    lat_ratio = attack_lat_mean / baseline_lat if baseline_lat else 0.0
+    if lat_vals and lat_ratio >= _LAT_RATIO:
         triggered.append("latency")
+    details["latency"] = {
+        "baseline_mean_ms": round(baseline_lat, 2),
+        "attack_mean_ms":   round(attack_lat_mean, 2),
+        "ratio":            round(lat_ratio, 2),
+        "threshold_ratio":  _LAT_RATIO,
+        "triggered": "latency" in triggered,
+    }
 
     # Unreachable: alive=False for >= 3 consecutive samples
+    max_consec_unreach = 0
     consec = 0
     for a in attack["alive"]:
         if not a:
             consec += 1
+            max_consec_unreach = max(max_consec_unreach, consec)
             if consec >= _UNREACHABLE_S:
                 triggered.append("unreachable")
                 break
         else:
             consec = 0
+    details["unreachable"] = {
+        "max_consecutive_down_s": max_consec_unreach,
+        "threshold_s":            _UNREACHABLE_S,
+        "triggered": "unreachable" in triggered,
+    }
 
-    return triggered
+    return triggered, details
 
 
 def _check_attribution(baseline: dict, attack: dict, attack_start_idx: int) -> bool:
@@ -189,31 +234,58 @@ def run(
     Returns dict with: verdict, baseline, attack, attack2, triggered, notes
     """
     tls = port in (443, 8443)
+    phases: list[dict] = []
+    thresholds_config = {
+        "cpu_delta_pp":    _CPU_DELTA_PP,
+        "cpu_sustain_s":   _CPU_SUSTAIN_S,
+        "mem_delta_mb":    _MEM_DELTA_MB,
+        "latency_ratio":   _LAT_RATIO,
+        "unreachable_s":   _UNREACHABLE_S,
+    }
 
     # ── Phase 1: Baseline ──────────────────────────────────────────────────────
+    p1_start = _now_iso()
     print(f"[verifier:{_run_id}] Phase 1 — Baseline ({baseline_duration_s}s) ...")
     collector = MetricsCollector(container_id, host, port, probe_tls=tls)
     collector.start()
     time.sleep(baseline_duration_s)
     collector.stop()
     baseline = collector.snapshot()
+    p1_end = _now_iso()
 
-    if not _baseline_healthy(baseline):
+    healthy = _baseline_healthy(baseline)
+    p1_phase = {
+        "phase": "baseline",
+        "started_at": p1_start,
+        "ended_at":   p1_end,
+        "duration_s": baseline_duration_s,
+        "healthy":    healthy,
+        "cpu_mean_pct":     round(_safe_mean(baseline["cpu_pct"]), 2),
+        "mem_mean_mb":      round(_safe_mean(baseline["mem_mb"]), 2),
+        "latency_mean_ms":  round(_safe_mean(baseline["latency_ms"]), 2),
+        "all_alive":        all(baseline["alive"]) if baseline["alive"] else False,
+        "sample_count":     len(baseline["cpu_pct"]),
+        "outcome": "healthy" if healthy else "unhealthy",
+    }
+    phases.append(p1_phase)
+
+    if not healthy:
         print(f"[verifier:{_run_id}] Baseline unhealthy — ENVIRONMENT_ERROR")
         return {
             "verdict": Verdict.ENVIRONMENT_ERROR,
-            "baseline": baseline,
-            "attack": {},
-            "attack2": {},
-            "triggered": [],
+            "baseline": baseline, "attack": {}, "attack2": {},
+            "triggered": [], "phases": phases,
+            "thresholds_config": thresholds_config,
             "notes": "Baseline unhealthy: server not responding or already under load",
         }
-    print(f"[verifier:{_run_id}] Baseline OK — cpu={_safe_mean(baseline['cpu_pct']):.1f}% "
-          f"lat={_safe_mean(baseline['latency_ms']):.0f}ms")
+    print(f"[verifier:{_run_id}] Baseline OK — cpu={p1_phase['cpu_mean_pct']}% "
+          f"lat={p1_phase['latency_mean_ms']}ms")
 
     # ── Phase 2: Attack + Attribution ─────────────────────────────────────────
+    p2_start = _now_iso()
     print(f"[verifier:{_run_id}] Phase 2 — Attack ({attack_duration_s}s) ...")
     attack_metrics = exploit_fn(plan, container_id, host, port, attack_duration_s)
+    p2_end = _now_iso()
 
     crash = _container_exited(container_id)
     if crash:
@@ -221,26 +293,50 @@ def run(
         print(f"[verifier:{_run_id}] Container crashed → crash threshold triggered")
         attack_metrics["_crash"] = True
 
-    triggered = _check_thresholds(baseline, attack_metrics)
+    triggered, details = _check_thresholds(baseline, attack_metrics)
     if crash:
         triggered.append("crash")
+        details["crash"] = {"triggered": True, "note": "container exited unexpectedly"}
 
     attributed = _check_attribution(baseline, attack_metrics, attack_start_idx=0)
-
     print(f"[verifier:{_run_id}] Phase 2 triggered={triggered} attributed={attributed}")
+
+    p2_phase = {
+        "phase": "attack",
+        "started_at": p2_start,
+        "ended_at":   p2_end,
+        "duration_s": attack_duration_s,
+        "sample_count": len(attack_metrics.get("cpu_pct", [])),
+        "triggered": triggered,
+        "attributed": attributed,
+        "threshold_details": details,
+        "escalated": False,
+    }
 
     if not triggered or not attributed:
         # Escalate once at higher intensity
+        p2_esc_start = _now_iso()
         print(f"[verifier:{_run_id}] No threshold crossed — escalating intensity ...")
         attack_metrics2 = exploit_fn(plan, container_id, host, port, attack_duration_s * 2)
+        p2_esc_end = _now_iso()
         crash2 = _container_exited(container_id)
         if crash2:
             attack_metrics2["_crash"] = True
-            triggered = list(set(triggered) | {"crash"})
-        triggered2 = _check_thresholds(baseline, attack_metrics2)
+        triggered2, details2 = _check_thresholds(baseline, attack_metrics2)
         if crash2:
             triggered2.append("crash")
+            details2["crash"] = {"triggered": True, "note": "container exited unexpectedly"}
         attributed2 = _check_attribution(baseline, attack_metrics2, 0)
+
+        p2_phase["escalated"] = True
+        p2_phase["escalated_started_at"] = p2_esc_start
+        p2_phase["escalated_ended_at"]   = p2_esc_end
+        p2_phase["escalated_duration_s"] = attack_duration_s * 2
+        p2_phase["escalated_triggered"]  = triggered2
+        p2_phase["escalated_attributed"] = attributed2
+        p2_phase["escalated_threshold_details"] = details2
+        phases.append(p2_phase)
+
         if not triggered2 or not attributed2:
             return {
                 "verdict": Verdict.NO_DOS_EFFECT,
@@ -248,14 +344,23 @@ def run(
                 "attack": attack_metrics,
                 "attack2": attack_metrics2,
                 "triggered": [],
+                "phases": phases,
+                "thresholds_config": thresholds_config,
                 "notes": "No threshold crossed even at escalated intensity",
             }
         triggered = triggered2
         attributed = attributed2
         attack_metrics = attack_metrics2
+    else:
+        phases.append(p2_phase)
 
     # ── Phase 3: Repeatability ─────────────────────────────────────────────────
+    p3_start = _now_iso()
     print(f"[verifier:{_run_id}] Phase 3 — Repeatability (cold restart) ...")
+    p3_phase: dict = {
+        "phase": "repeatability",
+        "started_at": p3_start,
+    }
     try:
         new_cid = _restart_container(image, container_name, ports, certs_dir, conf_file, config_path)
         print(f"[verifier:{_run_id}] Restarted: {new_cid[:12]} — waiting 5s ...")
@@ -267,14 +372,22 @@ def run(
         time.sleep(baseline_duration_s)
         col2.stop()
         baseline2 = col2.snapshot()
+        healthy2 = _baseline_healthy(baseline2)
 
-        if not _baseline_healthy(baseline2):
+        p3_phase["baseline_healthy"] = healthy2
+        p3_phase["baseline_cpu_mean_pct"] = round(_safe_mean(baseline2["cpu_pct"]), 2)
+        p3_phase["baseline_lat_mean_ms"]  = round(_safe_mean(baseline2["latency_ms"]), 2)
+
+        if not healthy2:
+            p3_phase["ended_at"] = _now_iso()
+            p3_phase["outcome"] = "baseline_unhealthy"
+            phases.append(p3_phase)
             return {
                 "verdict": Verdict.INCONCLUSIVE,
-                "baseline": baseline,
-                "attack": attack_metrics,
-                "attack2": {},
+                "baseline": baseline, "attack": attack_metrics, "attack2": {},
                 "triggered": triggered,
+                "phases": phases,
+                "thresholds_config": thresholds_config,
                 "notes": "Phase 3 restart produced unhealthy baseline — cannot confirm repeatability",
             }
 
@@ -282,38 +395,57 @@ def run(
         crash3 = _container_exited(new_cid)
         if crash3:
             attack2["_crash"] = True
-        triggered3 = _check_thresholds(baseline2, attack2)
+        triggered3, details3 = _check_thresholds(baseline2, attack2)
         if crash3:
             triggered3.append("crash")
+            details3["crash"] = {"triggered": True, "note": "container exited unexpectedly"}
         attributed3 = _check_attribution(baseline2, attack2, 0)
 
+        p3_phase["ended_at"]          = _now_iso()
+        p3_phase["triggered"]         = triggered3
+        p3_phase["attributed"]        = attributed3
+        p3_phase["threshold_details"] = details3
+        p3_phase["sample_count"]      = len(attack2.get("cpu_pct", []))
         print(f"[verifier:{_run_id}] Phase 3 triggered={triggered3} attributed={attributed3}")
 
         if triggered3 and attributed3:
+            p3_phase["outcome"] = "confirmed"
+            phases.append(p3_phase)
             return {
                 "verdict": Verdict.CONFIRMED_DOS,
                 "baseline": baseline,
                 "attack": attack_metrics,
                 "attack2": attack2,
                 "triggered": triggered3,
+                "phases": phases,
+                "thresholds_config": thresholds_config,
                 "notes": f"Confirmed on both Phase 2 and Phase 3 runs. Triggered: {triggered3}",
             }
         else:
+            p3_phase["outcome"] = "not_confirmed"
+            phases.append(p3_phase)
             return {
                 "verdict": Verdict.INCONCLUSIVE,
                 "baseline": baseline,
                 "attack": attack_metrics,
                 "attack2": attack2,
                 "triggered": triggered,
+                "phases": phases,
+                "thresholds_config": thresholds_config,
                 "notes": "Phase 2 threshold crossed but Phase 3 did not confirm",
             }
     except Exception as e:
         print(f"[verifier:{_run_id}] Phase 3 restart failed: {e}")
+        p3_phase["ended_at"] = _now_iso()
+        p3_phase["outcome"] = f"error: {e}"
+        phases.append(p3_phase)
         return {
             "verdict": Verdict.INCONCLUSIVE,
             "baseline": baseline,
             "attack": attack_metrics,
             "attack2": {},
             "triggered": triggered,
+            "phases": phases,
+            "thresholds_config": thresholds_config,
             "notes": f"Phase 3 restart failed: {e}",
         }

@@ -30,6 +30,7 @@ from exploit_planner.exploit_planner import run as plan_run
 from builder.builder import build, teardown
 from exploiter.exploiter import run as exploit_run
 from verifier.verifier import run as verify_run, Verdict
+import llm_client as _llm
 
 _PROJECT_ROOT = Path(__file__).parent
 _OUTPUT_DIR   = _PROJECT_ROOT / "output"
@@ -137,38 +138,161 @@ as recommended by the relevant RFC security considerations section.
     print(f"  [hypogenie:{run_id}] Disclosure draft written.")
 
 
-def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict, token_log: dict) -> None:
+def _serialize_finding(f) -> dict:
+    """Convert a Gap Finder finding dataclass to a JSON-serialisable dict."""
+    req = f.requirement
+    req_dict = {
+        "rfc": req.rfc, "section": req.section,
+        "classification": req.classification,
+        "requirement_text": req.requirement_text,
+        "dos_mechanism": req.dos_mechanism,
+    }
+    base = {
+        "type": type(f).__name__,
+        "requirement": req_dict,
+        "code_location": f.code_location,
+        "code_snippet": f.code_snippet,
+    }
+    if hasattr(f, "gap_description"):
+        base["gap_description"] = f.gap_description
+    if hasattr(f, "invariant_description"):
+        base["invariant_description"] = f.invariant_description
+    return base
+
+
+def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
+                   verdicts: list, findings: list) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # verdict.json
-    verdict_data = {
-        "run_id": run_id,
-        "verdict": verify_result["verdict"],
-        "triggered": verify_result.get("triggered", []),
-        "notes": verify_result.get("notes", ""),
-        "target": f"{ctx.repo_url}@{ctx.version}",
-        "protocol": ctx.protocol,
-        "dos_class": ctx.dos_class,
-    }
-    (out_dir / "verdict.json").write_text(json.dumps(verdict_data, indent=2))
+    # Collect token usage from llm_client accumulator
+    token_log = _llm.get_token_log()
+    token_log["run_id"] = run_id
 
-    # metrics.json
-    metrics_data = {
-        "baseline": verify_result.get("baseline", {}),
-        "attack":   verify_result.get("attack",   {}),
-        "attack2":  verify_result.get("attack2",  {}),
-    }
-    # Convert None values for JSON serialisation
     def _clean(d):
         if isinstance(d, dict):
             return {k: _clean(v) for k, v in d.items()}
         if isinstance(d, list):
             return [_clean(v) for v in d]
-        return d if d is not None else "null"
+        return d if d is not None else None
+
+    # ── verdict.json ──────────────────────────────────────────────────────────
+    # Assumption verdicts from Gap Finder
+    assumption_verdicts = [
+        {
+            "assumption_id":  v.assumption_id,
+            "status":         v.status,
+            "reasoning":      v.reasoning,
+            "code_evidence":  v.code_evidence,
+        }
+        for v in (verdicts or [])
+    ]
+
+    # Gap Finder findings
+    finding_list = [_serialize_finding(f) for f in (findings or [])]
+
+    # Exploit plan steps
+    plan_steps = []
+    if plan:
+        plan_steps = [
+            {
+                "step":                      s.n,
+                "action":                    s.action,
+                "frame":                     s.quic_frame,
+                "expected_server_response":  s.expected_server_response,
+                "rationale":                 s.rationale,
+            }
+            for s in plan.attack_sequence
+        ]
+
+    # Conclusion: how we got to the verdict
+    phases = verify_result.get("phases", [])
+    triggered = verify_result.get("triggered", [])
+    notes = verify_result.get("notes", "")
+
+    reasoning_parts = []
+    for ph in phases:
+        pname = ph.get("phase", "?")
+        if pname == "baseline":
+            status = ph.get("outcome", "?")
+            reasoning_parts.append(
+                f"Phase 1 (baseline, {ph.get('duration_s')}s): {status} — "
+                f"cpu={ph.get('cpu_mean_pct')}%, "
+                f"lat={ph.get('latency_mean_ms')}ms, "
+                f"all_alive={ph.get('all_alive')}"
+            )
+        elif pname == "attack":
+            esc = ph.get("escalated", False)
+            trig = ph.get("escalated_triggered", ph.get("triggered", []))
+            attr = ph.get("escalated_attributed", ph.get("attributed"))
+            reasoning_parts.append(
+                f"Phase 2 (attack{' escalated' if esc else ''}, "
+                f"{ph.get('escalated_duration_s', ph.get('duration_s'))}s): "
+                f"triggered={trig}, attributed={attr}"
+            )
+        elif pname == "repeatability":
+            outcome = ph.get("outcome", "?")
+            reasoning_parts.append(
+                f"Phase 3 (repeatability): {outcome}, "
+                f"triggered={ph.get('triggered', [])}, "
+                f"attributed={ph.get('attributed')}"
+            )
+    conclusion_text = "; ".join(reasoning_parts) + f". Final notes: {notes}"
+
+    verdict_data = {
+        "run_id":    run_id,
+        "verdict":   verify_result["verdict"],
+        "triggered": triggered,
+        "notes":     notes,
+
+        # target
+        "target":    f"{ctx.repo_url}@{ctx.version}" if ctx else "unknown",
+        "protocol":  ctx.protocol if ctx else "unknown",
+        "dos_class": ctx.dos_class if ctx else "unknown",
+
+        # run config
+        "config": {
+            "model":     _llm.get_model(_llm.get_provider()),
+            "provider":  _llm.get_provider(),
+        },
+
+        # conclusion
+        "conclusion": {
+            "verdict":   verify_result["verdict"],
+            "reasoning": conclusion_text,
+            "phases_run": [ph.get("phase") for ph in phases],
+        },
+
+        # lab tests
+        "lab_tests": phases,
+        "thresholds_config": verify_result.get("thresholds_config", {}),
+
+        # static analysis
+        "assumption_verdicts": assumption_verdicts,
+        "gap_finder_findings": finding_list,
+
+        # exploit plan
+        "exploit_plan": {
+            "finding_type":         plan.finding_type if plan else None,
+            "finding_ref":          plan.finding_ref if plan else None,
+            "severity":             plan.severity if plan else None,
+            "expected_effect":      plan.expected_effect if plan else None,
+            "assumptions_relied_on": plan.assumptions_relied_on if plan else [],
+            "pivot_note":           plan.pivot_note if plan else None,
+            "attack_steps":         plan_steps,
+        } if plan else None,
+    }
+    (out_dir / "verdict.json").write_text(json.dumps(_clean(verdict_data), indent=2))
+
+    # ── metrics.json ──────────────────────────────────────────────────────────
+    metrics_data = {
+        "baseline": verify_result.get("baseline", {}),
+        "attack":   verify_result.get("attack",   {}),
+        "attack2":  verify_result.get("attack2",  {}),
+    }
     (out_dir / "metrics.json").write_text(json.dumps(_clean(metrics_data), indent=2))
 
-    # token_usage.json
-    (out_dir / "token_usage.json").write_text(json.dumps(token_log, indent=2))
+    # ── token_usage.json ──────────────────────────────────────────────────────
+    (out_dir / "token_usage.json").write_text(json.dumps(_clean(token_log), indent=2))
 
     if verify_result["verdict"] == Verdict.CONFIRMED_DOS:
         _write_disclosure_draft(out_dir, ctx, plan, verify_result)
@@ -191,8 +315,10 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
     print(f"[hypogenie:{_id}] Starting run: {yaml_path}")
     print(f"{'='*60}\n")
 
-    token_log: dict[str, int] = {}
+    _llm.reset_token_log()
     container_info: dict = {}
+    verdicts: list = []
+    findings: list = []
 
     try:
         # ── 1. YAML Parser ─────────────────────────────────────────────────────
@@ -209,13 +335,11 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         print(f"[hypogenie:{_id}] [3/7] Spec Processor ...")
         spec_reqs = spec_run(ctx)
         print(f"  extracted {len(spec_reqs)} spec requirements")
-        token_log["spec_processor"] = len(spec_reqs)
 
         # ── 4. Gap Finder ──────────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [4/7] Gap Finder ...")
         verdicts, findings = gap_run(ctx, spec_reqs, repo_dir)
         print(f"  verdicts={len(verdicts)} findings={len(findings)}")
-        token_log["gap_finder_findings"] = len(findings)
 
         # Assumption gate: if all required assumptions refuted → INFEASIBLE
         required_refuted = [
@@ -226,8 +350,9 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         if required_refuted and not findings:
             print(f"[hypogenie:{_id}] All required assumptions refuted and no findings → INFEASIBLE")
             result = {"verdict": Verdict.INFEASIBLE, "baseline": {}, "attack": {},
-                      "attack2": {}, "triggered": [], "notes": f"Refuted: {required_refuted}"}
-            _write_outputs(out_dir, ctx, None, result, token_log)
+                      "attack2": {}, "triggered": [], "phases": [], "thresholds_config": {},
+                      "notes": f"Refuted: {required_refuted}"}
+            _write_outputs(out_dir, ctx, None, result, verdicts, findings)
             return result
 
         # ── 5. Exploit Planner ─────────────────────────────────────────────────
@@ -240,7 +365,9 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         product = _product_from_repo(ctx.repo_url)
         container_info = build(
             product, ctx.version, ctx.entry_point,
-            docker_image=ctx.docker_image
+            docker_image=ctx.docker_image,
+            protocol=ctx.protocol,
+            repo_url=ctx.repo_url,
         )
         container_id   = container_info["container_id"]
         port           = _port_from_entry_point(ctx.entry_point)
@@ -271,7 +398,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         verdict = verify_result["verdict"]
         print(f"\n[hypogenie:{_id}] *** VERDICT: {verdict} ***\n")
 
-        _write_outputs(out_dir, ctx, plan, verify_result, token_log)
+        _write_outputs(out_dir, ctx, plan, verify_result, verdicts, findings)
         return verify_result
 
     except Exception as e:
@@ -279,10 +406,11 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         print(f"[hypogenie:{_id}] ERROR: {e}")
         traceback.print_exc()
         result = {"verdict": Verdict.ENVIRONMENT_ERROR, "baseline": {}, "attack": {},
-                  "attack2": {}, "triggered": [], "notes": str(e)}
+                  "attack2": {}, "triggered": [], "phases": [], "thresholds_config": {},
+                  "notes": str(e)}
         try:
             _write_outputs(out_dir, ctx if 'ctx' in dir() else None,
-                           plan if 'plan' in dir() else None, result, token_log)
+                           plan if 'plan' in dir() else None, result, verdicts, findings)
         except Exception:
             pass
         return result

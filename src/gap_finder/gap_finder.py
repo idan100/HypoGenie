@@ -124,6 +124,12 @@ def _llm_with_tools(system: str, user: str, repo_root: str) -> str:
         )
         msg = resp.choices[0].message
 
+        if resp.usage:
+            _llm.track_usage(
+                "GAP_FINDER_MODEL", provider, model,
+                resp.usage.prompt_tokens, resp.usage.completion_tokens,
+            )
+
         if msg.tool_calls:
             messages.append(msg)
             for tc in msg.tool_calls:
