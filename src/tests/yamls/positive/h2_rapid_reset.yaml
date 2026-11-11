@@ -30,8 +30,8 @@ hypothesis:
 
 target:
   repo: https://github.com/golang/net
-  version: v0.16.0
-  docker_image: "caddy:2.7.5"
+  version: v0.14.0
+  docker_image: "caddy:2.7.4"
   protocol: HTTP/2
   entry_point: "TCP port 443, HTTP/2 over TLS"
 
