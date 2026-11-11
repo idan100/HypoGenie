@@ -11,8 +11,13 @@ hypothesis:
 
     This is not a compliance violation: RFC 7540 permits arbitrary DATA
     fragmentation and gRPC's per-frame allocation is not mandated by the spec.
-    The required invariant (a per-connection cap on recvMsg count or on
-    struct-metadata overhead) was simply never implemented.
+    The required invariant (a per-connection cap on concurrent stream count or
+    on total handler goroutines) was simply never implemented.
+
+    The practical exploit opens 200 concurrent streams per connection. Each
+    stream spawns a handler goroutine. With 10 connections × 200 streams = 2000
+    handler goroutines simultaneously processing 1-byte DATA frames, the Go
+    scheduler is saturated — CPU spikes and service latency degrades.
 
     Assumptions:
     - A1: gRPC-Go allocates one recvMsg struct per inbound DATA frame in recvBuffer.
@@ -26,7 +31,7 @@ hypothesis:
     4. Server issues WINDOW_UPDATE per consumed byte → attacker refills window.
     5. Repeat across multiple streams → heap exhaustion.
 
-  dos_class: memory
+  dos_class: cpu
 
 target:
   repo: https://github.com/grpc/grpc-go
@@ -48,15 +53,15 @@ assumptions:
 
 suspected_mechanism:
   - step: 1
-    action: "Open gRPC stream with HTTP/2 HEADERS frame"
+    action: "Open 200 concurrent gRPC streams per connection across 10 connections (2000 streams total)"
   - step: 2
-    action: "Send 65,536 DATA frames of 1 byte each — fills 64 KB flow-control window"
+    action: "Each stream: continuously send 1-byte DATA frames without closing — HEADERS sent once, then DATA loop"
   - step: 3
-    action: "Server allocates one recvMsg per frame — 13 MB of struct overhead created"
+    action: "Each stream spawns one handler goroutine in gRPC-Go's transport layer"
   - step: 4
-    action: "Server sends WINDOW_UPDATE — attacker fills window again"
+    action: "2000 active goroutines all receiving DATA frames + each recvBuffer accumulating structs → CPU saturation from goroutine scheduling"
   - step: 5
-    action: "Repeat across streams — heap exhausts → OOM crash"
+    action: "WINDOW_UPDATE per consumed byte keeps all 2000 streams fed continuously — CPU stays pegged"
 
 rfc_sections:
   - rfc: RFC 7540
