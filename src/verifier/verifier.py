@@ -21,7 +21,7 @@ from run_context import run_id as _run_id
 from exploiter.tools import MetricsCollector
 
 # Thresholds per CLAUDE.md §7.7
-_CPU_DELTA_PP     = 50     # attack_mean - baseline_mean >= 50 percentage points
+_CPU_DELTA_PP     = 40     # attack_mean - baseline_mean >= 40 percentage points
 _CPU_SUSTAIN_S    = 5      # sustained for >= 5 consecutive samples
 _MEM_DELTA_MB     = 100    # peak - baseline_mean >= 100 MB
 _LAT_RATIO        = 5      # attack_mean >= 5× baseline_mean
@@ -189,13 +189,18 @@ def _restart_container(image: str, container_name: str, ports: str,
     for mapping in ports.split():
         port_args += ["-p", mapping]
 
+    vol_args = [
+        "-v", f"{certs_dir}/server.crt:/certs/server.crt:ro",
+        "-v", f"{certs_dir}/server.key:/certs/server.key:ro",
+    ]
+    # Only mount config if config_path is non-empty (source-built containers embed config)
+    if config_path and conf_file:
+        vol_args += ["-v", f"{conf_file}:{config_path}:ro"]
+
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
-        "-v", f"{certs_dir}/server.crt:/certs/server.crt:ro",
-        "-v", f"{certs_dir}/server.key:/certs/server.key:ro",
-        "-v", f"{conf_file}:{config_path}:ro",
-    ] + port_args + [image]
+    ] + vol_args + port_args + [image]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:

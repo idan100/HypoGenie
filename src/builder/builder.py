@@ -26,6 +26,8 @@ from .prompts import (
     SETUP_DEVELOPER_USER_TEMPLATE,
     SETUP_CRITIC_SYSTEM,
     SETUP_CRITIC_USER_TEMPLATE,
+    DOCKERFILE_DEVELOPER_SYSTEM,
+    DOCKERFILE_DEVELOPER_USER_TEMPLATE,
 )
 
 _CERTS_DIR = Path(__file__).parent.parent.parent / "infra" / "certs"
@@ -67,27 +69,45 @@ def _docker_pull(image: str) -> bool:
     return False
 
 
-def _source_build(product: str, version: str, run_dir: Path) -> str:
+def _dockerfile_build(product: str, version: str, entry_point: str,
+                      protocol: str, repo_url: str, run_dir: Path) -> tuple[str, dict]:
     """
-    Fallback: write a minimal Dockerfile and docker build.
-    Returns the image tag built.
+    LLM-driven source build: generate Dockerfile + app files, then docker build.
+    Returns (image_tag, setup_dict) where setup_dict has config_path and ports.
     """
-    print(f"  [builder:{_run_id}] Source-build fallback for {product}:{version}")
-    # Minimal Dockerfile — just install from package manager
-    dockerfile = f"""FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y {product} --no-install-recommends && rm -rf /var/lib/apt/lists/*
-"""
-    df_path = run_dir / "Dockerfile"
-    df_path.write_text(dockerfile)
-    tag = f"hypogenie-{product}-{version}:latest"
+    print(f"  [builder:{_run_id}] LLM Dockerfile build for {product}@{version} ...")
+    user = DOCKERFILE_DEVELOPER_USER_TEMPLATE.format(
+        product=product, version=version, entry_point=entry_point,
+        protocol=protocol, repo_url=repo_url,
+    )
+    raw = _llm.call_llm(
+        DOCKERFILE_DEVELOPER_SYSTEM, user,
+        role_env="BUILDER_MODEL", max_tokens=4096, json_mode=True
+    )
+    d = json.loads(_extract_json(raw))
+
+    dockerfile = d.get("dockerfile", "")
+    app_files = d.get("app_files", {})
+    config_path = d.get("config_path", "")
+    ports = d.get("ports", "443:443/tcp")
+
+    if not dockerfile:
+        raise RuntimeError("LLM returned empty Dockerfile")
+
+    # Write Dockerfile and app files to run_dir
+    (run_dir / "Dockerfile").write_text(dockerfile)
+    for filename, content in app_files.items():
+        (run_dir / filename).write_text(content)
+
+    tag = f"hypogenie-{product}-{version}:latest".replace("/", "-").lower()
     result = subprocess.run(
         ["docker", "build", "-t", tag, str(run_dir)],
-        capture_output=True, text=True, timeout=300
+        capture_output=True, text=True, timeout=600
     )
     if result.returncode != 0:
-        raise RuntimeError(f"Source build failed: {result.stderr.strip()[:400]}")
+        raise RuntimeError(f"Source build failed:\n{result.stderr.strip()[:600]}")
     print(f"  [builder:{_run_id}] Source build succeeded: {tag}")
-    return tag
+    return tag, {"config_path": config_path, "ports": ports}
 
 
 def _setup_developer(product: str, version: str, entry_point: str) -> dict:
@@ -139,7 +159,8 @@ def _setup_critic(product: str, entry_point: str, setup: dict) -> bool:
 
 
 def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
-          docker_image: str | None = None) -> dict:
+          docker_image: str | None = None, protocol: str = "HTTP/2",
+          repo_url: str = "") -> dict:
     """
     Build and start a server container for the given product/version.
 
@@ -165,7 +186,39 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         image = f"{product}:{version}"
         pulled = _docker_pull(image)
         if not pulled:
-            image = _source_build(product, version, run_dir)
+            image, source_setup = _dockerfile_build(
+                product, version, entry_point, protocol, repo_url, run_dir
+            )
+            # Source build already generated config_path + ports — use them directly
+            # but still run Setup Developer to generate the actual config file content
+            # (unless config_path is empty, meaning the app handles config internally)
+            if not source_setup.get("config_path"):
+                # App handles config internally — skip config file mount
+                conf_file = run_dir / "server.conf"
+                conf_file.write_text("")
+                port_args = []
+                for mapping in source_setup["ports"].split():
+                    port_args += ["-p", mapping]
+                cmd = [
+                    "docker", "run", "-d",
+                    "--name", f"hypogenie-{_run_id}",
+                    "-v", f"{_CERTS_DIR}/server.crt:/certs/server.crt:ro",
+                    "-v", f"{_CERTS_DIR}/server.key:/certs/server.key:ro",
+                ] + port_args + [image]
+                print(f"  [builder:{_run_id}] Starting container: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode != 0:
+                    raise RuntimeError(f"docker run failed: {result.stderr.strip()[:400]}")
+                container_id = result.stdout.strip()
+                _running_containers.append(container_id)
+                print(f"  [builder:{_run_id}] Container started: {container_id[:12]}")
+                return {
+                    "container_id": container_id,
+                    "image": image,
+                    "config_path": "",
+                    "ports": source_setup["ports"],
+                    "run_dir": str(run_dir),
+                }
         effective_product = product
         effective_version = version
 

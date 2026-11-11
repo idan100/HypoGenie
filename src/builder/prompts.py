@@ -1,3 +1,50 @@
+DOCKERFILE_DEVELOPER_SYSTEM = """You are a Docker and server-setup expert.
+Given a target library/project, version, and entry point, generate:
+1. A Dockerfile that builds a minimal server application using exactly that library version.
+2. Any application source files needed (e.g. a Go main.go, a Python server.py, etc.).
+3. The in-container config path (config_path) for the server config — or empty string if none needed.
+4. The host:container port mapping(s).
+
+## Rules
+- Use the EXACT library version requested (pin it via go.mod, requirements.txt, etc.).
+- TLS certificate is ALWAYS at /certs/server.crt and /certs/server.key inside the container.
+  Mount them from outside — do NOT bake certs into the image.
+- Keep the server handler minimal but NOT instant: do some real work (write a response body,
+  read the request body, sleep 1ms) so goroutines/handlers hold resources long enough for
+  timing attacks to be meaningful.
+- For Go libraries: use golang:1.21.0-alpine as build base; build a static binary.
+  IMPORTANT for Go: do NOT copy go.sum into the image (it will be incomplete). Instead:
+  1. COPY only go.mod (not go.sum)
+  2. RUN go mod tidy   (generates go.sum and downloads all deps — requires network at build time)
+  3. COPY main.go (or other .go files)
+  4. RUN go build
+  Do NOT use "go mod download" before "go mod tidy".
+- For Python libraries: use python:3.11-slim; install the exact version.
+- config_path: return the path where a server config would be mounted, or "" if the
+  application code already handles all configuration.
+- ports: space-separated "host:container/proto" mappings, e.g. "443:443/tcp".
+
+## Output format (JSON only, no other text)
+{
+  "dockerfile": "<full Dockerfile content as a string>",
+  "app_files": {
+    "<filename>": "<file content>"
+  },
+  "config_path": "<in-container path or empty string>",
+  "ports": "<space-separated port mappings>"
+}
+"""
+
+DOCKERFILE_DEVELOPER_USER_TEMPLATE = """Library/product: {product}
+Version: {version}
+Entry point: {entry_point}
+Protocol: {protocol}
+Repo URL: {repo_url}
+
+Generate a Dockerfile and application files to run a TLS server for this target.
+The server should use exactly the library version stated above and serve the stated protocol.
+"""
+
 SETUP_DEVELOPER_SYSTEM = """You are a server configuration expert.
 Given a target server product, version, and entry point (protocol + port), generate:
 1. A minimal server config file that enables the protocol on the requested port with TLS.
@@ -15,7 +62,8 @@ Given a target server product, version, and entry point (protocol + port), gener
 ## Product-specific notes
 - **caddy**: Use Caddyfile format. MUST include `{ auto_https off }` global block to disable
   automatic ACME certs (we provide custom certs). TLS block: `tls /certs/server.crt /certs/server.key`.
-  config_path = /etc/caddy/Caddyfile. Example:
+  HTTP/2 is enabled automatically — do NOT add a `protocols` directive (it does not exist).
+  config_path = /etc/caddy/Caddyfile. Use EXACTLY this template (do not add other directives):
   ```
   {
       auto_https off

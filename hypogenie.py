@@ -125,7 +125,7 @@ Severity: {plan.severity}
 
 ## Suggested fix
 
-Apply a per-connection rate limit on stream resets / {plan.dos_class} operations
+Apply a per-connection rate limit on stream resets / {getattr(plan, 'dos_class', 'resource_exhaustion')} operations
 as recommended by the relevant RFC security considerations section.
 
 ## Timeline
