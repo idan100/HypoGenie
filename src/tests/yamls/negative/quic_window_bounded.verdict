@@ -1,0 +1,18 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: quic-go enforces an internal send-buffer cap regardless of peer-advertised window
+
+TARGET_IMAGE: caddy:2.8.4
+TARGET_PORT: 443/udp
+CLIENT_TOOL: aioquic
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Opened 100 QUIC connections, each advertising a 1 GB initial receive window
+  then immediately stalling (zero recv() calls). quic-go capped per-connection
+  send buffer at ~10 MB and began dropping blocked streams after the buffer-full
+  timeout. Server memory stayed within 50 MB above baseline. CPU stayed below 8%.
+  No observable resource accumulation; connections were eventually torn down cleanly.
+DISPROOF_NOTES: Assumption A1 ("no internal cap") is refuted. quic-go's flowcontrol
+                package applies a WriterToBeFlowControlBlocked cap independent of
+                the peer-advertised window.

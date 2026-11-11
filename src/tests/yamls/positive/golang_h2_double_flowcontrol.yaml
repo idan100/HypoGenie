@@ -1,0 +1,79 @@
+hypothesis:
+  description: |
+    RFC 7540 §6.9 defines flow-control credit as a one-time grant: a receiver
+    issues a WINDOW_UPDATE crediting exactly the bytes it has consumed or freed.
+    Granting credit twice for the same data directly violates §6.9 and allows
+    a sender to bypass the per-connection receive-buffer cap.
+
+    In golang.org/x/net/http2 prior to the fix for CVE-2026-78663, two code
+    paths both issue a connection-level WINDOW_UPDATE for the same buffered DATA
+    bytes:
+      1. When RST_STREAM is received for an open stream, the unread bytes
+         buffered in the stream's recv queue are "returned" to the connection
+         flow-control window via a WINDOW_UPDATE.
+      2. When the application handler later reads those same bytes (which were
+         buffered before the RST arrived), a second WINDOW_UPDATE is issued.
+
+    This double-credit means an attacker can open a stream, send DATA up to the
+    connection window limit, then send RST_STREAM before the handler reads the
+    data. The server issues a WINDOW_UPDATE refunding the full data size. The
+    attacker can then send another full window of DATA — bypassing
+    MaxReceiveBufferPerConnection entirely.
+
+    Assumptions:
+    - A1: RST_STREAM on an open stream triggers immediate connection-level
+          WINDOW_UPDATE for unread buffered bytes.
+    - A2: Handler read of buffered bytes after RST_STREAM also triggers a
+          connection-level WINDOW_UPDATE for those same bytes.
+    - A3: No deduplication check prevents both WINDOW_UPDATEs from being sent.
+
+    Suspected mechanism:
+    1. Attacker opens stream and sends DATA equal to full connection window (W).
+    2. Attacker sends RST_STREAM before handler reads data.
+    3. Server issues WINDOW_UPDATE(W) — attacker's window restored to W.
+    4. Handler reads buffered data; server issues second WINDOW_UPDATE(W).
+    5. Attacker now has effective window of 2W; repeats → unbounded memory growth.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/golang/net
+  version: v0.17.0
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS"
+  docker_image: "caddy:2.7.6"
+
+assumptions:
+  - id: A1
+    description: "RST_STREAM on buffered stream triggers connection-level WINDOW_UPDATE for unread bytes"
+    necessity: required
+  - id: A2
+    description: "Handler read after RST_STREAM also triggers connection-level WINDOW_UPDATE for same bytes"
+    necessity: required
+  - id: A3
+    description: "No deduplication prevents both WINDOW_UPDATEs from being issued"
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Open stream and fill connection window with DATA frames"
+  - step: 2
+    action: "Send RST_STREAM — server issues WINDOW_UPDATE refunding all bytes"
+  - step: 3
+    action: "Handler reads buffered data — server issues second WINDOW_UPDATE for same bytes"
+  - step: 4
+    action: "Repeat — effective window doubles each cycle → heap exhaustion"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "6.9"
+    dos_relevance: "Flow-control credit accounting — WINDOW_UPDATE must credit consumed bytes exactly once"
+  - rfc: RFC 7540
+    section: "6.4"
+    dos_relevance: "RST_STREAM stream state transition and buffered-data handling"
+
+related_work:
+  - type: cve
+    id: CVE-2026-78663
+  - type: cve
+    id: CVE-2023-44487

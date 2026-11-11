@@ -1,0 +1,17 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: Caddy 2.8.4 applies stream-reset rate-limit — all required assumptions are refuted
+
+TARGET_IMAGE: caddy:2.8.4
+TARGET_PORT: 443/udp
+CLIENT_TOOL: aioquic
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Sent rapid RESET_STREAM frames against caddy:2.8.4 HTTP/3 endpoint.
+  After ~200 resets/s the server sent QUIC GOAWAY and closed the connection.
+  CPU stayed below 5% throughout. Memory delta < 3 MB. No server-side resource
+  accumulation observed. Caddy 2.8.4 introduced a stream-churn rate limit
+  (default 200/s) in response to CVE-2023-44487 disclosures.
+DISPROOF_NOTES: Assumption A3 ("no stream-churn rate limit") is refuted. The patch
+                applies to HTTP/3 as well as HTTP/2 in Caddy 2.8.x.

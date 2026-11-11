@@ -1,0 +1,66 @@
+hypothesis:
+  description: |
+    RFC 8484 (DNS-over-HTTPS) §5.1 recommends that servers apply "appropriate
+    limits" on request sizes and rates, but uses SHOULD language and specifies
+    no concrete bound. CoreDNS's DoH, gRPC, and HTTP/3 listeners apply no
+    connection limit, concurrent-stream limit, or message-size cap by default.
+
+    An attacker can open thousands of concurrent DoH connections or gRPC streams
+    and send oversized DNS request bodies. Because CoreDNS parses each request
+    fully before returning an error, it buffers the entire request body in memory
+    before rejecting oversized messages. With no connection limit, the attacker
+    can hold thousands of concurrent large-request parse operations, exhausting
+    heap and goroutine pool.
+
+    Assumptions:
+    - A1: CoreDNS DoH listener applies no per-IP or global connection limit.
+    - A2: CoreDNS reads the full request body before checking message size.
+    - A3: No goroutine or memory cap per listener.
+
+    Suspected mechanism:
+    1. Attacker opens 10,000 concurrent HTTPS connections to CoreDNS DoH port.
+    2. Each sends a POST /dns-query with a 64 KB body (max-size not enforced).
+    3. CoreDNS reads all 64 KB into a buffer before parsing as DNS message.
+    4. Goroutine pool and heap exhaust — DNS resolution fails for all clients.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/coredns/coredns
+  version: v1.11.4
+  protocol: HTTPS
+  entry_point: "TCP port 443, DNS-over-HTTPS"
+  docker_image: "coredns/coredns:1.11.4"
+
+assumptions:
+  - id: A1
+    description: "No per-IP or global connection limit on DoH listener"
+    necessity: required
+  - id: A2
+    description: "Full request body buffered before message-size check"
+    necessity: required
+  - id: A3
+    description: "No goroutine or memory cap per listener"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open 10,000 concurrent HTTPS connections to port 443"
+  - step: 2
+    action: "POST /dns-query with 64 KB body on each connection"
+  - step: 3
+    action: "CoreDNS allocates 64 KB read buffer per request — 640 MB total"
+  - step: 4
+    action: "Goroutine pool exhausts — DNS resolution fails"
+
+rfc_sections:
+  - rfc: RFC 8484
+    section: "5.1"
+    dos_relevance: "DoH server SHOULD apply appropriate request size and rate limits"
+  - rfc: RFC 8484
+    section: "4"
+    dos_relevance: "DNS message encoding and maximum message size"
+
+related_work:
+  - type: cve
+    id: CVE-2025-68151

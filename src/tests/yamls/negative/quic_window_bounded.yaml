@@ -1,0 +1,54 @@
+hypothesis:
+  description: |
+    RFC 9000 §4.1 defines flow control via STREAM and CONNECTION-level WINDOW_UPDATE
+    frames. A theoretical attack would advertise a very large initial receive window
+    and then stop consuming data, forcing the sender to buffer unbounded data while
+    waiting for window credit.
+
+    quic-go v0.45.0 introduced a maximum send-buffer cap that is enforced regardless
+    of the peer-advertised window size. The cap prevents the sender from buffering
+    more than 10 MB per connection even if the receiver advertises a 1 GB window.
+    This defense is present in quic-go v0.45.0 and later.
+
+    Assumptions:
+    - A1: quic-go buffers outgoing data up to the peer-advertised window
+          without an internal cap.
+    - A2: Advertising a 1 GB window and then stalling causes the server to buffer
+          1 GB of response data per connection.
+    - A3: Opening 100 stalled connections exhausts server memory at ~1 GB each.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/quic-go/quic-go
+  version: v0.45.0
+  protocol: QUIC
+  entry_point: "UDP port 443, HTTP/3 over QUIC"
+  docker_image: "caddy:2.8.4"
+
+assumptions:
+  - id: A1
+    description: "quic-go buffers outgoing data up to peer-advertised window with no internal cap"
+    necessity: required
+  - id: A2
+    description: "Advertising 1 GB window and stalling causes 1 GB server-side buffer per connection"
+    necessity: required
+  - id: A3
+    description: "100 stalled connections exhaust server memory"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open QUIC connection and send initial WINDOW_UPDATE advertising 1 GB receive window"
+  - step: 2
+    action: "Make HTTP/3 GET request for large resource and stop reading"
+  - step: 3
+    action: "quic-go internal buffer cap (10 MB) limits allocation — connection eventually dropped"
+
+rfc_sections:
+  - rfc: RFC 9000
+    section: "4.1"
+    dos_relevance: "Flow control, window sizes, and sender buffering behavior"
+  - rfc: RFC 9000
+    section: "4.2"
+    dos_relevance: "Increasing flow-control limits and receiver window management"

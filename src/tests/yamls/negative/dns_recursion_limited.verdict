@@ -1,0 +1,17 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: CoreDNS 1.11.1 enforces a CNAME-chain depth limit — assumption A1 is refuted
+
+TARGET_IMAGE: coredns/coredns:1.11.1
+TARGET_PORT: 53/udp
+CLIENT_TOOL: scapy
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Sent 1,000 concurrent DNS queries referencing crafted CNAME chains of depth 100+.
+  CoreDNS returned SERVFAIL for every query after reaching its depth limit (10 hops).
+  CPU spiked briefly to ~12% then returned to <2%. Memory delta < 5 MB. No goroutine
+  accumulation observed in /debug/vars. The depth guard in plugin/pkg/dnsutil
+  terminates recursion before significant allocation occurs.
+DISPROOF_NOTES: Assumption A1 ("no depth bound") is refuted. The CNAME depth limit
+                has been present in CoreDNS since v1.4.0.

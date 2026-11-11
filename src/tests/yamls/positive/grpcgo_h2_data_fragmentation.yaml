@@ -1,0 +1,73 @@
+hypothesis:
+  description: |
+    RFC 7540 §6.9 governs payload byte accounting for HTTP/2 flow control — it
+    sets no bound on per-frame struct overhead. gRPC-Go allocates a separate
+    recvMsg struct in its recvBuffer for every inbound DATA frame, regardless
+    of size. When an attacker sends millions of 1-byte DATA frames within the
+    negotiated flow-control window, the receiver accumulates one recvMsg per
+    frame. Each struct carries ~200 bytes of Go metadata, so a 64 KB window
+    filled with 65,536 single-byte frames creates ~13 MB of struct overhead —
+    a 200× amplification ratio.
+
+    This is not a compliance violation: RFC 7540 permits arbitrary DATA
+    fragmentation and gRPC's per-frame allocation is not mandated by the spec.
+    The required invariant (a per-connection cap on recvMsg count or on
+    struct-metadata overhead) was simply never implemented.
+
+    Assumptions:
+    - A1: gRPC-Go allocates one recvMsg struct per inbound DATA frame in recvBuffer.
+    - A2: Flow-control window refund is issued per-frame (attacker keeps sending).
+    - A3: No per-connection cap on recvMsg count or aggregate struct size.
+
+    Suspected mechanism:
+    1. Attacker opens an HTTP/2 stream over gRPC connection.
+    2. Attacker sends 65,536 DATA frames of 1 byte each (filling 64 KB window).
+    3. Server allocates one recvMsg per frame → 65,536 × ~200 bytes = ~13 MB overhead.
+    4. Server issues WINDOW_UPDATE per consumed byte → attacker refills window.
+    5. Repeat across multiple streams → heap exhaustion.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/grpc/grpc-go
+  version: v1.68.1
+  protocol: HTTP/2
+  entry_point: "TCP port 443, gRPC over HTTP/2 over TLS"
+  docker_image: "nginx:1.25.3"
+
+assumptions:
+  - id: A1
+    description: "One recvMsg struct allocated per inbound DATA frame in recvBuffer"
+    necessity: required
+  - id: A2
+    description: "Per-frame WINDOW_UPDATE issued allowing attacker to refill window continuously"
+    necessity: required
+  - id: A3
+    description: "No cap on per-connection recvMsg count or aggregate struct-metadata size"
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Open gRPC stream with HTTP/2 HEADERS frame"
+  - step: 2
+    action: "Send 65,536 DATA frames of 1 byte each — fills 64 KB flow-control window"
+  - step: 3
+    action: "Server allocates one recvMsg per frame — 13 MB of struct overhead created"
+  - step: 4
+    action: "Server sends WINDOW_UPDATE — attacker fills window again"
+  - step: 5
+    action: "Repeat across streams — heap exhausts → OOM crash"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "6.9"
+    dos_relevance: "Flow-control accounting — governs byte credits but not per-frame struct allocation"
+  - rfc: RFC 7540
+    section: "6.1"
+    dos_relevance: "DATA frame fragmentation — spec permits arbitrary fragment sizes"
+
+related_work:
+  - type: cve
+    id: CVE-2026-84304
+  - type: cve
+    id: CVE-2023-44487

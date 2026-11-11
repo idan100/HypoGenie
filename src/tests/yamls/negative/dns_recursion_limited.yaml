@@ -1,0 +1,57 @@
+hypothesis:
+  description: |
+    RFC 1034 §3.7 describes recursive DNS resolution where a resolver follows
+    CNAME chains and NS delegations on behalf of the client. A theoretical attack
+    would construct a chain of CNAME records that expands infinitely, causing the
+    resolver to consume unbounded CPU and memory following the chain.
+
+    CoreDNS v1.11.1 applies a strict CNAME-chain depth limit (default: 10 hops)
+    enforced inside the recursive resolution loop. When the depth limit is reached,
+    CoreDNS returns SERVFAIL and discards the query without further recursion.
+
+    This hypothesis tests whether sending CNAME chains of depth 100+ can exhaust
+    CoreDNS resources. The assumption that no depth limit applies should be refuted
+    because the guard is present in the codebase.
+
+    Assumptions:
+    - A1: CoreDNS 1.11.1 follows CNAME chains without a depth bound.
+    - A2: Each recursive hop allocates memory that is not released until the full
+          chain resolves or times out.
+    - A3: Sending 1,000 concurrent queries each with a 100-hop chain will
+          exhaust resolver goroutine pool.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/coredns/coredns
+  version: v1.11.1
+  protocol: DNS/UDP
+  entry_point: "UDP port 53"
+  docker_image: "coredns/coredns:1.11.1"
+
+assumptions:
+  - id: A1
+    description: "CoreDNS follows CNAME chains without a depth bound"
+    necessity: required
+  - id: A2
+    description: "Each recursive hop allocates persistent memory until chain resolves"
+    necessity: required
+  - id: A3
+    description: "1,000 concurrent deep CNAME queries exhaust goroutine pool"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Craft DNS response with CNAME chain of depth 100"
+  - step: 2
+    action: "CoreDNS depth guard triggers at hop 10 — returns SERVFAIL"
+  - step: 3
+    action: "No resource accumulation; goroutines released immediately"
+
+rfc_sections:
+  - rfc: RFC 1034
+    section: "3.7"
+    dos_relevance: "CNAME chain following and depth in recursive resolvers"
+  - rfc: RFC 1035
+    section: "3.3.1"
+    dos_relevance: "CNAME resource record and chained resolution behavior"

@@ -1,0 +1,70 @@
+hypothesis:
+  description: |
+    RFC 9114 §4.2.2 mandates: "An endpoint MUST NOT allow the peer to cause it
+    to allocate an excessive amount of memory for field sections." quic-go's
+    HTTP/3 implementation enforces a limit on the compressed QPACK header frame
+    length (wire bytes) but does NOT enforce a limit on the decoded field-section
+    size (heap bytes after QPACK decompression).
+
+    QPACK (RFC 9204) achieves high compression ratios through static and dynamic
+    table references. A compressed header of 100 bytes can expand to 1,500+ bytes
+    when decoded (e.g., a full Cookie header with a long value compressed via a
+    static-table reference). An attacker who crafts HEADERS frames that use
+    maximum QPACK compression can achieve a ~15× wire-to-heap amplification
+    ratio. By sending many such HEADERS frames within the flow-control window,
+    the attacker exhausts server heap far beyond what the wire-byte limit would
+    suggest.
+
+    Assumptions:
+    - A1: quic-go enforces a MaxHeaderBytes limit on compressed (wire) size only.
+    - A2: QPACK decompression can expand headers by 10–20× (static table refs).
+    - A3: Decoded field sections are buffered in heap before the size is rechecked.
+
+    Suspected mechanism:
+    1. Attacker opens an HTTP/3 stream and sends a HEADERS frame with 4 KB of
+       QPACK-compressed data (within wire limit).
+    2. Server decompresses to ~60 KB decoded headers.
+    3. Server checks compressed size (passes) but not decoded size.
+    4. Attacker floods with many such streams — heap fills at ~15× wire rate.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/quic-go/quic-go
+  version: v0.56.0
+  protocol: QUIC
+  entry_point: "UDP port 443, HTTP/3 over QUIC"
+  docker_image: "caddy:2.7.6"
+
+assumptions:
+  - id: A1
+    description: "MaxHeaderBytes enforced on compressed wire size, not decoded heap size"
+    necessity: required
+  - id: A2
+    description: "QPACK decompression expands headers by 10-20x using static table references"
+    necessity: required
+  - id: A3
+    description: "Decoded field section buffered in heap before size rechecked"
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Open HTTP/3 stream and send HEADERS with 4 KB QPACK-compressed data"
+  - step: 2
+    action: "Server decompresses to 60 KB decoded headers"
+  - step: 3
+    action: "Wire-size check passes; decoded size unchecked"
+  - step: 4
+    action: "Flood with 1,000 concurrent streams — heap exhausts at 60 MB/stream"
+
+rfc_sections:
+  - rfc: RFC 9114
+    section: "4.2.2"
+    dos_relevance: "MUST NOT allow peer to cause excessive memory allocation for field sections"
+  - rfc: RFC 9204
+    section: "3.2"
+    dos_relevance: "QPACK static table compression ratios and decoder memory usage"
+
+related_work:
+  - type: cve
+    id: CVE-2025-64702

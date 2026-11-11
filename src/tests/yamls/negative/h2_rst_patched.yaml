@@ -1,0 +1,54 @@
+hypothesis:
+  description: |
+    RFC 7540 §10.5 warns that RST_STREAM can be abused for resource exhaustion.
+    HTTP/2 Rapid Reset (CVE-2023-44487) demonstrated that servers failing to
+    rate-limit stream resets are vulnerable. nginx was affected and patched in
+    nginx 1.25.3 (released October 2023) by applying a per-connection
+    concurrent-streams reset limit.
+
+    This hypothesis attempts the same HEADERS+RST_STREAM rapid-reset attack
+    against nginx 1.25.3, which applies the patch. The patched version limits
+    the number of streams that can be reset per connection per second via the
+    http2_max_requests and stream_reset_timeout directives (default: 100 resets
+    per connection). The attack should NOT trigger DoS on the patched version.
+
+    Assumptions:
+    - A1: nginx 1.25.3 has NOT applied the RST_STREAM rate-limit patch.
+    - A2: No per-connection reset counter exists.
+
+    Suspected mechanism (should fail):
+    1. Send rapid HEADERS+RST_STREAM cycles.
+    2. nginx rate-limit kicks in and closes connection after 100 resets.
+    3. CPU stays low; no goroutine backlog forms.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/nginx/nginx
+  version: release-1.25.3
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS"
+  docker_image: "nginx:1.25.3"
+
+assumptions:
+  - id: A1
+    description: "nginx 1.25.3 has NOT applied the RST_STREAM rate-limit patch (incorrect — it has)"
+    necessity: required
+  - id: A2
+    description: "No per-connection reset counter limits rapid resets"
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Send HEADERS+RST_STREAM cycles at high rate"
+  - step: 2
+    action: "nginx rate-limit closes connection — attack terminates"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "10.5"
+    dos_relevance: "RST_STREAM rate-limiting — nginx 1.25.3 applies a limit"
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487

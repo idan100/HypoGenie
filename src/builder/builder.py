@@ -138,7 +138,8 @@ def _setup_critic(product: str, entry_point: str, setup: dict) -> bool:
     return True
 
 
-def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS") -> dict:
+def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
+          docker_image: str | None = None) -> dict:
     """
     Build and start a server container for the given product/version.
 
@@ -153,10 +154,15 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS") 
     run_dir = _WORKSPACE / _run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    image = f"{product}:{version}"
-    pulled = _docker_pull(image)
-    if not pulled:
-        image = _source_build(product, version, run_dir)
+    if docker_image:
+        image = docker_image
+        print(f"  [builder:{_run_id}] Using docker_image override: {image}")
+        _docker_pull(image)  # pre-pull; ignore failure (may already be cached)
+    else:
+        image = f"{product}:{version}"
+        pulled = _docker_pull(image)
+        if not pulled:
+            image = _source_build(product, version, run_dir)
 
     # Generate server config via LLM
     setup = _setup_developer(product, version, entry_point)
