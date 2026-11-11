@@ -4,8 +4,7 @@ An LLM-based multi-agent framework for **discovering novel DoS vulnerabilities**
 
 HypoGenie is a fork of [CVE-Genie](https://github.com/BUseclab/cve-genie), redesigned for pre-disclosure discovery. You supply a structured YAML attack hypothesis and the framework verifies it end-to-end: from RFC analysis and static code review through live exploit execution and reproducibility confirmation.
 
-> M.Sc. thesis project — Idan Efraim, Bar-Ilan University / TAU Deepness Lab (Prof. Anat Bremler-Barr).
-
+> M.Sc. Thesis Research — Idan Efraim, Bar-Ilan University, under the supervision of Dr. Ariel Nof, in collaboration with TAU Deepness Lab (Prof. Anat Bremler-Barr).
 ---
 
 ## What it does
