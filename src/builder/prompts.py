@@ -75,13 +75,16 @@ Given a target server product, version, and entry point (protocol + port), gener
   ```
 - **nginx**: Use nginx.conf format. config_path = /etc/nginx/nginx.conf.
   Wrap in `events {}` and `http { server { ... } }` blocks.
-- **coredns**: Use Corefile format. config_path = /etc/coredns/Corefile.
-  For DNS-over-HTTPS (DoH) entry points, enable the `doh` plugin on port 443 with TLS:
+- **coredns**: Use Corefile format. IMPORTANT notes:
+  1. config_path = /Corefile (CoreDNS working directory is /; reads Corefile from there,
+     NOT from /etc/coredns/).
+  2. The standard `coredns/coredns` Docker image does NOT include the `doh` plugin.
+     Do NOT use `doh`. Do NOT use `grpc` as a server listener.
+  3. To serve DNS-over-TLS, the zone prefix MUST start with `tls://` — without it
+     CoreDNS ignores the `tls` directive and listens as plain TCP DNS (probe will fail):
   ```
-  .:443 {
-      bind 0.0.0.0
+  tls://.:443 {
       tls /certs/server.crt /certs/server.key
-      doh
       forward . 8.8.8.8 8.8.4.4
       log
       errors

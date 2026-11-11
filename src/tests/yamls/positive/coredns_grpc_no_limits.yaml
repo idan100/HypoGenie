@@ -1,66 +1,66 @@
 hypothesis:
   description: |
-    RFC 8484 (DNS-over-HTTPS) §5.1 recommends that servers apply "appropriate
-    limits" on request sizes and rates, but uses SHOULD language and specifies
-    no concrete bound. CoreDNS's DoH, gRPC, and HTTP/3 listeners apply no
-    connection limit, concurrent-stream limit, or message-size cap by default.
+    CoreDNS applies no limit on concurrent TCP connections or in-flight DNS
+    queries per listener. Each inbound DNS query over a persistent TLS
+    connection is dispatched to a goroutine; with pipelined queries and no
+    per-connection or global concurrency cap, an attacker can saturate the
+    goroutine pool and cause CPU exhaustion.
 
-    An attacker can open thousands of concurrent DoH connections or gRPC streams
-    and send oversized DNS request bodies. Because CoreDNS parses each request
-    fully before returning an error, it buffers the entire request body in memory
-    before rejecting oversized messages. With no connection limit, the attacker
-    can hold thousands of concurrent large-request parse operations, exhausting
-    heap and goroutine pool.
+    RFC 7766 §6.2.1 requires that a DNS-over-TCP server "SHOULD" limit
+    concurrent connections but CoreDNS enforces no such limit. The standard
+    `coredns/coredns` Docker image uses Go's net/http or net listeners with
+    default settings — no ReadTimeout, no MaxConns, no active-query cap.
 
     Assumptions:
-    - A1: CoreDNS DoH listener applies no per-IP or global connection limit.
-    - A2: CoreDNS reads the full request body before checking message size.
-    - A3: No goroutine or memory cap per listener.
+    - A1: CoreDNS DNS-over-TLS listener applies no per-connection query limit.
+    - A2: Each pipelined query on a TLS connection spawns a goroutine that
+          holds resources until the upstream (8.8.8.8) responds.
+    - A3: No global concurrent-request or goroutine cap on the listener.
 
     Suspected mechanism:
-    1. Attacker opens 10,000 concurrent HTTPS connections to CoreDNS DoH port.
-    2. Each sends a POST /dns-query with a 64 KB body (max-size not enforced).
-    3. CoreDNS reads all 64 KB into a buffer before parsing as DNS message.
-    4. Goroutine pool and heap exhaust — DNS resolution fails for all clients.
+    1. Attacker opens N concurrent TLS connections to CoreDNS port 443.
+    2. Each connection pipelines M large DNS queries without waiting for replies.
+    3. Each query spawns a goroutine blocked on the upstream forward call.
+    4. Goroutine pool + CPU saturate — DNS resolution fails for legitimate clients.
 
   dos_class: resource_exhaustion
 
 target:
   repo: https://github.com/coredns/coredns
   version: v1.11.4
-  protocol: HTTPS
-  entry_point: "TCP port 443, DNS-over-HTTPS"
+  protocol: DNS-over-TLS
+  entry_point: "TCP port 443, DNS-over-TLS"
   docker_image: "coredns/coredns:1.11.4"
 
 assumptions:
   - id: A1
-    description: "No per-IP or global connection limit on DoH listener"
+    description: "No per-connection query limit or timeout on DNS-over-TLS listener"
     necessity: required
   - id: A2
-    description: "Full request body buffered before message-size check"
+    description: "Each pipelined query spawns a goroutine blocked on upstream forward"
     necessity: required
   - id: A3
-    description: "No goroutine or memory cap per listener"
+    description: "No global concurrent-request or goroutine cap"
     necessity: favorable
 
 suspected_mechanism:
   - step: 1
-    action: "Open 10,000 concurrent HTTPS connections to port 443"
+    action: "Open 50 concurrent TLS connections to CoreDNS port 443"
   - step: 2
-    action: "POST /dns-query with 64 KB body on each connection"
+    action: "Each connection pipelines 200 DNS A queries without reading replies"
   - step: 3
-    action: "CoreDNS allocates 64 KB read buffer per request — 640 MB total"
+    action: "Each query goroutine blocks on 8.8.8.8 forward — 10,000 goroutines accumulate"
   - step: 4
-    action: "Goroutine pool exhausts — DNS resolution fails"
+    action: "CPU saturates; legitimate DNS queries time out"
 
 rfc_sections:
-  - rfc: RFC 8484
-    section: "5.1"
-    dos_relevance: "DoH server SHOULD apply appropriate request size and rate limits"
-  - rfc: RFC 8484
-    section: "4"
-    dos_relevance: "DNS message encoding and maximum message size"
+  - rfc: RFC 7766
+    section: "6.2.1"
+    dos_relevance: "DNS-over-TCP servers SHOULD limit the number of concurrent connections"
+  - rfc: RFC 7766
+    section: "6.2.2"
+    dos_relevance: "Servers SHOULD impose a timeout on idle and in-flight queries"
 
 related_work:
   - type: cve
-    id: CVE-2025-68151
+    id: CVE-2023-28452
