@@ -1,7 +1,7 @@
 default_provider: anthropic      # or: openai
 
 anthropic:
-  model: claude-3-5-haiku-20241022   # cheapest Anthropic model
+  model: claude-haiku-4-5            # cheapest Anthropic model (Claude 4 Haiku)
   api_key_env: ANTHROPIC_API_KEY
 
 openai:

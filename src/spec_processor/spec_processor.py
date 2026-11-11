@@ -2,33 +2,14 @@ import json
 import os
 import re
 import requests
+import sys
 from typing import Optional
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import llm_client as _llm
 
 from .models import SpecRequirement
 from .prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
-
-# Loaded lazily to avoid import-time side effects
-_anthropic_client = None
-_openai_client = None
-
-
-def _get_client():
-    """Return the configured LLM client based on env/config."""
-    provider = os.environ.get("SPEC_PROCESSOR_PROVIDER", "anthropic")
-    if provider == "anthropic":
-        global _anthropic_client
-        if _anthropic_client is None:
-            import anthropic
-            _anthropic_client = anthropic.Anthropic(
-                api_key=os.environ.get("ANTHROPIC_API_KEY")
-            )
-        return ("anthropic", _anthropic_client)
-    else:
-        global _openai_client
-        if _openai_client is None:
-            from openai import OpenAI
-            _openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        return ("openai", _openai_client)
 
 
 def _fetch_rfc_section(rfc: str, section: str) -> str:
@@ -134,29 +115,7 @@ def _build_next_section_re(section: str) -> str:
 
 
 def _call_llm(system: str, user: str) -> str:
-    provider, client = _get_client()
-
-    if provider == "anthropic":
-        model = os.environ.get("SPEC_PROCESSOR_MODEL", "claude-3-5-haiku-20241022")
-        resp = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        return resp.content[0].text
-    else:
-        model = os.environ.get("SPEC_PROCESSOR_MODEL", "gpt-4o-mini")
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=4096,
-            response_format={"type": "json_object"},
-        )
-        return resp.choices[0].message.content
+    return _llm.call_llm(system, user, role_env="SPEC_PROCESSOR_MODEL", json_mode=True)
 
 
 def _parse_llm_output(raw: str, rfc: str, section: str) -> list[SpecRequirement]:
