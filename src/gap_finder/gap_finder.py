@@ -15,6 +15,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import llm_client as _llm
 import cache as _cache
+from run_context import run_id as _run_id
 
 from .models import (
     AssumptionVerdict,
@@ -46,7 +47,7 @@ def _llm_with_tools(system: str, user: str, repo_root: str) -> str:
 
     cached = _cache.get(provider, model, system, cache_key_user)
     if cached is not None:
-        print("  [gap_finder] developer (cache hit)")
+        print(f"  [gap_finder:{_run_id}] developer cache hit ({provider}/{model})")
         return cached
 
     _tools.set_repo_root(repo_root)
@@ -137,7 +138,7 @@ def _llm_with_tools(system: str, user: str, repo_root: str) -> str:
                     "tool_call_id": tc.id,
                     "content": str(result),
                 })
-            print(f"  [gap_finder] developer tool calls iteration {iteration+1}")
+            print(f"  [gap_finder:{_run_id}] developer tool calls iteration {iteration+1}")
         else:
             # Final response
             result_text = msg.content or ""
@@ -278,7 +279,7 @@ def run(ctx, spec_reqs, repo_root: str) -> tuple[list[AssumptionVerdict], list[F
         repo_root=repo_root,
     )
 
-    print("  [gap_finder] Running developer agent...")
+    print(f"  [gap_finder:{_run_id}] Running developer agent...")
     raw = _llm_with_tools(DEVELOPER_SYSTEM, user, repo_root)
     verdicts, findings = _parse_developer_output(raw, ctx, spec_reqs)
     print(f"  [gap_finder] Developer: {len(verdicts)} verdicts, {len(findings)} findings")

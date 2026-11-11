@@ -5,11 +5,17 @@ cvelistV5/
 .DS_Store
 cvelist/
 share/
+shared/
 
 *volumes/
 
 src/simulation_environments/*
 !src/simulation_environments/.keep
+
+# HypoGenie runtime outputs
+.hypogenie_cache/
+workspace/test/target/
+workspace/runs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

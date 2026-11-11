@@ -9,6 +9,14 @@ import sys
 import yaml
 from pathlib import Path
 
+# Import run_id lazily to avoid circular issues; modules may import us at module level.
+def _run_id() -> str:
+    try:
+        from run_context import run_id
+        return run_id
+    except Exception:
+        return "?"
+
 # Always load .env from the project root (two levels up from src/)
 _project_root = Path(__file__).parent.parent
 _env_path = _project_root / ".env"
@@ -87,6 +95,7 @@ def call_llm(
 
     cached = _cache_mod.get(prov, model, system, user)
     if cached is not None:
+        print(f"  [llm_client:{_run_id()}] cache hit ({prov}/{model})")
         return cached
 
     if prov == "anthropic":
@@ -111,5 +120,6 @@ def call_llm(
         resp = client.chat.completions.create(**kwargs)
         result = resp.choices[0].message.content
 
+    print(f"  [llm_client:{_run_id()}] call ({prov}/{model}, {len(user)} chars)")
     _cache_mod.put(prov, model, system, user, result)
     return result
