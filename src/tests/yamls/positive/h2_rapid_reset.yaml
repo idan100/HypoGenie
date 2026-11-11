@@ -1,0 +1,73 @@
+hypothesis:
+  description: |
+    RFC 7540 §10.5 warns that RST_STREAM can be abused for resource exhaustion.
+    HTTP/2 stream resets are fully spec-compliant behavior: a client may open a
+    stream and immediately send RST_STREAM. The RFC permits this but notes that
+    "an endpoint SHOULD protect against RST_STREAM amplification."
+
+    CVE-2023-44487 (HTTP/2 Rapid Reset) demonstrated that multiple server
+    implementations (nginx, Apache, Go net/http, etc.) failed to rate-limit
+    stream resets, allowing attackers to rapidly open and reset streams in a
+    loop. Because the server allocates handler/goroutine resources on stream
+    open and must process the RST_STREAM event, the gap between resource
+    allocation and deallocation creates unbounded accumulation.
+
+    Assumptions:
+    - A1: Server allocates per-stream handler resources on stream open (before
+          receiving any DATA frames).
+    - A2: RST_STREAM triggers credit recycling (server updates MAX_STREAMS)
+          before the per-stream handler fully winds down.
+    - A3: No rate-limit or count cap exists on concurrent stream resets.
+
+    Suspected mechanism:
+    1. Attacker opens N streams to the server's current MAX_CONCURRENT_STREAMS.
+    2. Attacker immediately sends RST_STREAM on each stream.
+    3. Server increments its concurrent-stream counter and may grant new
+       MAX_CONCURRENT_STREAMS credit before handlers finish.
+    4. Attacker repeats — handlers backlog grows without bound → CPU exhaustion.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/golang/net
+  version: v0.17.0
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS"
+
+assumptions:
+  - id: A1
+    description: "Server allocates per-stream goroutine/handler on HEADERS frame before RST_STREAM"
+    necessity: required
+  - id: A2
+    description: "Stream concurrency credit is updated before handler fully completes"
+    necessity: required
+  - id: A3
+    description: "No rate-limit on stream resets per connection"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens N HEADERS frames (filling MAX_CONCURRENT_STREAMS)"
+  - step: 2
+    action: "Attacker immediately sends RST_STREAM on all N streams"
+  - step: 3
+    action: "Server recycles stream credit — attacker opens another N streams"
+  - step: 4
+    action: "Handler backlog accumulates → CPU and goroutine exhaustion"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "10.5"
+    dos_relevance: "RST_STREAM amplification and denial-of-service protections"
+  - rfc: RFC 7540
+    section: "6.4"
+    dos_relevance: "RST_STREAM frame semantics, error handling, and stream state transitions"
+  - rfc: RFC 7540
+    section: "6.9"
+    dos_relevance: "Flow control WINDOW_UPDATE and resource allocation limits per connection"
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+  - type: writeup
+    url: https://blog.cloudflare.com/technical-breakdown-http2-rapid-reset-ddos-attack/

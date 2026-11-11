@@ -82,7 +82,7 @@ class MyParser(BaseParser):
                 try_itr += 1
 
 class RepoCritic(AgentWithHistory[dict, str]):
-    __LLM_MODEL__ = 'o3'
+    __LLM_MODEL__ = 'gpt-4o'
     __SYSTEM_PROMPT_TEMPLATE__ = 'repoCritic/repoCritic.system.j2'
     __USER_PROMPT_TEMPLATE__ = 'repoCritic/repoCritic.user.j2'
     __OUTPUT_PARSER__ = MyParser

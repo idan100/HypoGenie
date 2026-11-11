@@ -80,7 +80,7 @@ class MyParser(BaseParser):
                 try_itr += 1
 
 class PreReqBuilder(AgentWithHistory[dict, str]):
-    __LLM_MODEL__ = 'o4-mini'
+    __LLM_MODEL__ = 'gpt-4o-mini'
     __SYSTEM_PROMPT_TEMPLATE__ = 'preReqBuilder/preReqBuilder.system.j2'
     __USER_PROMPT_TEMPLATE__ = 'preReqBuilder/preReqBuilder.user.j2'
     __OUTPUT_PARSER__ = MyParser

@@ -70,7 +70,7 @@ class MyParser(BaseParser):
                 try_itr += 1
 
 class RepoBuilder(AgentWithHistory[dict, str]):
-    __LLM_MODEL__ = 'o4-mini'
+    __LLM_MODEL__ = 'gpt-4o-mini'
     __SYSTEM_PROMPT_TEMPLATE__ = 'repoBuilder/repoBuilder.system.j2'
     __USER_PROMPT_TEMPLATE__ = 'repoBuilder/repoBuilder.user.j2'
     __OUTPUT_PARSER__ = MyParser

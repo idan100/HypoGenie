@@ -3,7 +3,7 @@ from agentlib import Agent
 from typing import Optional
 
 class KnowledgeBuilder(Agent[dict, str]):
-    __LLM_MODEL__ = 'o4-mini'
+    __LLM_MODEL__ = 'gpt-4o-mini'
     __SYSTEM_PROMPT_TEMPLATE__ = 'knowledgeBuilder/knowledgeBuilder.system.j2'
     __USER_PROMPT_TEMPLATE__ = 'knowledgeBuilder/knowledgeBuilder.user.j2'
 

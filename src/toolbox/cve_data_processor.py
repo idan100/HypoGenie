@@ -1,4 +1,4 @@
-import json, os, subprocess
+import json, os, subprocess, zipfile
 
 class CVEDataProcessor:
     def __init__(self, cve_id: str, cve_json: str = None):
@@ -52,7 +52,10 @@ class CVEDataProcessor:
         subprocess.run(f"wget {cve['sw_version_wget']}", shell=True)
 
         zip_name = [file for file in os.listdir(".") if file.endswith(".zip")][0]
-        subprocess.run(f"unzip {zip_name}", shell=True)
+        result = subprocess.run(f"unzip {zip_name}", shell=True)
+        if result.returncode != 0:
+            with zipfile.ZipFile(zip_name, 'r') as zf:
+                zf.extractall(".")
 
         dir_name = [file for file in os.listdir(".") if os.path.isdir(file)][0]
         os.chdir(dir_name)

@@ -3,7 +3,7 @@ import subprocess
 import json
 import csv
 
-LOGS_DIR="/shared"
+LOGS_DIR=os.environ.get("LOGS_DIR", "/shared")
 
 def remove_tree_from_setup_logs(logs: str) -> str:
     lines = logs.splitlines()

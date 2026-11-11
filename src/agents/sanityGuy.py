@@ -78,7 +78,7 @@ class MyParser(BaseParser):
                 try_itr += 1
 
 class SanityGuy(AgentWithHistory[dict, str]):
-    __LLM_MODEL__ = 'o3'
+    __LLM_MODEL__ = 'gpt-4o'
     __SYSTEM_PROMPT_TEMPLATE__ = 'sanityGuy/sanityGuy.system.j2'
     __USER_PROMPT_TEMPLATE__ = 'sanityGuy/sanityGuy.user.j2'
     __OUTPUT_PARSER__ = MyParser
