@@ -14,7 +14,9 @@ FINDING_TYPE: ComplianceGap
 PROOF_METHOD: metric
 PROOF_METRIC: mem_mb
 PROOF_THRESHOLD: +100 MB RSS
-PROOF_NOTES: Manually verified against golang.org/x/net v0.17.0 test server. Sent repeated
-             DATA+RST_STREAM cycles. Server RSS grew at ~8 MB/s with no bound. After 60s
-             reached 512 MB and OOM-killed. The double WINDOW_UPDATE is confirmed in the
-             http2/transport.go adjustRcvFlow() path. CVSS 9.1 Critical. Post-cutoff CVE.
+PROOF_NOTES: PENDING — no live exploit run against caddy:2.7.6 / golang.org/x/net v0.17.0 has
+             been performed. Memory growth measurements above are derived from the vulnerability
+             description and have not been experimentally confirmed. Run the pipeline against
+             caddy:2.7.6 to obtain actual measurements. The double-credit path is in
+             http2/transport.go adjustRcvFlow(). Expected: heap growth ≥100 MB RSS within 60s.
+             CVSS 9.1 Critical. Post-cutoff CVE.

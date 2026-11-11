@@ -262,8 +262,10 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         "--name", f"hypogenie-{_run_id}",
         "-v", f"{certs_dir}/server.crt:/certs/server.crt:ro",
         "-v", f"{certs_dir}/server.key:/certs/server.key:ro",
-        "-v", f"{conf_file}:{config_path}:ro",
-    ] + port_args + [image]
+    ]
+    if config_path:
+        cmd += ["-v", f"{conf_file}:{config_path}:ro"]
+    cmd += port_args + [image]
 
     print(f"  [builder:{_run_id}] Starting container: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)

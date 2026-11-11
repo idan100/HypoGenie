@@ -76,7 +76,24 @@ Given a target server product, version, and entry point (protocol + port), gener
 - **nginx**: Use nginx.conf format. config_path = /etc/nginx/nginx.conf.
   Wrap in `events {}` and `http { server { ... } }` blocks.
 - **coredns**: Use Corefile format. config_path = /etc/coredns/Corefile.
+  For DNS-over-HTTPS (DoH) entry points, enable the `doh` plugin on port 443 with TLS:
+  ```
+  .:443 {
+      bind 0.0.0.0
+      tls /certs/server.crt /certs/server.key
+      doh
+      forward . 8.8.8.8 8.8.4.4
+      log
+      errors
+  }
+  ```
 - **haproxy**: Use haproxy.cfg format. config_path = /etc/haproxy/haproxy.cfg.
+- **grpcgo-server** (hypogenie/grpcgo-server:*): Custom gRPC-Go image. Handles all configuration
+  internally (TLS certs mounted at /certs/). Return config_path = "" and config = "".
+  ports = "443:443/tcp".
+- **http3-server** (hypogenie/http3-server:*): Custom HTTP/3 server. Handles all configuration
+  internally (TLS certs mounted at /certs/). Return config_path = "" and config = "".
+  ports = "443:443/udp".
 
 ## Output format (JSON only, no other text)
 {
