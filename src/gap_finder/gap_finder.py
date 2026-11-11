@@ -38,8 +38,8 @@ def _llm_with_tools(system: str, user: str, repo_root: str) -> str:
     Run the developer agent: LLM with file-reading tools.
     Implements a simple tool-call loop using the OpenAI function-calling API.
     """
-    # Developer tool loop requires OpenAI function-calling API
-    provider, client = _llm.get_client("openai")
+    # Developer tool loop uses OpenAI function-calling API format
+    provider, client = _llm.get_client(_llm.get_provider(role_env="GAP_FINDER_MODEL"))
     model = _llm.get_model(provider, "GAP_FINDER_MODEL")
 
     # Check cache

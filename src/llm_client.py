@@ -35,6 +35,24 @@ if _config_path.exists():
 _DEFAULT_PROVIDER = _config.get("default_provider", "anthropic")
 _ANTHROPIC_MODEL = _config.get("anthropic", {}).get("model", "claude-haiku-4-5")
 _OPENAI_MODEL = _config.get("openai", {}).get("model", "gpt-4o-mini")
+_ROLES: dict[str, str] = _config.get("roles", {})  # role_env → "provider:model"
+
+
+def _parse_role(role_env: str | None) -> tuple[str | None, str | None]:
+    """
+    Return (provider, model) from a role_env name.
+    Checks env var first (format: "provider:model" or just "model"),
+    then config roles section.  Returns (None, None) if not found.
+    """
+    if not role_env:
+        return None, None
+    raw = os.environ.get(role_env) or _ROLES.get(role_env, "")
+    if not raw:
+        return None, None
+    if ":" in raw:
+        prov, mdl = raw.split(":", 1)
+        return prov, mdl
+    return None, raw  # model only, no provider override
 
 _anthropic_client = None
 _openai_client = None
@@ -107,10 +125,12 @@ def reset_token_log() -> None:
         _token_log.clear()
 
 
-def get_provider(override: str | None = None) -> str:
-    """Return provider: env override → config default."""
+def get_provider(override: str | None = None, role_env: str | None = None) -> str:
+    """Return provider: role config → explicit override → env → config default."""
+    role_prov, _ = _parse_role(role_env)
     return (
-        override
+        role_prov
+        or override
         or os.environ.get("HYPOGENIE_PROVIDER")
         or _DEFAULT_PROVIDER
     )
@@ -120,11 +140,11 @@ def get_model(provider: str, role_env: str | None = None) -> str:
     """
     Return the model ID for the given provider.
     role_env: optional env-var name to check first (e.g. 'GAP_FINDER_MODEL').
+    Supports 'provider:model' format in env var or config roles section.
     """
-    if role_env:
-        v = os.environ.get(role_env)
-        if v:
-            return v
+    _, role_model = _parse_role(role_env)
+    if role_model:
+        return role_model
     if provider == "anthropic":
         return os.environ.get("HYPOGENIE_ANTHROPIC_MODEL", _ANTHROPIC_MODEL)
     return os.environ.get("HYPOGENIE_OPENAI_MODEL", _OPENAI_MODEL)
@@ -158,7 +178,7 @@ def call_llm(
     Make a single LLM call (no tool loop). Checks cache; writes cache on hit.
     """
     import cache as _cache_mod
-    prov, client = get_client(provider)
+    prov, client = get_client(get_provider(provider, role_env))
     model = get_model(prov, role_env)
 
     cached = _cache_mod.get(prov, model, system, user)

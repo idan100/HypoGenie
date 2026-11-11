@@ -7,3 +7,15 @@ anthropic:
 openai:
   model: gpt-4o-mini                 # cheapest OpenAI model
   api_key_env: OPENAI_API_KEY
+
+# Per-module overrides: "provider:model"
+# Format: <role_env_name>: "<provider>:<model>"
+# Simple structured tasks → openai:gpt-4o-mini  ($0.15/$0.60 per M tokens)
+# Code / config generation → anthropic:claude-haiku-4-5  ($0.80/$4.00 per M tokens)
+roles:
+  SPEC_PROCESSOR_MODEL:    "openai:gpt-4o-mini"       # RFC text extraction → structured JSON
+  GAP_FINDER_MODEL:        "openai:gpt-4o-mini"       # tool-call loop (hardcoded OpenAI format)
+  GAP_FINDER_CRITIC_MODEL: "openai:gpt-4o-mini"       # short review pass
+  EXPLOIT_PLANNER_MODEL:   "openai:gpt-4o-mini"       # JSON attack plan generation
+  BUILDER_MODEL:           "anthropic:claude-haiku-4-5"  # Dockerfile / server config codegen
+  EXPLOITER_MODEL:         "anthropic:claude-haiku-4-5"  # Python exploit script codegen
