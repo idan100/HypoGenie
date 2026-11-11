@@ -158,22 +158,27 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         image = docker_image
         print(f"  [builder:{_run_id}] Using docker_image override: {image}")
         _docker_pull(image)  # pre-pull; ignore failure (may already be cached)
+        # Derive product name from image (e.g. "caddy:2.7.6" → "caddy")
+        effective_product = image.split(":")[0].split("/")[-1]
+        effective_version = image.split(":")[-1] if ":" in image else version
     else:
         image = f"{product}:{version}"
         pulled = _docker_pull(image)
         if not pulled:
             image = _source_build(product, version, run_dir)
+        effective_product = product
+        effective_version = version
 
     # Generate server config via LLM
-    setup = _setup_developer(product, version, entry_point)
+    setup = _setup_developer(effective_product, effective_version, entry_point)
 
     # Critic validates cert paths
-    critic_ok = _setup_critic(product, entry_point, setup)
+    critic_ok = _setup_critic(effective_product, entry_point, setup)
     if not critic_ok:
         # Retry setup developer once with explicit cert path instruction
         user_retry = (
             SETUP_DEVELOPER_USER_TEMPLATE.format(
-                product=product, version=version, entry_point=entry_point
+                product=effective_product, version=effective_version, entry_point=entry_point
             )
             + "\n\nIMPORTANT: The config MUST reference /certs/server.crt and /certs/server.key exactly."
         )
@@ -182,7 +187,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
             SETUP_DEVELOPER_SYSTEM, user_retry, role_env="BUILDER_MODEL", json_mode=True
         )
         setup = json.loads(_extract_json(raw))
-        critic_ok = _setup_critic(product, entry_point, setup)
+        critic_ok = _setup_critic(effective_product, entry_point, setup)
         if not critic_ok:
             raise RuntimeError("Setup Developer could not produce valid cert paths after retry")
 

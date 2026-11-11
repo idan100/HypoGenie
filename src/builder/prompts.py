@@ -12,6 +12,24 @@ Given a target server product, version, and entry point (protocol + port), gener
 - config_path must be the standard config file location for that product inside the container.
 - ports must be a space-separated list of "host_port:container_port/proto" mappings, e.g. "443:443/tcp".
 
+## Product-specific notes
+- **caddy**: Use Caddyfile format. MUST include `{ auto_https off }` global block to disable
+  automatic ACME certs (we provide custom certs). TLS block: `tls /certs/server.crt /certs/server.key`.
+  config_path = /etc/caddy/Caddyfile. Example:
+  ```
+  {
+      auto_https off
+  }
+  :443 {
+      tls /certs/server.crt /certs/server.key
+      respond "OK" 200
+  }
+  ```
+- **nginx**: Use nginx.conf format. config_path = /etc/nginx/nginx.conf.
+  Wrap in `events {}` and `http { server { ... } }` blocks.
+- **coredns**: Use Corefile format. config_path = /etc/coredns/Corefile.
+- **haproxy**: Use haproxy.cfg format. config_path = /etc/haproxy/haproxy.cfg.
+
 ## Output format (JSON only, no other text)
 {
   "config": "<full server config file content as a string>",
