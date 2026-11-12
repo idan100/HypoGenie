@@ -36,7 +36,7 @@ hypothesis:
 target:
   repo: https://github.com/grpc/grpc-go
   version: v1.68.1
-  protocol: HTTP/2
+  protocol: gRPC
   entry_point: "TCP port 443, gRPC over HTTP/2 over TLS"
   docker_image: "hypogenie/grpcgo-server:v1.68.1"
 
