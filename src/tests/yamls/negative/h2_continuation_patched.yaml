@@ -1,0 +1,63 @@
+hypothesis:
+  description: |
+    RFC 7540 §6.10 permits a HEADERS frame to be followed by any number of
+    CONTINUATION frames before END_HEADERS is set. CVE-2024-27316 showed that
+    servers failing to bound the cumulative size of this chain are vulnerable to
+    memory exhaustion: an attacker sends HEADERS with END_HEADERS=0, then streams
+    unlimited CONTINUATION frames, forcing the server to buffer the entire header
+    block before it can process a single byte.
+
+    nginx 1.25.5 (released March 2024) introduced a hard cap on the cumulative
+    header-block size accumulated across CONTINUATION frames. The fix enforces
+    max_header_size (default 8 KB) across the whole HEADERS+CONTINUATION chain:
+    once the cap is exceeded, nginx returns HTTP 400 and closes the connection.
+    This defense is present and carried forward in nginx 1.26.0.
+
+    This hypothesis tests the CONTINUATION-flood attack against nginx 1.26.0.
+    All required assumptions are expected to be refuted by the Gap Finder because
+    the size cap is enforced in ngx_http_v2_module.c before the buffer can grow.
+
+    Assumptions:
+    - A1: nginx 1.26.0 does not bound the total size of a HEADERS+CONTINUATION chain.
+    - A2: Sending unlimited CONTINUATION frames exhausts the HTTP/2 parser's buffer.
+    - A3: Per-connection header memory is unbounded before END_HEADERS is received.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/nginx/nginx
+  version: release-1.26.0
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS"
+  docker_image: "nginx:1.26.0"
+
+assumptions:
+  - id: A1
+    description: "nginx 1.26.0 does not cap the cumulative HEADERS+CONTINUATION chain size"
+    necessity: required
+  - id: A2
+    description: "Unlimited CONTINUATION frames exhaust HTTP/2 parser memory before END_HEADERS"
+    necessity: required
+  - id: A3
+    description: "Per-connection header buffer grows without bound until END_HEADERS is set"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open HTTP/2 connection and send HEADERS frame with END_HEADERS=0"
+  - step: 2
+    action: "Stream unlimited CONTINUATION frames without ever setting END_HEADERS"
+  - step: 3
+    action: "nginx cap triggers at max_header_size (8 KB) — HTTP 400 sent, connection closed"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "6.10"
+    dos_relevance: "CONTINUATION frame and header block fragmentation — no RFC-level size cap"
+  - rfc: RFC 7540
+    section: "4.3"
+    dos_relevance: "Header block accumulation across HEADERS and CONTINUATION frames"
+
+related_work:
+  - type: cve
+    id: CVE-2024-27316

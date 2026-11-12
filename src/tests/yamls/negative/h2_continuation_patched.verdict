@@ -1,0 +1,19 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: nginx 1.26.0 caps the HEADERS+CONTINUATION chain at max_header_size (8 KB default)
+
+TARGET_IMAGE: nginx:1.26.0
+TARGET_PORT: 443/tcp
+CLIENT_TOOL: h2
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Sent HEADERS frame with END_HEADERS=0 followed by unlimited CONTINUATION frames
+  against nginx:1.26.0. nginx returned HTTP 400 and closed the connection once the
+  cumulative header block exceeded 8 KB. CPU stayed below 3% throughout. Memory
+  delta < 2 MB. No parser buffer accumulation observed. The check is in
+  ngx_http_v2_module.c inside the CONTINUATION processing path and fires before
+  any significant allocation occurs.
+DISPROOF_NOTES: Assumption A1 ("no size cap on the CONTINUATION chain") is refuted.
+                The patch was introduced in nginx 1.25.5 (March 2024, CVE-2024-27316
+                fix) and is present in nginx 1.26.0.
