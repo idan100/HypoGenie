@@ -21,7 +21,7 @@ from run_context import run_id as _run_id
 from exploiter.tools import MetricsCollector
 
 # Thresholds per CLAUDE.md §7.7
-_CPU_DELTA_PP     = 40     # attack_mean - baseline_mean >= 40 percentage points
+_CPU_DELTA_PP     = 50     # attack_mean - baseline_mean >= 50pp (CLAUDE.md §7.7)
 _CPU_SUSTAIN_S    = 5      # sustained for >= 5 consecutive samples
 _MEM_DELTA_MB     = 100    # peak - baseline_mean >= 100 MB
 _LAT_RATIO        = 5      # attack_mean >= 5× baseline_mean

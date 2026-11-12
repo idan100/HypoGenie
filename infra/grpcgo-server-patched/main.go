@@ -11,9 +11,7 @@ import (
 	"google.golang.org/grpc/encoding"
 )
 
-// rawCodec overrides the default proto codec so the server accepts
-// any byte sequence without proto decoding, keeping streams alive longer.
-// In v1.83.1 the per-connection recvMsg limit is enforced — negative control.
+// rawCodec accepts any byte sequence without proto decoding.
 type rawCodec struct{}
 
 func (rawCodec) Marshal(v any) ([]byte, error) {
@@ -72,14 +70,19 @@ func main() {
 		MinVersion:   tls.VersionTLS12,
 	})
 
-	srv := grpc.NewServer(grpc.Creds(creds))
+	// PATCH: enforce MaxConcurrentStreams=100 per connection.
+	// gRPC-Go sends GOAWAY when this limit is exceeded, preventing goroutine accumulation.
+	srv := grpc.NewServer(
+		grpc.Creds(creds),
+		grpc.MaxConcurrentStreams(100),
+	)
 	srv.RegisterService(&echoServiceDesc, struct{}{})
 
 	lis, err := net.Listen("tcp", ":443")
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Println("grpc-go v1.83.1 server (patched) listening on :443/tcp (TLS)")
+	log.Println("grpc-go v1.68.1 (patched: MaxConcurrentStreams=100) listening on :443/tcp (TLS)")
 	if err := srv.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

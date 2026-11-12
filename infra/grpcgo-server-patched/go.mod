@@ -1,5 +1,7 @@
-module grpcgo-server-patched
+module grpcgo-server
 
-go 1.25
+go 1.22
 
-require google.golang.org/grpc v1.83.1
+require (
+	google.golang.org/grpc v1.68.1
+)
