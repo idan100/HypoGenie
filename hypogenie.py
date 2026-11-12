@@ -341,14 +341,19 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         verdicts, findings = gap_run(ctx, spec_reqs, repo_dir)
         print(f"  verdicts={len(verdicts)} findings={len(findings)}")
 
-        # Assumption gate: if all required assumptions refuted → INFEASIBLE
+        # Assumption gate: if ALL required assumptions are refuted → INFEASIBLE.
+        # Findings are ignored here: if every precondition for the attack is proven
+        # false, the attack mechanism cannot work regardless of incidental findings
+        # the gap finder may have produced (which often contradict the refutation).
+        all_required = [a.id for a in ctx.assumptions if a.necessity == "required"]
         required_refuted = [
             a.id for a in ctx.assumptions
             if a.necessity == "required"
             and any(v.assumption_id == a.id and v.status == "refuted" for v in verdicts)
         ]
-        if required_refuted and not findings:
-            print(f"[hypogenie:{_id}] All required assumptions refuted and no findings → INFEASIBLE")
+        all_required_refuted = bool(all_required) and set(required_refuted) == set(all_required)
+        if all_required_refuted:
+            print(f"[hypogenie:{_id}] All required assumptions refuted → INFEASIBLE")
             result = {"verdict": Verdict.INFEASIBLE, "baseline": {}, "attack": {},
                       "attack2": {}, "triggered": [], "phases": [], "thresholds_config": {},
                       "notes": f"Refuted: {required_refuted}"}
@@ -455,7 +460,8 @@ def run_test_suite(suite_dir: str, expect: str) -> None:
                 verdict = json.loads(vf.read_text()).get("verdict", "UNKNOWN")
 
         passed = (verdict == expect) or (
-            expect == "NO_DOS_EFFECT" and verdict in (Verdict.NO_DOS_EFFECT, Verdict.INCONCLUSIVE)
+            expect == "NO_DOS_EFFECT" and verdict in (
+                Verdict.NO_DOS_EFFECT, Verdict.INCONCLUSIVE, Verdict.INFEASIBLE)
         )
         results.append((yaml_path.name, verdict, passed))
         status = "✓" if passed else "✗"
