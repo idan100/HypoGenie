@@ -340,6 +340,17 @@ def run(
         print(f"[verifier:{_run_id}] No threshold crossed — escalating intensity ...")
         attack_metrics2 = exploit_fn(plan, container_id, host, port, attack_duration_s * 2)
         p2_esc_end = _now_iso()
+        if attack_metrics2.get("_invalid"):
+            note2 = attack_metrics2.get("_invalid_reason", "exploit invalid on escalation")
+            print(f"[verifier:{_run_id}] Escalated exploit invalid — {note2}; INVALID_TEST")
+            phases.append(p2_phase)
+            return {
+                "verdict": Verdict.INVALID_TEST,
+                "baseline": baseline, "attack": attack_metrics2, "attack2": {},
+                "triggered": [], "phases": phases,
+                "thresholds_config": thresholds_config,
+                "notes": note2,
+            }
         crash2 = _container_exited(container_id)
         if crash2:
             attack_metrics2["_crash"] = True
@@ -414,6 +425,19 @@ def run(
             }
 
         attack2 = exploit_fn(plan, new_cid, host, port, attack_duration_s)
+        if attack2.get("_invalid"):
+            note3 = attack2.get("_invalid_reason", "exploit invalid on Phase 3 repeat")
+            print(f"[verifier:{_run_id}] Phase 3 exploit invalid — {note3}; INVALID_TEST")
+            p3_phase["ended_at"] = _now_iso()
+            p3_phase["outcome"] = "invalid_exploit"
+            phases.append(p3_phase)
+            return {
+                "verdict": Verdict.INVALID_TEST,
+                "baseline": baseline, "attack": attack_metrics, "attack2": attack2,
+                "triggered": [], "phases": phases,
+                "thresholds_config": thresholds_config,
+                "notes": note3,
+            }
         crash3 = _container_exited(new_cid)
         if crash3:
             attack2["_crash"] = True
