@@ -381,7 +381,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         print(f"[hypogenie:{_id}] [7/7] DoS Verifier ...")
 
         def _exploit_fn(p, cid, h, prt, dur):
-            return exploit_run(p, container_id=cid, host=h, port=prt, attack_duration_s=dur)
+            return exploit_run(p, container_id=cid, host=h, port=prt, attack_duration_s=dur,
+                               protocol=ctx.protocol)
 
         conf_file   = str(_WORKSPACE / _id / "server.conf")
         verify_result = verify_run(
