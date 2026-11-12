@@ -36,10 +36,14 @@ func init() {
 	encoding.RegisterCodec(rawCodec{})
 }
 
-// streamHandler drains all inbound messages without sending a response.
-// The vulnerability accumulates in recvBuffer.put() before Recv() is called.
+// streamHandler simulates realistic per-message work by retaining a 200-byte
+// allocation per received message — mirroring the struct-metadata amplification
+// described in CVE-2026-84304 (1-byte payload → ~200 bytes server-side overhead).
+// Buffers are released only when the stream closes, so they accumulate while
+// the attacker keeps the stream open.
 func streamHandler(_ any, stream grpc.ServerStream) error {
 	var buf []byte
+	var held [][]byte // retained per-message allocations
 	for {
 		if err := stream.RecvMsg(&buf); err != nil {
 			if err == io.EOF {
@@ -47,6 +51,9 @@ func streamHandler(_ any, stream grpc.ServerStream) error {
 			}
 			return err
 		}
+		// Retain 200 bytes per message to model recvMsg struct overhead.
+		overhead := make([]byte, 200)
+		held = append(held, overhead)
 	}
 }
 
