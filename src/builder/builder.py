@@ -55,6 +55,13 @@ def _extract_json(raw: str) -> str:
     return raw[start:]
 
 
+def _image_exists_locally(image: str) -> bool:
+    """Return True if the image is present in the local Docker image store."""
+    r = subprocess.run(["docker", "image", "inspect", image],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
 def _docker_pull(image: str) -> bool:
     """Try docker pull. Returns True on success."""
     print(f"  [builder:{_run_id}] Trying docker pull {image} ...")
@@ -181,7 +188,10 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
     if docker_image:
         image = docker_image
         print(f"  [builder:{_run_id}] Using docker_image override: {image}")
-        _docker_pull(image)  # pre-pull; ignore failure (may already be cached)
+        if _image_exists_locally(image):
+            print(f"  [builder:{_run_id}] Image found in local store — skipping pull.")
+        else:
+            _docker_pull(image)  # try registry; failure is tolerated only if already local
         # Derive product name from image (e.g. "caddy:2.7.6" → "caddy")
         effective_product = image.split(":")[0].split("/")[-1]
         effective_version = image.split(":")[-1] if ":" in image else version

@@ -29,11 +29,12 @@ _UNREACHABLE_S    = 3      # alive=False for >= 3 consecutive samples
 
 
 class Verdict:
-    CONFIRMED_DOS   = "CONFIRMED_DOS"
-    INCONCLUSIVE    = "INCONCLUSIVE"
-    NO_DOS_EFFECT   = "NO_DOS_EFFECT"
+    CONFIRMED_DOS     = "CONFIRMED_DOS"
+    INCONCLUSIVE      = "INCONCLUSIVE"
+    NO_DOS_EFFECT     = "NO_DOS_EFFECT"
     ENVIRONMENT_ERROR = "ENVIRONMENT_ERROR"
-    INFEASIBLE      = "INFEASIBLE"
+    INFEASIBLE        = "INFEASIBLE"
+    INVALID_TEST      = "INVALID_TEST"   # experiment setup was invalid; result not meaningful
 
 
 def _safe_mean(lst):
@@ -317,6 +318,20 @@ def run(
         "threshold_details": details,
         "escalated": False,
     }
+
+    if attack_metrics.get("_invalid"):
+        note = attack_metrics.get("_invalid_reason", "exploit script failed pre-execution validation")
+        print(f"[verifier:{_run_id}] Exploit invalid — {note}; returning INVALID_TEST (no escalation)")
+        return {
+            "verdict":    Verdict.INVALID_TEST,
+            "baseline":   baseline,
+            "attack":     attack_metrics,
+            "attack2":    {},
+            "triggered":  [],
+            "phases":     phases,
+            "thresholds_config": thresholds_config,
+            "notes":      note,
+        }
 
     if not triggered or not attributed:
         # Escalate once at higher intensity
