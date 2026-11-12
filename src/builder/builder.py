@@ -273,6 +273,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
     cmd = [
         "docker", "run", "-d",
         "--name", f"hypogenie-{_run_id}",
+        "--cpus", "1",
         "-v", f"{certs_dir}/server.crt:/certs/server.crt:ro",
         "-v", f"{certs_dir}/server.key:/certs/server.key:ro",
     ]

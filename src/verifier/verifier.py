@@ -201,6 +201,7 @@ def _restart_container(image: str, container_name: str, ports: str,
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
+        "--cpus", "1",
     ] + vol_args + port_args + [image]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
