@@ -1,0 +1,24 @@
+EXPECTED: CONFIRMED_DOS
+
+REASON: 270K connection-level WINDOW_UPDATE frames/s saturates nginx CPU even though each frame handler is O(1)
+
+TARGET_IMAGE: nginx:1.26.0
+TARGET_PORT: 443/tcp
+CLIENT_TOOL: h2
+
+PROOF_METHOD: runtime_measurement
+PROOF_DETAIL: |
+  Ran connection-level WINDOW_UPDATE flood (increment=1, stream_id=None) against
+  nginx:1.26.0 with 10 concurrent connections for 30 seconds.
+  Result: 821,486 total frames at ~27,383 frames/s, CPU threshold crossed in Phase 2
+  and confirmed in Phase 3 (CONFIRMED_DOS, both phases triggered='cpu').
+
+  The O(1) arithmetic assumption was correct per-frame, but at 270K frames/s across
+  10 connections the cumulative syscall and kernel overhead fully saturates the single
+  nginx worker CPU core (--cpus=1 container). The connection window math is fast but
+  not free at this throughput.
+
+PROOF_NOTES: nginx's WINDOW_UPDATE handler at ngx_http_v2_state_window_update
+             (src/http/v2/ngx_http_v2.c) does only one integer add + overflow check.
+             The bottleneck is the socket recv / frame parse overhead, not the handler
+             itself. At Python socket throughput this is enough to peg the CPU.

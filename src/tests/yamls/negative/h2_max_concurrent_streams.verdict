@@ -1,0 +1,25 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: nginx enforces http2_max_concurrent_streams at the h2 layer; excess streams are
+        rejected with RST_STREAM(REFUSED_STREAM) before any per-request context is allocated.
+
+TARGET_IMAGE: nginx:1.26.0
+TARGET_PORT: 443/tcp
+CLIENT_TOOL: h2
+
+DISPROOF_METHOD: source_analysis + runtime_measurement
+DISPROOF_DETAIL: |
+  nginx enforces the concurrent stream limit in ngx_http_v2_state_headers_save() /
+  ngx_http_v2_state_headers() inside ngx_http_v2.c. When h2c->processing >= the
+  configured http2_max_concurrent_streams, nginx immediately sends RST_STREAM with
+  REFUSED_STREAM error code and increments h2c->refused_streams, returning without
+  allocating an ngx_http_v2_stream_t or calling ngx_http_v2_create_stream().
+
+  Assumption A2 is false: excess streams never reach the request handler layer.
+  Assumption A3 is false: no per-request memory pool is allocated for refused streams.
+  The only cost per refused stream is one integer comparison and one RST_STREAM frame
+  (~9 bytes), which is bounded and negligible at any achievable flood rate.
+
+DISPROOF_NOTES: RFC 7540 §5.1.2 permits the receiver to send RST_STREAM(REFUSED_STREAM)
+                for any stream that exceeds the advertised MAX_CONCURRENT_STREAMS.
+                nginx 1.26.0 correctly implements this protection.

@@ -1,0 +1,50 @@
+target:
+  repo: https://github.com/nginx/nginx
+  version: release-1.26.0
+  docker_image: nginx:1.26.0
+  protocol: HTTP/2
+  entry_point: src/http/v2/ngx_http_v2.c
+  server_config: |
+    events { worker_connections 1024; }
+    http {
+      server {
+        listen 443 ssl http2;
+        ssl_certificate /certs/server.crt;
+        ssl_certificate_key /certs/server.key;
+        http2_max_concurrent_streams 128;
+        location / { return 200 "ok"; }
+      }
+    }
+
+hypothesis: >
+  An attacker opens many more concurrent HTTP/2 streams than nginx's
+  http2_max_concurrent_streams limit (default 128). If nginx dispatches all incoming
+  HEADERS frames to worker request handlers before enforcing the per-connection stream
+  limit, concurrent request contexts accumulate without bound, exhausting nginx worker
+  memory and CPU.
+
+dos_class: resource_exhaustion
+
+required_assumptions:
+  - id: A1
+    description: >
+      nginx's h2 state machine processes every incoming HEADERS frame at the wire
+      level, including frames that exceed the http2_max_concurrent_streams limit,
+      before deciding whether to accept or reject the stream.
+    spec_ref: "RFC 7540 §6.2 — HEADERS frames initiate stream state"
+
+  - id: A2
+    description: >
+      nginx does not enforce http2_max_concurrent_streams at the h2 layer; excess
+      streams are dispatched to upstream request handlers and allocated a full
+      per-request memory pool rather than being rejected with RST_STREAM(REFUSED_STREAM).
+    spec_ref: "RFC 7540 §5.1.2 — stream concurrency"
+
+favorable_assumptions:
+  - id: A3
+    description: >
+      Each accepted stream allocates a per-request nginx memory pool (ngx_pool_t)
+      that persists until the stream closes, so opening streams beyond
+      http2_max_concurrent_streams causes unbounded memory growth proportional to
+      concurrent stream count.
+    spec_ref: "nginx memory model — ngx_http_v2_create_stream"
