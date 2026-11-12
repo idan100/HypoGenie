@@ -334,6 +334,43 @@ def run(
             "notes":      note,
         }
 
+    # Footer Rule 1: PROTOCOL_NEGOTIATED must be "h2" for HTTP/2 and gRPC exploits.
+    # If the TLS handshake negotiated something else (e.g. "http/1.1"), no h2 frames
+    # were processed and the result is meaningless.
+    _proto_neg = attack_metrics.get("_protocol_negotiated")
+    _plan_proto = getattr(plan, "protocol", "HTTP/2")
+    if _proto_neg is not None and _plan_proto in ("HTTP/2", "gRPC") and _proto_neg != "h2":
+        note = (f"ALPN negotiated '{_proto_neg}' instead of 'h2'; "
+                f"server did not speak HTTP/2 — no attack frames were processed")
+        print(f"[verifier:{_run_id}] Footer Rule 1 FAIL — {note}; INVALID_TEST")
+        return {
+            "verdict":    Verdict.INVALID_TEST,
+            "baseline":   baseline,
+            "attack":     attack_metrics,
+            "attack2":    {},
+            "triggered":  [],
+            "phases":     phases,
+            "thresholds_config": thresholds_config,
+            "notes":      note,
+        }
+
+    # Footer Rule 2: CONNECTIONS_ATTEMPTED must be > 0.
+    # Zero means the attack loop never opened a single connection — setup failure.
+    _conns = attack_metrics.get("_connections_attempted")
+    if _conns is not None and _conns == 0:
+        note = "exploit attempted 0 connections; attack loop did not execute"
+        print(f"[verifier:{_run_id}] Footer Rule 2 FAIL — {note}; INVALID_TEST")
+        return {
+            "verdict":    Verdict.INVALID_TEST,
+            "baseline":   baseline,
+            "attack":     attack_metrics,
+            "attack2":    {},
+            "triggered":  [],
+            "phases":     phases,
+            "thresholds_config": thresholds_config,
+            "notes":      note,
+        }
+
     if not triggered or not attributed:
         # Escalate once at higher intensity
         p2_esc_start = _now_iso()
