@@ -41,6 +41,20 @@ _VENV_PYTHON  = _PROJECT_ROOT / ".venv" / "bin" / "python"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def _release_stale_containers() -> None:
+    """Stop and remove any leftover hypogenie-* containers before starting a new run."""
+    result = subprocess.run(
+        ["docker", "ps", "-q", "--filter", "name=hypogenie-"],
+        capture_output=True, text=True, timeout=10,
+    )
+    ids = result.stdout.split()
+    if not ids:
+        return
+    print(f"  [hypogenie] releasing {len(ids)} stale container(s): {ids}")
+    subprocess.run(["docker", "stop"] + ids, capture_output=True, timeout=30)
+    subprocess.run(["docker", "rm"]  + ids, capture_output=True, timeout=30)
+
+
 def _clone_repo(repo_url: str, version: str, dest: Path) -> str:
     if dest.exists():
         print(f"  [hypogenie:{run_id}] Repo already at {dest}")
@@ -367,6 +381,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
 
         # ── 6. Builder ─────────────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [6/7] Builder ...")
+        _release_stale_containers()
         product = _product_from_repo(ctx.repo_url)
         container_info = build(
             product, ctx.version, ctx.entry_point,

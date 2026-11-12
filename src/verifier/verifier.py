@@ -18,7 +18,18 @@ from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from run_context import run_id as _run_id
-from exploiter.tools import MetricsCollector
+from exploiter.tools import MetricsCollector, _probe_latency_ms
+
+def _wait_for_ready(host: str, port: int, tls: bool, timeout_s: int = 30) -> bool:
+    """Poll until the server responds to a probe, up to timeout_s seconds."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        _, alive = _probe_latency_ms(host, port, tls)
+        if alive:
+            return True
+        time.sleep(1)
+    return False
+
 
 # Thresholds per CLAUDE.md §7.7
 _CPU_DELTA_PP     = 50     # attack_mean - baseline_mean >= 50pp (CLAUDE.md §7.7)
@@ -433,8 +444,10 @@ def run(
     new_cid = None
     try:
         new_cid = _restart_container(image, container_name, ports, certs_dir, conf_file, config_path)
-        print(f"[verifier:{_run_id}] Restarted: {new_cid[:12]} — waiting 5s ...")
-        time.sleep(5)
+        print(f"[verifier:{_run_id}] Restarted: {new_cid[:12]} — waiting for ready ...")
+        ready = _wait_for_ready(host, port, tls, timeout_s=30)
+        if not ready:
+            raise RuntimeError("Server did not become ready within 30s after restart")
 
         # Verify new baseline
         col2 = MetricsCollector(new_cid, host, port, probe_tls=tls)
