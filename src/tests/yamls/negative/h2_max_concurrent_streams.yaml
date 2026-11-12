@@ -4,30 +4,35 @@ hypothesis:
     RST_STREAM(REFUSED_STREAM) for streams that exceed that limit. nginx 1.26.0 sets
     http2_max_concurrent_streams to 128 by default.
 
-    An attacker opens far more concurrent HTTP/2 streams than the advertised limit
-    (e.g., 1000 streams per connection across 10 connections). The hypothesis is that
-    nginx allocates a full per-request memory pool for each HEADERS frame before checking
-    whether the per-connection stream count exceeds http2_max_concurrent_streams, so
-    concurrent request contexts accumulate beyond the limit and exhaust nginx worker
-    memory and CPU.
+    An attacker opens one HTTP/2 connection per thread and sends a single batch of
+    1000 HEADERS frames (all with END_STREAM=False). The hypothesis is that nginx
+    allocates a full per-request memory pool for each of the 1000 streams before
+    checking the concurrent stream limit, causing 10 × 1000 = 10,000 live request
+    contexts and significant memory growth.
+
+    The attacker then holds the connection open for the full attack duration without
+    sending further HEADERS or DATA — this tests whether the initial allocation cost
+    is permanent. No reconnection occurs.
 
     The reality is that nginx enforces the stream count limit early in the HEADERS
-    state machine, before allocating any request context. Excess streams receive
-    RST_STREAM(REFUSED_STREAM) with negligible per-frame cost.
+    state machine, before any per-request memory is allocated. Only 128 streams per
+    connection (1280 total) receive actual contexts. The remaining 872 per connection
+    receive RST_STREAM(REFUSED_STREAM) with negligible CPU cost. After the initial
+    burst the CPU returns to baseline — the hold phase generates zero nginx work.
 
     Assumptions:
-    - A1: nginx must read and decode each incoming HTTP/2 frame header (9 bytes:
-          length, type, flags, stream ID) from the socket to determine how to handle it.
-          This is an unavoidable cost of any HTTP/2 implementation.
-    - A2: nginx allocates a full per-request context (ngx_http_v2_stream_t + memory pool)
-          before it checks whether the concurrent stream count exceeds
-          http2_max_concurrent_streams, so excess streams create real request handlers
-          rather than being refused at the h2 layer.
-    - A3: Accumulated per-request contexts are not freed until the stream ends, so
-          opening streams beyond the limit causes nginx worker memory to grow
-          proportionally to the number of accepted-then-refused streams.
+    - A1: nginx must read and decode the HTTP/2 frame header (9 bytes: length, type,
+          flags, stream ID) for every incoming HEADERS frame in order to identify and
+          dispatch it. This is an unavoidable cost independent of whether the stream
+          is accepted.
+    - A2: nginx allocates a full per-request ngx_http_v2_stream_t context for all
+          incoming HEADERS frames before checking whether the concurrent stream count
+          exceeds http2_max_concurrent_streams.
+    - A3: Allocated stream contexts for over-limit streams are not freed promptly,
+          so opening 10,000 streams causes permanent memory growth throughout the
+          attack duration.
 
-  dos_class: resource_exhaustion
+  dos_class: memory
 
 target:
   repo: https://github.com/nginx/nginx
@@ -55,18 +60,20 @@ assumptions:
     description: "nginx allocates a full per-request ngx_http_v2_stream_t context before checking http2_max_concurrent_streams, so excess streams create real request handlers"
     necessity: required
   - id: A3
-    description: "Per-request contexts for over-limit streams accumulate and are not freed promptly, causing unbounded memory growth"
+    description: "Allocated contexts for refused streams are not freed promptly, causing permanent memory growth proportional to total streams attempted"
     necessity: favorable
 
 suspected_mechanism:
   - step: 1
-    action: "Open 10 concurrent HTTP/2 connections with ALPN h2 to nginx"
+    action: "Open exactly 10 HTTP/2 connections via TLS ALPN h2 — one per attacker thread. Do NOT reconnect during the attack."
   - step: 2
-    action: "On each connection, send HEADERS frames attempting to open 1000 concurrent streams (8x over the 128 limit)"
+    action: "On each connection, send a single one-shot batch of 1000 HEADERS frames (END_STREAM=False) as fast as possible, then stop sending HEADERS."
   - step: 3
-    action: "If A2 holds, nginx allocates request contexts for all 1000 streams before enforcing the limit — memory grows proportionally"
+    action: "If A2 holds: nginx allocates 10,000 stream contexts before enforcing the limit — memory grows by 10,000 × context_size bytes and stays elevated for the full duration."
   - step: 4
-    action: "nginx enforces the limit before allocation in ngx_http_v2_state_headers(): only 128 streams per connection get a context; excess receive RST_STREAM(REFUSED_STREAM)"
+    action: "Hold all 10 connections open and idle for the full attack duration (do NOT send DATA, do NOT send more HEADERS, do NOT reconnect). This tests whether memory from the initial batch accumulates permanently."
+  - step: 5
+    action: "nginx enforces the limit before allocation: only 1,280 contexts exist (128 × 10), and the CPU cost of RST_STREAM for the 8,720 refused streams is negligible. After the initial burst (<1s), nginx CPU returns to baseline."
 
 rfc_sections:
   - rfc: RFC 7540
