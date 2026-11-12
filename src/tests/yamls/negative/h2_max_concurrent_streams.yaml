@@ -5,24 +5,27 @@ hypothesis:
     http2_max_concurrent_streams to 128 by default.
 
     An attacker opens far more concurrent HTTP/2 streams than the advertised limit
-    (e.g., 1000 streams per connection). The hypothesis is that nginx dispatches all
-    incoming HEADERS frames to worker request handlers before enforcing the per-connection
-    stream limit, allowing concurrent request contexts to accumulate without bound and
-    exhaust nginx worker memory and CPU.
+    (e.g., 1000 streams per connection across 10 connections). The hypothesis is that
+    nginx allocates a full per-request memory pool for each HEADERS frame before checking
+    whether the per-connection stream count exceeds http2_max_concurrent_streams, so
+    concurrent request contexts accumulate beyond the limit and exhaust nginx worker
+    memory and CPU.
 
-    However, nginx enforces the limit at the h2 layer in ngx_http_v2_state_headers():
-    when h2c->processing reaches http2_max_concurrent_streams, excess streams are
-    rejected with RST_STREAM(REFUSED_STREAM) before any per-request memory pool is
-    allocated. The per-refused-stream cost is one integer comparison plus one small
-    RST_STREAM frame, which is negligible at any achievable flood rate.
+    The reality is that nginx enforces the stream count limit early in the HEADERS
+    state machine, before allocating any request context. Excess streams receive
+    RST_STREAM(REFUSED_STREAM) with negligible per-frame cost.
 
     Assumptions:
-    - A1: nginx's h2 state machine processes every incoming HEADERS frame at the wire
-          level, including those exceeding the concurrent stream limit.
-    - A2: nginx does not enforce http2_max_concurrent_streams at the h2 layer; excess
-          streams are dispatched to request handlers rather than rejected with RST_STREAM.
-    - A3: Each accepted stream allocates a per-request memory pool that persists until
-          the stream closes, causing unbounded memory growth.
+    - A1: nginx must read and decode each incoming HTTP/2 frame header (9 bytes:
+          length, type, flags, stream ID) from the socket to determine how to handle it.
+          This is an unavoidable cost of any HTTP/2 implementation.
+    - A2: nginx allocates a full per-request context (ngx_http_v2_stream_t + memory pool)
+          before it checks whether the concurrent stream count exceeds
+          http2_max_concurrent_streams, so excess streams create real request handlers
+          rather than being refused at the h2 layer.
+    - A3: Accumulated per-request contexts are not freed until the stream ends, so
+          opening streams beyond the limit causes nginx worker memory to grow
+          proportionally to the number of accepted-then-refused streams.
 
   dos_class: resource_exhaustion
 
@@ -46,24 +49,24 @@ target:
 
 assumptions:
   - id: A1
-    description: "nginx h2 state machine processes every incoming HEADERS frame at the wire level before accepting or refusing the stream"
+    description: "nginx must read and decode every incoming HTTP/2 frame header from the socket — an unavoidable cost independent of whether the stream is accepted or refused"
     necessity: required
   - id: A2
-    description: "nginx does not enforce http2_max_concurrent_streams at the h2 layer; excess streams reach the request handler"
+    description: "nginx allocates a full per-request ngx_http_v2_stream_t context before checking http2_max_concurrent_streams, so excess streams create real request handlers"
     necessity: required
   - id: A3
-    description: "Each stream over the limit allocates a per-request ngx_pool_t causing unbounded memory growth"
+    description: "Per-request contexts for over-limit streams accumulate and are not freed promptly, causing unbounded memory growth"
     necessity: favorable
 
 suspected_mechanism:
   - step: 1
-    action: "Open 10 concurrent HTTP/2 connections with ALPN h2"
+    action: "Open 10 concurrent HTTP/2 connections with ALPN h2 to nginx"
   - step: 2
-    action: "On each connection, rapidly send HEADERS frames attempting to open 1000 concurrent streams (8x over the 128 limit)"
+    action: "On each connection, send HEADERS frames attempting to open 1000 concurrent streams (8x over the 128 limit)"
   - step: 3
-    action: "If A2 holds, nginx dispatches all 1000 streams to worker handlers; memory and CPU grow proportionally"
+    action: "If A2 holds, nginx allocates request contexts for all 1000 streams before enforcing the limit — memory grows proportionally"
   - step: 4
-    action: "nginx's RST_STREAM(REFUSED_STREAM) enforcement means only 128 streams are accepted per connection; CPU stays bounded"
+    action: "nginx enforces the limit before allocation in ngx_http_v2_state_headers(): only 128 streams per connection get a context; excess receive RST_STREAM(REFUSED_STREAM)"
 
 rfc_sections:
   - rfc: RFC 7540
