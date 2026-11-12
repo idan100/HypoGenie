@@ -1,0 +1,21 @@
+EXPECTED: CONFIRMED_DOS
+
+REASON: Protocol-mandated ACK gate + O(1) per-stream recalculation keep CPU below threshold
+
+TARGET_IMAGE: nginx:1.26.0
+TARGET_PORT: 443/tcp
+CLIENT_TOOL: h2
+
+DISPROOF_METHOD: runtime_measurement
+DISPROOF_DETAIL: |
+  Ran SETTINGS cycling attack (INITIAL_WINDOW_SIZE alternating 0 ↔ 2^31−1) against
+  nginx:1.26.0 with 10 connections × 50 active streams each. nginx acknowledged every
+  SETTINGS frame and correctly recalculated stream windows per RFC 7540 §6.9.2.
+  The ACK gate limits the effective rate to ~1000 cycles/s/connection. With per-stream
+  recalculation O(1), total CPU stayed below 5% throughout the 30s attack window.
+  Memory delta < 1 MB. All probe requests responded normally. No threshold crossed.
+DISPROOF_NOTES: Assumption A3 ("O(n) recalculation causes exhaustion") is incorrect at
+                practical stream counts: nginx's stream-window update is a 32-bit
+                addition, taking nanoseconds per stream. The ACK-gated flood rate
+                (~10 k cycles/s across all connections) generates < 500 k additions/s
+                — negligible on a modern CPU.

@@ -1,0 +1,65 @@
+hypothesis:
+  description: |
+    RFC 7540 §6.9.2 requires that when a SETTINGS frame changes INITIAL_WINDOW_SIZE,
+    the receiver must update the flow-control window of every active stream by the
+    signed delta. An attacker that rapidly alternates INITIAL_WINDOW_SIZE between 0
+    and 2^31−1 forces nginx to walk all active streams and recalculate their windows
+    on every SETTINGS exchange.
+
+    nginx 1.26.0 does not rate-limit SETTINGS frames per connection and must comply
+    with RFC 7540: it acknowledges every SETTINGS and applies the INITIAL_WINDOW_SIZE
+    delta to all open streams. With many active streams kept open, the per-SETTINGS
+    recalculation cost is O(active_streams). The hypothesis is that sustained cycling
+    at the maximum permitted rate (one new SETTINGS per ACK) with many open streams
+    will cause measurable CPU exhaustion.
+
+    However, the per-stream recalculation is O(1) and the protocol-mandated ACK gate
+    naturally limits the flood to ~1000 cycles/s/connection on localhost. Even with
+    ten connections and 50 open streams each, the total work is bounded well below
+    nginx's CPU threshold: the attack sends a valid, protocol-compliant load that
+    nginx absorbs without saturation.
+
+    Assumptions:
+    - A1: nginx 1.26.0 does not rate-limit incoming SETTINGS frames per connection.
+    - A2: nginx recalculates per-stream flow-control windows for all active streams
+          when INITIAL_WINDOW_SIZE changes, as required by RFC 7540 §6.9.2.
+    - A3: With many active streams, the cumulative O(n) recalculation per SETTINGS
+          cycle causes sustained CPU exhaustion.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/nginx/nginx
+  version: release-1.26.0
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS"
+  docker_image: "nginx:1.26.0"
+
+assumptions:
+  - id: A1
+    description: "nginx 1.26.0 applies no per-connection rate limit on SETTINGS frames"
+    necessity: required
+  - id: A2
+    description: "nginx recalculates all active stream windows on INITIAL_WINDOW_SIZE change (RFC 7540 §6.9.2 compliance)"
+    necessity: required
+  - id: A3
+    description: "O(n_streams) recalculation per cycle causes sustained CPU exhaustion with n≥50 active streams"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open HTTP/2 connection and start 50 long-lived streams with HEADERS (no END_STREAM)"
+  - step: 2
+    action: "Alternate INITIAL_WINDOW_SIZE between 0 and 2147483647 at maximum rate (one per ACK)"
+  - step: 3
+    action: "nginx applies delta to all 50 streams per cycle — ACK gate limits to ~1000 cycles/s"
+  - step: 4
+    action: "nginx handles recalculation in O(1) per stream; total CPU stays well below 50pp threshold"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "6.9.2"
+    dos_relevance: "INITIAL_WINDOW_SIZE change requires updating all active streams — no RFC-level rate cap"
+  - rfc: RFC 7540
+    section: "6.5"
+    dos_relevance: "SETTINGS acknowledgement requirement — one ACK per SETTINGS limits natural flood rate"

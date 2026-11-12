@@ -1,0 +1,66 @@
+hypothesis:
+  description: |
+    RFC 7540 §6.9.1 permits a sender to issue WINDOW_UPDATE frames at any time,
+    including on the connection level (stream identifier 0). Each connection-level
+    WINDOW_UPDATE increments nginx's send window by the specified value. An attacker
+    that floods connection-level WINDOW_UPDATE frames with small increments forces
+    nginx to execute the update path on every frame, potentially saturating the event
+    loop CPU budget with arithmetic and bounds-checking work.
+
+    nginx 1.26.0 applies no per-frame rate limit on connection-level WINDOW_UPDATE
+    frames: it processes every frame, checks for overflow, and updates h2c->send_window
+    with a 32-bit addition. The operation is O(1) and executes on nginx's single-threaded
+    event loop. The hypothesis is that sending WINDOW_UPDATE at the maximum socket
+    throughput rate will accumulate enough per-frame CPU overhead to saturate the
+    worker process.
+
+    However, the per-frame work is minimal — one bounds-check comparison and one
+    integer addition — with no frame allocation, no ACK queued, and no stream tree
+    traversal. The practical per-frame cost is a few nanoseconds of CPU. Even at the
+    highest Python-achievable flood rate (~500 K frames/s over localhost), the aggregate
+    nginx CPU stays well under the 50-percentile-point sustained threshold.
+
+    Assumptions:
+    - A1: nginx 1.26.0 processes every connection-level WINDOW_UPDATE without rate limiting.
+    - A2: nginx updates h2c->send_window via a single O(1) bounds-check and integer
+          addition, with no ACK frame allocated or queued.
+    - A3: The aggregate CPU from O(1) arithmetic at achievable Python flood rates crosses
+          the sustained 50 pp CPU threshold.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/nginx/nginx
+  version: release-1.26.0
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS"
+  docker_image: "nginx:1.26.0"
+
+assumptions:
+  - id: A1
+    description: "nginx 1.26.0 applies no per-connection rate limit on connection-level WINDOW_UPDATE frames (stream id 0)"
+    necessity: required
+  - id: A2
+    description: "nginx connection-level WINDOW_UPDATE handling is O(1): one overflow check + h2c->send_window += increment, no ACK queued"
+    necessity: required
+  - id: A3
+    description: "O(1) arithmetic per frame × Python-achievable flood rate (~500 K/s) produces sustained CPU exhaustion"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open 10 concurrent HTTP/2 connections to nginx"
+  - step: 2
+    action: "On each connection, loop: send WINDOW_UPDATE (stream id 0) with increment=1; nginx adds 1 to h2c->send_window; no ACK is sent back"
+  - step: 3
+    action: "The connection window fills to max (2^31-1) after ~2.1 billion increments — well beyond the 30-second window"
+  - step: 4
+    action: "Measure nginx CPU; the O(1) per-frame arithmetic does not accumulate past the threshold"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "6.9"
+    dos_relevance: "WINDOW_UPDATE frames must be processed immediately; no RFC-level rate cap"
+  - rfc: RFC 7540
+    section: "6.9.1"
+    dos_relevance: "Connection-level WINDOW_UPDATE (stream id 0) updates the whole-connection flow-control window"
