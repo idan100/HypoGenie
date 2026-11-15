@@ -30,6 +30,7 @@ from exploit_planner.exploit_planner import run as plan_run
 from builder.builder import build, teardown
 from exploiter.exploiter import run as exploit_run
 from verifier.verifier import run as verify_run, Verdict
+from exploiter.exploiter import make_control_fn as _make_control_fn
 import llm_client as _llm
 
 _PROJECT_ROOT = Path(__file__).parent
@@ -404,6 +405,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             return exploit_run(p, container_id=cid, host=h, port=prt, attack_duration_s=dur,
                                protocol=ctx.protocol, dos_class=ctx.dos_class)
 
+        _control_fn = _make_control_fn(ctx.protocol, ctx.dos_class)
+
         conf_file   = str(_WORKSPACE / _id / "server.conf")
         verify_result = verify_run(
             plan, container_id, host, port,
@@ -414,6 +417,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             certs_dir=str(_CERTS_DIR),
             conf_file=conf_file,
             config_path=container_info.get("config_path", ""),
+            control_exploit_fn=_control_fn,
+            has_code_findings=len(findings) > 0,
         )
 
         verdict = verify_result["verdict"]
@@ -476,7 +481,8 @@ def run_test_suite(suite_dir: str, expect: str) -> None:
 
         passed = (verdict == expect) or (
             expect == "NO_DOS_EFFECT" and verdict in (
-                Verdict.NO_DOS_EFFECT, Verdict.INCONCLUSIVE, Verdict.INFEASIBLE)
+                Verdict.NO_DOS_EFFECT, Verdict.INCONCLUSIVE, Verdict.INFEASIBLE,
+                Verdict.DEFECT, Verdict.REJECTED)
         )
         results.append((yaml_path.name, verdict, passed))
         status = "✓" if passed else "✗"

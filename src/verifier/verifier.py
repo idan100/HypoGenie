@@ -38,6 +38,12 @@ _MEM_DELTA_MB     = 100    # peak - baseline_mean >= 100 MB
 _LAT_RATIO        = 5      # attack_mean >= 5× baseline_mean
 _UNREACHABLE_S    = 3      # alive=False for >= 3 consecutive samples
 
+# Differential attribution thresholds
+# control_delta / target_delta < CONFIRM → target >> control → real application overhead
+# control_delta / target_delta >= REJECT  → control ≈ target → transport overhead only
+_CTRL_CONFIRM_RATIO = 0.50   # control must be < 50% of target to confirm
+_CTRL_REJECT_RATIO  = 0.80   # control >= 80% of target → reject as transport overhead
+
 
 class Verdict:
     CONFIRMED_DOS     = "CONFIRMED_DOS"
@@ -46,6 +52,8 @@ class Verdict:
     ENVIRONMENT_ERROR = "ENVIRONMENT_ERROR"
     INFEASIBLE        = "INFEASIBLE"
     INVALID_TEST      = "INVALID_TEST"   # experiment setup was invalid; result not meaningful
+    DEFECT            = "DEFECT"         # code issue confirmed but not exploitable as DoS
+    REJECTED          = "REJECTED"       # false positive: control test shows transport overhead
 
 
 def _safe_mean(lst):
@@ -180,6 +188,62 @@ def _baseline_healthy(baseline: dict) -> bool:
     return True
 
 
+def _check_differential(baseline: dict, target: dict, control: dict) -> tuple[bool, str, dict]:
+    """
+    Compare target vs control impact above baseline.
+    Returns (attributed, reason_note, details_dict).
+
+    attributed = True when target impact >> control impact on at least one metric:
+      CPU:    control_delta / target_delta < _CTRL_CONFIRM_RATIO
+      Memory: same ratio check on peak deltas
+    """
+    b_cpu = _safe_mean(baseline["cpu_pct"])
+    t_cpu = _safe_mean(target.get("cpu_pct", []))
+    c_cpu = _safe_mean(control.get("cpu_pct", []))
+    t_cpu_delta = max(0.0, t_cpu - b_cpu)
+    c_cpu_delta = max(0.0, c_cpu - b_cpu)
+
+    b_mem = _safe_mean(baseline["mem_mb"])
+    t_mem = max(target.get("mem_mb") or [b_mem])
+    c_mem = max(control.get("mem_mb") or [b_mem])
+    t_mem_delta = max(0.0, t_mem - b_mem)
+    c_mem_delta = max(0.0, c_mem - b_mem)
+
+    cpu_ratio  = (c_cpu_delta / t_cpu_delta) if t_cpu_delta > 5  else 1.0
+    mem_ratio  = (c_mem_delta / t_mem_delta) if t_mem_delta > 10 else 1.0
+
+    cpu_attributed = cpu_ratio < _CTRL_CONFIRM_RATIO
+    mem_attributed = mem_ratio < _CTRL_CONFIRM_RATIO
+    attributed = cpu_attributed or mem_attributed
+
+    details = {
+        "baseline_cpu_pct": round(b_cpu, 2),
+        "target_cpu_mean_pct": round(t_cpu, 2),
+        "control_cpu_mean_pct": round(c_cpu, 2),
+        "cpu_delta_target": round(t_cpu_delta, 2),
+        "cpu_delta_control": round(c_cpu_delta, 2),
+        "cpu_ratio": round(cpu_ratio, 3),
+        "cpu_attributed": cpu_attributed,
+        "baseline_mem_mb": round(b_mem, 2),
+        "target_mem_peak_mb": round(t_mem, 2),
+        "control_mem_peak_mb": round(c_mem, 2),
+        "mem_delta_target": round(t_mem_delta, 2),
+        "mem_delta_control": round(c_mem_delta, 2),
+        "mem_ratio": round(mem_ratio, 3),
+        "mem_attributed": mem_attributed,
+        "attributed": attributed,
+        "confirm_threshold": _CTRL_CONFIRM_RATIO,
+        "reject_threshold": _CTRL_REJECT_RATIO,
+    }
+    reason = (
+        f"CPU: target={t_cpu:.1f}% control={c_cpu:.1f}% base={b_cpu:.1f}% "
+        f"(δtarget={t_cpu_delta:.1f}pp δcontrol={c_cpu_delta:.1f}pp ratio={cpu_ratio:.2f}); "
+        f"MEM: target_peak={t_mem:.0f}MB control_peak={c_mem:.0f}MB base={b_mem:.0f}MB "
+        f"(ratio={mem_ratio:.2f})"
+    )
+    return attributed, reason, details
+
+
 def _container_exited(container_id: str) -> bool:
     result = subprocess.run(
         ["docker", "inspect", "--format", "{{.State.ExitCode}}", container_id],
@@ -236,6 +300,9 @@ def run(
     config_path: str = "",
     baseline_duration_s: int = 10,
     attack_duration_s: int = 30,
+    # differential attribution
+    control_exploit_fn: Callable | None = None,
+    has_code_findings: bool = False,
 ) -> dict:
     """
     Three-phase DoS verification.
@@ -474,6 +541,48 @@ def run(
                 "notes": "Phase 3 restart produced unhealthy baseline — cannot confirm repeatability",
             }
 
+        # ── Phase 2c: Differential control test (runs on the Phase-3 container) ──
+        # Send a cheap-payload equivalent at the same intensity as the target.
+        # If control ≈ target → CPU is from TLS/kernel overhead, not application logic.
+        p2c_phase: dict = {"phase": "control"}
+        if control_exploit_fn is not None:
+            print(f"[verifier:{_run_id}] Phase 2c — Control test ({attack_duration_s}s) ...")
+            p2c_start = _now_iso()
+            control_metrics = control_exploit_fn(attack_metrics, new_cid, host, port, attack_duration_s)
+            p2c_phase["started_at"] = p2c_start
+            p2c_phase["ended_at"]   = _now_iso()
+            p2c_phase["sample_count"] = len(control_metrics.get("cpu_pct", []))
+
+            diff_attributed, diff_reason, diff_details = _check_differential(
+                baseline2, attack_metrics, control_metrics
+            )
+            p2c_phase["differential"] = diff_details
+            p2c_phase["attributed"]   = diff_attributed
+            print(f"[verifier:{_run_id}] Phase 2c differential — {diff_reason}")
+            print(f"[verifier:{_run_id}] Phase 2c attributed={diff_attributed}")
+            phases.append(p2c_phase)
+
+            if not diff_attributed:
+                # Control matched target → CPU/memory came from transport overhead.
+                if has_code_findings:
+                    verdict = Verdict.DEFECT
+                    note = (f"Control test shows transport overhead (not application-level): "
+                            f"{diff_reason}. Source analysis found code issues (DEFECT).")
+                else:
+                    verdict = Verdict.REJECTED
+                    note = (f"Control test rejects finding as transport overhead: {diff_reason}. "
+                            f"No source-level code issues found.")
+                print(f"[verifier:{_run_id}] {verdict} — {note}")
+                return {
+                    "verdict": verdict,
+                    "baseline": baseline, "attack": attack_metrics,
+                    "attack2": control_metrics,
+                    "triggered": triggered, "phases": phases,
+                    "thresholds_config": thresholds_config,
+                    "notes": note,
+                }
+
+        # ── Phase 3: Repeatability (run target on the same restarted container) ──
         attack2 = exploit_fn(plan, new_cid, host, port, attack_duration_s)
         if attack2.get("_invalid"):
             note3 = attack2.get("_invalid_reason", "exploit invalid on Phase 3 repeat")
