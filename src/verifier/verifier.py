@@ -11,6 +11,7 @@ Replaces CVE-Genie's CTF flag checker.
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from statistics import mean
@@ -44,6 +45,10 @@ _UNREACHABLE_S    = 3      # alive=False for >= 3 consecutive samples
 _CTRL_CONFIRM_RATIO = 0.50   # control must be < 50% of target to confirm
 _CTRL_REJECT_RATIO  = 0.80   # control >= 80% of target → reject as transport overhead
 
+# TLS calibration: measures per-connection TLS CPU cost during Phase 1
+_TLS_CAL_RATE     = 100   # TLS handshakes/s during calibration
+_TLS_CAL_DURATION = 15    # seconds
+
 
 class Verdict:
     CONFIRMED_DOS     = "CONFIRMED_DOS"
@@ -59,6 +64,67 @@ class Verdict:
 def _safe_mean(lst):
     vals = [v for v in lst if v is not None]
     return mean(vals) if vals else 0.0
+
+
+def _run_tls_calibration(container_id: str, host: str, port: int,
+                          rate: int = _TLS_CAL_RATE,
+                          duration: int = _TLS_CAL_DURATION) -> float:
+    """
+    Measure per-connection TLS handshake CPU cost on the server.
+
+    Opens TLS connections at `rate`/s for `duration` seconds without sending
+    any application-layer frames.  MetricsCollector runs in parallel to record
+    container CPU.  Returns the mean CPU % observed during calibration.
+
+    Returns 0.0 on any failure so the caller can safely fall back to ratio-only
+    differential attribution.
+    """
+    script = f"""\
+import ssl, socket, time, threading
+
+HOST = {repr(host)}
+PORT = {port}
+RATE = {rate}
+DURATION = {duration}
+
+def _connect():
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        s = socket.create_connection((HOST, PORT), timeout=2)
+        tls = ctx.wrap_socket(s, server_hostname=HOST)
+        tls.close()
+    except Exception:
+        pass
+
+start = time.time()
+interval = 1.0 / RATE
+while time.time() - start < DURATION:
+    threading.Thread(target=_connect, daemon=True).start()
+    time.sleep(interval)
+time.sleep(1)
+"""
+    collector = MetricsCollector(container_id, host, port, probe_tls=(port in (443, 8443)))
+    collector.start()
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(script)
+            script_path = f.name
+        subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True, timeout=duration + 10,
+        )
+    except Exception:
+        pass
+    finally:
+        collector.stop()
+        try:
+            os.unlink(script_path)
+        except Exception:
+            pass
+
+    return _safe_mean(collector.snapshot().get("cpu_pct", []))
 
 
 def _now_iso() -> str:
@@ -188,14 +254,22 @@ def _baseline_healthy(baseline: dict) -> bool:
     return True
 
 
-def _check_differential(baseline: dict, target: dict, control: dict) -> tuple[bool, str, dict]:
+def _check_differential(baseline: dict, target: dict, control: dict,
+                        tls_cpu_per_conn_s: float = 0.0,
+                        attack_conn_rate: float = 0.0) -> tuple[bool, str, dict]:
     """
     Compare target vs control impact above baseline.
     Returns (attributed, reason_note, details_dict).
 
-    attributed = True when target impact >> control impact on at least one metric:
-      CPU:    control_delta / target_delta < _CTRL_CONFIRM_RATIO
-      Memory: same ratio check on peak deltas
+    Two independent attribution paths — either one is sufficient:
+      1. Ratio path: control_delta / target_delta < _CTRL_CONFIRM_RATIO
+         (control test shows transport overhead dominates)
+      2. Net-app path: (target_delta - predicted_tls_cpu) >= _CPU_DELTA_PP
+         (even after subtracting the calibrated TLS cost, application overhead
+          still crosses the DoS threshold independently)
+
+    tls_cpu_per_conn_s: per-connection TLS CPU cost from Phase 1b calibration
+    attack_conn_rate:   connections/s during the target attack (from footer)
     """
     b_cpu = _safe_mean(baseline["cpu_pct"])
     t_cpu = _safe_mean(target.get("cpu_pct", []))
@@ -209,35 +283,59 @@ def _check_differential(baseline: dict, target: dict, control: dict) -> tuple[bo
     t_mem_delta = max(0.0, t_mem - b_mem)
     c_mem_delta = max(0.0, c_mem - b_mem)
 
-    cpu_ratio  = (c_cpu_delta / t_cpu_delta) if t_cpu_delta > 5  else 1.0
-    mem_ratio  = (c_mem_delta / t_mem_delta) if t_mem_delta > 10 else 1.0
+    cpu_ratio = (c_cpu_delta / t_cpu_delta) if t_cpu_delta > 5  else 1.0
+    mem_ratio = (c_mem_delta / t_mem_delta) if t_mem_delta > 10 else 1.0
 
-    cpu_attributed = cpu_ratio < _CTRL_CONFIRM_RATIO
+    # Net application CPU: subtract the predicted TLS handshake contribution.
+    # If the calibration was not run (tls_cpu_per_conn_s == 0), this collapses
+    # to t_cpu_delta and the net-app path is irrelevant (ratio path still works).
+    expected_tls_cpu  = tls_cpu_per_conn_s * attack_conn_rate
+    net_app_cpu_delta = max(0.0, t_cpu_delta - expected_tls_cpu)
+
+    # Attribution: ratio path OR net-app path
+    cpu_ratio_attributed   = cpu_ratio < _CTRL_CONFIRM_RATIO
+    cpu_netapp_attributed  = (tls_cpu_per_conn_s > 0 and attack_conn_rate > 0
+                              and net_app_cpu_delta >= _CPU_DELTA_PP)
+    cpu_attributed = cpu_ratio_attributed or cpu_netapp_attributed
     mem_attributed = mem_ratio < _CTRL_CONFIRM_RATIO
     attributed = cpu_attributed or mem_attributed
 
     details = {
-        "baseline_cpu_pct": round(b_cpu, 2),
+        "baseline_cpu_pct":    round(b_cpu, 2),
         "target_cpu_mean_pct": round(t_cpu, 2),
         "control_cpu_mean_pct": round(c_cpu, 2),
-        "cpu_delta_target": round(t_cpu_delta, 2),
-        "cpu_delta_control": round(c_cpu_delta, 2),
-        "cpu_ratio": round(cpu_ratio, 3),
-        "cpu_attributed": cpu_attributed,
-        "baseline_mem_mb": round(b_mem, 2),
-        "target_mem_peak_mb": round(t_mem, 2),
+        "cpu_delta_target":    round(t_cpu_delta, 2),
+        "cpu_delta_control":   round(c_cpu_delta, 2),
+        "cpu_ratio":           round(cpu_ratio, 3),
+        "cpu_ratio_attributed": cpu_ratio_attributed,
+        # TLS-calibrated net-app path
+        "tls_cpu_per_conn_s":  round(tls_cpu_per_conn_s, 5),
+        "attack_conn_rate":    round(attack_conn_rate, 1),
+        "expected_tls_cpu_pp": round(expected_tls_cpu, 2),
+        "net_app_cpu_delta_pp": round(net_app_cpu_delta, 2),
+        "cpu_netapp_attributed": cpu_netapp_attributed,
+        "cpu_attributed":      cpu_attributed,
+        # Memory
+        "baseline_mem_mb":     round(b_mem, 2),
+        "target_mem_peak_mb":  round(t_mem, 2),
         "control_mem_peak_mb": round(c_mem, 2),
-        "mem_delta_target": round(t_mem_delta, 2),
-        "mem_delta_control": round(c_mem_delta, 2),
-        "mem_ratio": round(mem_ratio, 3),
-        "mem_attributed": mem_attributed,
-        "attributed": attributed,
-        "confirm_threshold": _CTRL_CONFIRM_RATIO,
-        "reject_threshold": _CTRL_REJECT_RATIO,
+        "mem_delta_target":    round(t_mem_delta, 2),
+        "mem_delta_control":   round(c_mem_delta, 2),
+        "mem_ratio":           round(mem_ratio, 3),
+        "mem_attributed":      mem_attributed,
+        "attributed":          attributed,
+        "confirm_threshold":   _CTRL_CONFIRM_RATIO,
+        "reject_threshold":    _CTRL_REJECT_RATIO,
     }
+
+    net_app_note = (
+        f" net_app={net_app_cpu_delta:.1f}pp (tls_pred={expected_tls_cpu:.1f}pp)"
+        if tls_cpu_per_conn_s > 0 else ""
+    )
     reason = (
         f"CPU: target={t_cpu:.1f}% control={c_cpu:.1f}% base={b_cpu:.1f}% "
-        f"(δtarget={t_cpu_delta:.1f}pp δcontrol={c_cpu_delta:.1f}pp ratio={cpu_ratio:.2f}); "
+        f"(δtarget={t_cpu_delta:.1f}pp δcontrol={c_cpu_delta:.1f}pp ratio={cpu_ratio:.2f})"
+        f"{net_app_note}; "
         f"MEM: target_peak={t_mem:.0f}MB control_peak={c_mem:.0f}MB base={b_mem:.0f}MB "
         f"(ratio={mem_ratio:.2f})"
     )
@@ -365,6 +463,22 @@ def run(
         }
     print(f"[verifier:{_run_id}] Baseline OK — cpu={p1_phase['cpu_mean_pct']}% "
           f"lat={p1_phase['latency_mean_ms']}ms")
+
+    # ── Phase 1b: TLS calibration ──────────────────────────────────────────────
+    # Only meaningful for TLS endpoints; skipped for plain TCP.
+    tls_cpu_per_conn_s = 0.0
+    if tls:
+        print(f"[verifier:{_run_id}] Phase 1b — TLS calibration "
+              f"({_TLS_CAL_DURATION}s at {_TLS_CAL_RATE}/s) ...")
+        cal_cpu = _run_tls_calibration(container_id, host, port)
+        idle_cpu = _safe_mean(baseline["cpu_pct"])
+        # Net TLS cost above idle, normalised to per-connection CPU-seconds.
+        tls_cpu_per_conn_s = max(0.0, cal_cpu - idle_cpu) / _TLS_CAL_RATE
+        baseline["tls_cpu_per_conn_s"] = round(tls_cpu_per_conn_s, 5)
+        p1_phase["tls_cal_cpu_pct"]    = round(cal_cpu, 2)
+        p1_phase["tls_cpu_per_conn_s"] = round(tls_cpu_per_conn_s, 5)
+        print(f"[verifier:{_run_id}] TLS cal: cpu={cal_cpu:.1f}% "
+              f"idle={idle_cpu:.1f}% per_conn_s={tls_cpu_per_conn_s:.4f}%")
 
     # ── Phase 2: Attack + Attribution ─────────────────────────────────────────
     p2_start = _now_iso()
@@ -553,8 +667,15 @@ def run(
             p2c_phase["ended_at"]   = _now_iso()
             p2c_phase["sample_count"] = len(control_metrics.get("cpu_pct", []))
 
+            # Derive connection rate from attack metrics for TLS-calibrated attribution.
+            _atk_conns = attack_metrics.get("_connections_attempted", 0)
+            _atk_dur   = attack_metrics.get("_duration_s", attack_duration_s) or attack_duration_s
+            attack_conn_rate = _atk_conns / _atk_dur if _atk_conns else 0.0
+
             diff_attributed, diff_reason, diff_details = _check_differential(
-                baseline2, attack_metrics, control_metrics
+                baseline2, attack_metrics, control_metrics,
+                tls_cpu_per_conn_s=tls_cpu_per_conn_s,
+                attack_conn_rate=attack_conn_rate,
             )
             p2c_phase["differential"] = diff_details
             p2c_phase["attributed"]   = diff_attributed
