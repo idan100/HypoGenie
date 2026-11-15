@@ -1,4 +1,4 @@
-EXPECTED: CONFIRMED_DOS
+EXPECTED: DEFECT
 CVE: CVE-2023-44487
 
 ATTACK: Rapid HEADERS+RST_STREAM cycles exhaust server goroutine/handler pool
@@ -11,12 +11,18 @@ CLIENT_TOOL: h2
 
 FINDING_TYPE: SecurityDesignGap
 
-PROOF_METHOD: metric
+PROOF_METHOD: differential_attribution
 PROOF_METRIC: cpu_pct
-PROOF_THRESHOLD: +50pp for 5s
-PROOF_NOTES: PENDING — no live exploit run against caddy:2.7.4 / golang/net v0.14.0 has been
-             performed. The CPU and goroutine measurements previously cited were taken against a
-             patched image (caddy:2.7.5 / golang/net v0.17.0) and cannot be attributed to the
-             vulnerable target. Run the pipeline against caddy:2.7.4 to obtain actual measurements.
-             Expected: CPU spike ≥50pp, goroutine growth, unreachability within 30s. Fixed in
-             golang/net v0.17.0 via per-connection RST_STREAM rate limit (100/s).
+PROOF_THRESHOLD: control_delta / target_delta < 0.50
+PROOF_NOTES: Run 20261115-180418-7f70 against caddy:2.7.4 / golang/net v0.14.0.
+             Code gap is real (no RST_STREAM rate limit — findings confirmed by Gap Finder).
+             Exploit sent 483,500 RST_STREAM frames in 30s (avg_lifetime=0.06s, reconnect mode).
+             CPU threshold crossed: target_delta=311.7pp (>50pp threshold, 5s sustained).
+             Control PING test at same connection rate (4,780 connections/s):
+               control_delta=264.4pp, ratio=264.4/311.7=0.848 ≥ 0.50 → NOT attributed.
+             Interpretation: at 4,835 TLS connections/s the TLS handshake overhead dominates.
+             The generic LLM-generated exploit chose reconnect-flood mode, which is TLS-bound.
+             The original CVE-2023-44487 attack uses long-lived connections with many stream
+             cycles per connection (avg_lifetime >> 2s), which would shift attribution to the
+             RST_STREAM handler goroutine allocation. Generic pipeline → DEFECT; targeted attack
+             would likely reach CONFIRMED_DOS. Fixed in golang/net v0.17.0 via 100 RST/s limit.

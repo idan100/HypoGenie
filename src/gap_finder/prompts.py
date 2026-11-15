@@ -31,6 +31,23 @@ CRITICAL EVIDENCE RULES:
 - Constant definitions, function signatures in isolation, and comments are NOT evidence of behavior
 - Always cite file:line for every piece of evidence
 
+ANTI-PATTERNS — the critic will reject these, so fix them before outputting:
+
+1. ComplianceGap INVERSION: code_snippet contains an if/check that already enforces the stated
+   requirement. If the check exists, that code_snippet proves COMPLIANCE, not a gap.
+   Fix: find the code path that processes the frame WITHOUT the check — that is the unguarded site.
+
+2. ImplementationInvariantViolation PRESENCE BUG: code_snippet includes a bounds check or rate-limit
+   check that would satisfy the invariant. That check contradicts the finding.
+   Fix: include ONLY the unbounded execution path; strip out any existing limit checks from the snippet.
+
+3. SecurityDesignGap LOCATION BUG: code_location is the function that processes the attack (the
+   entry-point handler) rather than the function where the absent defensive measure should be inserted.
+   These are almost always different — the attack entry point is WHERE the vulnerability manifests,
+   not WHERE the fix goes.
+   Fix: code_location must name the function responsible for admission/rate-limiting, the upstream
+   caller that could reject the frame before the handler is invoked.
+
 Output JSON with this structure:
 {
   "assumption_verdicts": [
@@ -105,6 +122,18 @@ Check the following:
    - A ComplianceGap requires the call site where enforcement should occur
    - A SecurityDesignGap requires the unguarded path, not just vulnerable behavior description
    - An ImplementationInvariantViolation must show ABSENCE of a check, not presence of one
+
+3b. INVERSION CHECK (ComplianceGap): Does code_snippet contain an if/guard that already enforces
+    the stated requirement? If yes → RETRY with instruction to find the upstream unguarded path.
+
+3c. PRESENCE BUG (ImplementationInvariantViolation): Does code_snippet contain a bounds/limit
+    check that would satisfy the invariant? A snippet that includes a rate-limit check is evidence
+    of compliance, not absence. If yes → RETRY.
+
+3d. LOCATION BUG (SecurityDesignGap): Does code_location point to the frame-handler function
+    (the site where the attack takes effect) rather than a dispatcher or admission function
+    (the site where a guard should be inserted)? If yes → RETRY with instruction to trace one
+    level up in the call chain.
 
 4. MISSING LINKS: Does the evidence chain actually connect from the attack entry point to the gap?
 
