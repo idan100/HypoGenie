@@ -21,11 +21,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from run_context import run_id as _run_id
 from exploiter.tools import MetricsCollector, _probe_latency_ms
 
-def _wait_for_ready(host: str, port: int, tls: bool, timeout_s: int = 30) -> bool:
+def _wait_for_ready(host: str, port: int, tls: bool, timeout_s: int = 30,
+                    container_id: str = "") -> bool:
     """Poll until the server responds to a probe, up to timeout_s seconds."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        _, alive = _probe_latency_ms(host, port, tls)
+        _, alive = _probe_latency_ms(host, port, tls, container_id=container_id)
         if alive:
             return True
         time.sleep(1)
@@ -626,7 +627,7 @@ def run(
     try:
         new_cid = _restart_container(image, container_name, ports, certs_dir, conf_file, config_path)
         print(f"[verifier:{_run_id}] Restarted: {new_cid[:12]} — waiting for ready ...")
-        ready = _wait_for_ready(host, port, tls, timeout_s=30)
+        ready = _wait_for_ready(host, port, tls, timeout_s=30, container_id=new_cid)
         if not ready:
             raise RuntimeError("Server did not become ready within 30s after restart")
 
