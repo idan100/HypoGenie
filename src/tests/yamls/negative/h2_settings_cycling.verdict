@@ -1,4 +1,4 @@
-EXPECTED: CONFIRMED_DOS
+EXPECTED: NO_DOS_EFFECT
 
 REASON: Protocol-mandated ACK gate + O(1) per-stream recalculation keep CPU below threshold
 
