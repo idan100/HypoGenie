@@ -32,27 +32,50 @@ if _config_path.exists():
     with open(_config_path) as f:
         _config = yaml.safe_load(f) or {}
 
-_DEFAULT_PROVIDER = _config.get("default_provider", "anthropic")
-_ANTHROPIC_MODEL = _config.get("anthropic", {}).get("model", "claude-haiku-4-5")
-_OPENAI_MODEL = _config.get("openai", {}).get("model", "gpt-4o-mini")
-_ROLES: dict[str, str] = _config.get("roles", {})  # role_env → "provider:model"
+_DEFAULT_PROVIDER = "anthropic"
+
+# Profile-based model selection — set active_profile in config/models.yaml.
+_active_profile_name: str = _config.get("active_profile", "cheap")
+_profiles: dict = _config.get("profiles", {})
+_active_profile: dict = _profiles.get(_active_profile_name, {})
+_ROLE_OVERRIDES: dict[str, str] = _config.get("role_overrides", {})
+
+# Fallback defaults when profile lookup fails
+_ANTHROPIC_MODEL: str = _active_profile.get("anthropic", "claude-haiku-4-5")
+_OPENAI_MODEL: str    = _active_profile.get("openai",    "gpt-4o-mini")
+
+# Which provider each named role always uses — tied to implementation, not config.
+_ROLE_PROVIDER: dict[str, str] = {
+    "SPEC_PROCESSOR_MODEL":    "openai",
+    "GAP_FINDER_MODEL":        "openai",
+    "GAP_FINDER_CRITIC_MODEL": "openai",
+    "EXPLOIT_PLANNER_MODEL":   "openai",
+    "BUILDER_MODEL":           "anthropic",
+    "EXPLOITER_MODEL":         "anthropic",
+}
 
 
 def _parse_role(role_env: str | None) -> tuple[str | None, str | None]:
     """
-    Return (provider, model) from a role_env name.
-    Checks env var first (format: "provider:model" or just "model"),
-    then config roles section.  Returns (None, None) if not found.
+    Return (provider, model) for a role name.
+    Priority: env var → role_overrides → active profile.
     """
     if not role_env:
         return None, None
-    raw = os.environ.get(role_env) or _ROLES.get(role_env, "")
-    if not raw:
-        return None, None
-    if ":" in raw:
-        prov, mdl = raw.split(":", 1)
-        return prov, mdl
-    return None, raw  # model only, no provider override
+    # 1. env var override (highest priority, backward compat)
+    raw = os.environ.get(role_env, "") or _ROLE_OVERRIDES.get(role_env, "")
+    if raw:
+        if ":" in raw:
+            prov, mdl = raw.split(":", 1)
+            return prov, mdl
+        return None, raw
+    # 2. Active profile
+    prov = _ROLE_PROVIDER.get(role_env)
+    if prov:
+        mdl = _active_profile.get(prov)
+        if mdl:
+            return prov, mdl
+    return None, None
 
 _anthropic_client = None
 _openai_client = None
@@ -64,6 +87,7 @@ _PRICING: list[tuple[str, float, float]] = [
     ("claude-opus",    15.00, 75.00),
     ("claude-sonnet",   3.00, 15.00),
     ("claude-haiku",    0.80,  4.00),
+    ("claude-3-5-haiku", 0.80,  4.00),   # Claude 3.5 Haiku — same price tier as 4.x Haiku
     ("claude-3-5",      3.00, 15.00),   # catch-all for claude-3-5-* sonnet variants
     ("claude-3-haiku",  0.25,  1.25),
     ("gpt-4o-mini",     0.15,  0.60),
