@@ -193,6 +193,11 @@ def call_llm(
             system=system,
             messages=[{"role": "user", "content": user}],
         )
+        if not resp.content:
+            raise ValueError(
+                f"Empty response from {model} (stop_reason={resp.stop_reason}). "
+                "Model may be unavailable or the request was refused."
+            )
         result = resp.content[0].text
         track_usage(
             role_env or "unknown", prov, model,
