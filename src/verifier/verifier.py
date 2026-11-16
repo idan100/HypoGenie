@@ -20,6 +20,7 @@ from typing import Callable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from run_context import run_id as _run_id
 from exploiter.tools import MetricsCollector, _probe_latency_ms
+from exploiter.prompts import QUIC_CONTROL_SKELETON_TEMPLATE
 
 def _wait_for_ready(host: str, port: int, tls: bool, timeout_s: int = 30,
                     container_id: str = "") -> bool:
@@ -46,9 +47,14 @@ _UNREACHABLE_S    = 3      # alive=False for >= 3 consecutive samples
 _CTRL_CONFIRM_RATIO = 0.50   # control must be < 50% of target to confirm
 _CTRL_REJECT_RATIO  = 0.80   # control >= 80% of target → reject as transport overhead
 
-# TLS calibration: measures per-connection TLS CPU cost during Phase 1
-_TLS_CAL_RATE     = 100   # TLS handshakes/s during calibration
+# TLS calibration: measures per-connection TLS CPU cost during Phase 1b
+_TLS_CAL_RATE     = 100   # TCP/TLS handshakes/s during calibration
 _TLS_CAL_DURATION = 15    # seconds
+
+# QUIC calibration: QUIC handshakes are more expensive than TCP/TLS,
+# so a lower rate avoids saturating the server during the calibration step.
+_QUIC_CAL_RATE     = 20   # QUIC handshakes/s during calibration
+_QUIC_CAL_DURATION = 15   # seconds
 
 
 class Verdict:
@@ -124,6 +130,49 @@ time.sleep(1)
             os.unlink(script_path)
         except Exception:
             pass
+
+    return _safe_mean(collector.snapshot().get("cpu_pct", []))
+
+
+def _run_quic_calibration(container_id: str, host: str, port: int,
+                           rate: int = _QUIC_CAL_RATE,
+                           duration: int = _QUIC_CAL_DURATION) -> float:
+    """
+    Measure per-connection QUIC handshake CPU cost on the server.
+
+    Runs the QUIC control skeleton (handshake-only, zero streams) at `rate`
+    connections/s for `duration` seconds. MetricsCollector runs in parallel.
+    Returns mean CPU % during calibration, 0.0 on any failure.
+
+    With THREADS=10 in the skeleton, conn_sleep = 10/rate gives the per-thread
+    delay needed to achieve the target aggregate rate.
+    """
+    # THREADS=10 baked into QUIC_CONTROL_SKELETON_TEMPLATE.
+    conn_sleep = max(10.0 / rate, 0.001)
+    script = (QUIC_CONTROL_SKELETON_TEMPLATE
+              .replace("DURATION = 30", f"DURATION = {duration}")
+              .replace("__CONN_SLEEP__", f"{conn_sleep:.6f}"))
+
+    collector = MetricsCollector(container_id, host, port, probe_tls=False)
+    collector.start()
+    script_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(script)
+            script_path = f.name
+        subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True, timeout=duration + 10,
+        )
+    except Exception:
+        pass
+    finally:
+        collector.stop()
+        if script_path:
+            try:
+                os.unlink(script_path)
+            except Exception:
+                pass
 
     return _safe_mean(collector.snapshot().get("cpu_pct", []))
 
@@ -402,6 +451,7 @@ def run(
     # differential attribution
     control_exploit_fn: Callable | None = None,
     has_code_findings: bool = False,
+    protocol: str = "",
 ) -> dict:
     """
     Three-phase DoS verification.
@@ -465,20 +515,32 @@ def run(
     print(f"[verifier:{_run_id}] Baseline OK — cpu={p1_phase['cpu_mean_pct']}% "
           f"lat={p1_phase['latency_mean_ms']}ms")
 
-    # ── Phase 1b: TLS calibration ──────────────────────────────────────────────
-    # Only meaningful for TLS endpoints; skipped for plain TCP.
+    # ── Phase 1b: connection-cost calibration ─────────────────────────────────
+    # Measures per-connection CPU overhead so _check_differential can subtract
+    # it mathematically (net_app path) even when the control test fails.
+    # TCP/TLS: TCP+TLS handshakes at 100/s.  QUIC: QUIC handshakes at 20/s.
+    # Skipped for plain TCP (no TLS) and for QUIC without protocol tag.
     tls_cpu_per_conn_s = 0.0
+    is_quic = protocol == "QUIC"
     if tls:
-        print(f"[verifier:{_run_id}] Phase 1b — TLS calibration "
-              f"({_TLS_CAL_DURATION}s at {_TLS_CAL_RATE}/s) ...")
-        cal_cpu = _run_tls_calibration(container_id, host, port)
+        if is_quic:
+            print(f"[verifier:{_run_id}] Phase 1b — QUIC calibration "
+                  f"({_QUIC_CAL_DURATION}s at {_QUIC_CAL_RATE}/s) ...")
+            cal_cpu  = _run_quic_calibration(container_id, host, port)
+            cal_rate = _QUIC_CAL_RATE
+        else:
+            print(f"[verifier:{_run_id}] Phase 1b — TLS calibration "
+                  f"({_TLS_CAL_DURATION}s at {_TLS_CAL_RATE}/s) ...")
+            cal_cpu  = _run_tls_calibration(container_id, host, port)
+            cal_rate = _TLS_CAL_RATE
         idle_cpu = _safe_mean(baseline["cpu_pct"])
-        # Net TLS cost above idle, normalised to per-connection CPU-seconds.
-        tls_cpu_per_conn_s = max(0.0, cal_cpu - idle_cpu) / _TLS_CAL_RATE
+        # Net handshake cost above idle, normalised to per-connection CPU-seconds.
+        tls_cpu_per_conn_s = max(0.0, cal_cpu - idle_cpu) / cal_rate
         baseline["tls_cpu_per_conn_s"] = round(tls_cpu_per_conn_s, 5)
         p1_phase["tls_cal_cpu_pct"]    = round(cal_cpu, 2)
         p1_phase["tls_cpu_per_conn_s"] = round(tls_cpu_per_conn_s, 5)
-        print(f"[verifier:{_run_id}] TLS cal: cpu={cal_cpu:.1f}% "
+        label = "QUIC cal" if is_quic else "TLS cal"
+        print(f"[verifier:{_run_id}] {label}: cpu={cal_cpu:.1f}% "
               f"idle={idle_cpu:.1f}% per_conn_s={tls_cpu_per_conn_s:.4f}%")
 
     # ── Phase 2: Attack + Attribution ─────────────────────────────────────────

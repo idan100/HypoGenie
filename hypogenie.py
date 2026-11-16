@@ -419,6 +419,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             config_path=container_info.get("config_path", ""),
             control_exploit_fn=_control_fn,
             has_code_findings=len(findings) > 0,
+            protocol=ctx.protocol,
         )
 
         verdict = verify_result["verdict"]
