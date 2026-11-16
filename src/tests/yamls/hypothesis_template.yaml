@@ -1,0 +1,64 @@
+hypothesis:
+  description: |
+    <One-paragraph summary of the vulnerability mechanism. Explain the RFC gap
+    or design choice that enables the attack, and what the server does (or fails
+    to do) that makes it exploitable.>
+
+    Assumptions:
+    - A1: <State what must be true about the target implementation for the attack
+          to work. Phrase absence assumptions as "no X exists" rather than "X is absent".>
+    - A2: <Per-request / per-connection resource that is not bounded or reclaimed promptly.>
+    - A3: <Optional: absence of a global cap or rate limit.>
+
+  # One of: memory | cpu | connection | bandwidth | resource_exhaustion
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/<org>/<repo>
+  version: v0.0.0
+  # One of: HTTP/2 | HTTP/3 | QUIC | gRPC | DNS-over-TLS | TLS | TCP | UDP
+  protocol: HTTP/2
+  entry_point: "TCP port 443, TLS ALPN h2"
+  # Use an image from: docker.io, hypogenie/* local images, or a standard image tag
+  docker_image: "<image>:<tag>"
+  # Optional: omit if the image handles configuration internally
+  server_config: |
+    # Paste the server config block here (nginx.conf, caddy config, etc.)
+    # Remove this key entirely if not needed.
+
+assumptions:
+  - id: A1
+    description: "<Single sentence: what this assumption claims about the implementation>"
+    # required = attack fails if refuted | favorable = weakens attack if refuted
+    necessity: required
+  - id: A2
+    description: "<Single sentence>"
+    necessity: required
+  - id: A3
+    description: "<Single sentence>"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "<Concrete attacker action: what frame/packet/connection is opened>"
+  - step: 2
+    action: "<What the server does in response (the vulnerable behavior)>"
+  - step: 3
+    action: "<How that server behavior accumulates / compounds under repeated steps>"
+  - step: 4
+    action: "<The end state: what resource is exhausted and why the server cannot recover>"
+
+rfc_sections:
+  - rfc: RFC 0000
+    section: "X.Y"
+    dos_relevance: "<What the RFC says and why the implementation's choice creates exposure>"
+  - rfc: RFC 0000
+    section: "X.Y"
+    dos_relevance: "<Second relevant section>"
+
+# Optional: remove entire block if no prior art
+related_work:
+  - type: cve       # cve | paper | writeup | advisory
+    id: CVE-0000-00000
+  - type: writeup
+    url: https://example.com/writeup
