@@ -177,6 +177,7 @@ def run(ctx, rfc_text_override: Optional[dict] = None) -> list[SpecRequirement]:
     Returns a flat list of SpecRequirement objects across all sections.
     """
     all_requirements: list[SpecRequirement] = []
+    failed_sections: list[str] = []
 
     assumptions_text = "\n".join(
         f"- {a.id} ({a.necessity}): {a.description}" for a in ctx.assumptions
@@ -223,6 +224,22 @@ def run(ctx, rfc_text_override: Optional[dict] = None) -> list[SpecRequirement]:
             )
             all_requirements.extend(reqs)
         except Exception as e:
+            failed_sections.append(f"{rfc_sec.rfc} §{rfc_sec.section}: {e}")
             print(f"  [spec_processor] ERROR on {rfc_sec.rfc} §{rfc_sec.section}: {e}")
+
+    if failed_sections and not all_requirements:
+        # Every section failed — the Gap Finder would have nothing to verify.
+        # Raise so the pipeline records ENV_ERROR rather than silently proceeding
+        # with an empty spec analysis that looks like successful analysis.
+        raise RuntimeError(
+            f"Spec processor: all {len(failed_sections)} section(s) failed with no "
+            f"requirements extracted — cannot proceed. Failures: {failed_sections}"
+        )
+    if failed_sections:
+        print(
+            f"  [spec_processor] WARNING: {len(failed_sections)} section(s) failed; "
+            f"proceeding with {len(all_requirements)} requirement(s) from "
+            f"{len(ctx.rfc_sections) - len(failed_sections)} section(s)"
+        )
 
     return all_requirements

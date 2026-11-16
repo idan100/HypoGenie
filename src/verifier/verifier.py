@@ -264,34 +264,58 @@ def _check_thresholds(baseline: dict, attack: dict) -> tuple[list[str], dict]:
     return triggered, details
 
 
+_ATTRIBUTION_SUSTAIN_S = 3   # consecutive samples required for correlation evidence
+_ATTRIBUTION_CPU_PP    = 20  # CPU delta above baseline to count as elevated (correlation bar,
+                             # lower than _CPU_DELTA_PP which is the confirmation bar)
+
+
 def _check_attribution(baseline: dict, attack: dict, attack_start_idx: int) -> bool:
     """
-    Verify the metric spike is temporally correlated with attack traffic:
-    onset must occur within 10 samples of attack_start_idx.
-    Also verify probe requests were alive during baseline.
+    Check that attack-period metrics show sustained (not transient) degradation above
+    baseline.  Three independent paths — any one suffices:
+
+    1. Latency: mean latency in first 10s > 2× baseline mean (fast onset).
+    2. CPU fast onset: mean CPU in first 10s ≥ baseline_cpu + _ATTRIBUTION_CPU_PP.
+    3. CPU sustained: ≥ _ATTRIBUTION_SUSTAIN_S consecutive samples anywhere in the
+       attack window that each exceed baseline_cpu + _ATTRIBUTION_CPU_PP.
+       This catches gradual attacks without accepting single-sample noise.
+
+    Returns False (not attributed) rather than passing by default when none of the
+    above conditions hold — single isolated CPU spikes do not satisfy path 3.
     """
     if not all(baseline["alive"]):
         return False  # baseline already unhealthy
 
-    # Check that there is some degradation during/after attack started
-    # (not before — we just check alive or latency went up after index attack_start_idx)
     post_attack_alive = attack["alive"][attack_start_idx: attack_start_idx + 10]
     if not post_attack_alive:
         return True  # can't check, give benefit of doubt
 
-    # Attribution: at least one sample worse than baseline within first 10s of attack
     baseline_lat = _safe_mean(baseline["latency_ms"]) or 1.0
     post_lats = [v for v in attack["latency_ms"][attack_start_idx:attack_start_idx + 10]
                  if v is not None]
     if post_lats and _safe_mean(post_lats) > 2 * baseline_lat:
-        return True
+        return True  # path 1: latency onset
 
-    post_cpu_mean = _safe_mean(attack["cpu_pct"][attack_start_idx:attack_start_idx + 10])
     baseline_cpu = _safe_mean(baseline["cpu_pct"])
-    if post_cpu_mean - baseline_cpu >= 20:
+    elevated = baseline_cpu + _ATTRIBUTION_CPU_PP
+
+    # Path 2: fast-onset CPU mean in first 10 samples
+    post_cpu_mean = _safe_mean(attack["cpu_pct"][attack_start_idx:attack_start_idx + 10])
+    if post_cpu_mean >= elevated:
         return True
 
-    return True  # pass by default if no strong signal either way
+    # Path 3: sustained elevation anywhere in the attack window.
+    # Requires _ATTRIBUTION_SUSTAIN_S consecutive samples; a single spike is not enough.
+    consec = 0
+    for v in attack["cpu_pct"][attack_start_idx:]:
+        if v is not None and v >= elevated:
+            consec += 1
+            if consec >= _ATTRIBUTION_SUSTAIN_S:
+                return True
+        else:
+            consec = 0
+
+    return False  # no sustained metric correlation with attack period
 
 
 def _baseline_healthy(baseline: dict) -> bool:
@@ -304,34 +328,43 @@ def _baseline_healthy(baseline: dict) -> bool:
     return True
 
 
-def _check_differential(baseline: dict, target: dict, control: dict,
+def _check_differential(target_baseline: dict, target: dict,
+                        control_baseline: dict, control: dict,
                         tls_cpu_per_conn_s: float = 0.0,
-                        attack_conn_rate: float = 0.0) -> tuple[bool, str, dict]:
+                        attack_conn_rate: float = 0.0) -> tuple[bool, str, dict, bool]:
     """
-    Compare target vs control impact above baseline.
-    Returns (attributed, reason_note, details_dict).
+    Compare target vs control impact, each measured against its own container baseline.
+
+    target_baseline:  idle metrics from the same container that ran the attack (Phase 1).
+    control_baseline: idle metrics from the same container that ran the control (Phase 3).
+    Using separate baselines eliminates cross-container measurement error.
+
+    Returns (attributed, reason_note, details_dict, transport_overhead_confirmed).
 
     Two independent attribution paths — either one is sufficient:
       1. Ratio path: control_delta / target_delta < _CTRL_CONFIRM_RATIO
-         (control test shows transport overhead dominates)
       2. Net-app path: (target_delta - predicted_tls_cpu) >= _CPU_DELTA_PP
-         (even after subtracting the calibrated TLS cost, application overhead
-          still crosses the DoS threshold independently)
+
+    transport_overhead_confirmed=True means cpu_ratio >= _CTRL_REJECT_RATIO.
+    When attributed=False and transport_overhead_confirmed=False (0.50 ≤ ratio < 0.80),
+    the caller should return INCONCLUSIVE rather than REJECTED/DEFECT.
 
     tls_cpu_per_conn_s: per-connection TLS CPU cost from Phase 1b calibration
     attack_conn_rate:   connections/s during the target attack (from footer)
     """
-    b_cpu = _safe_mean(baseline["cpu_pct"])
+    tb_cpu = _safe_mean(target_baseline["cpu_pct"])
+    cb_cpu = _safe_mean(control_baseline["cpu_pct"])
     t_cpu = _safe_mean(target.get("cpu_pct", []))
     c_cpu = _safe_mean(control.get("cpu_pct", []))
-    t_cpu_delta = max(0.0, t_cpu - b_cpu)
-    c_cpu_delta = max(0.0, c_cpu - b_cpu)
+    t_cpu_delta = max(0.0, t_cpu - tb_cpu)
+    c_cpu_delta = max(0.0, c_cpu - cb_cpu)
 
-    b_mem = _safe_mean(baseline["mem_mb"])
-    t_mem = max(target.get("mem_mb") or [b_mem])
-    c_mem = max(control.get("mem_mb") or [b_mem])
-    t_mem_delta = max(0.0, t_mem - b_mem)
-    c_mem_delta = max(0.0, c_mem - b_mem)
+    tb_mem = _safe_mean(target_baseline["mem_mb"])
+    cb_mem = _safe_mean(control_baseline["mem_mb"])
+    t_mem = max(target.get("mem_mb") or [tb_mem])
+    c_mem = max(control.get("mem_mb") or [cb_mem])
+    t_mem_delta = max(0.0, t_mem - tb_mem)
+    c_mem_delta = max(0.0, c_mem - cb_mem)
 
     cpu_ratio = (c_cpu_delta / t_cpu_delta) if t_cpu_delta > 5  else 1.0
     mem_ratio = (c_mem_delta / t_mem_delta) if t_mem_delta > 10 else 1.0
@@ -350,32 +383,45 @@ def _check_differential(baseline: dict, target: dict, control: dict,
     mem_attributed = mem_ratio < _CTRL_CONFIRM_RATIO
     attributed = cpu_attributed or mem_attributed
 
+    # transport_overhead_confirmed: ratio >= _CTRL_REJECT_RATIO means control ≈ target.
+    # When attributed=False and this is also False (0.50 ≤ ratio < 0.80), the result is
+    # ambiguous — caller should use INCONCLUSIVE rather than REJECTED/DEFECT.
+    # Memory transport overhead only applies when there IS a real memory delta (> 10 MB);
+    # a 1.0 sentinel (no memory effect) must not trigger the transport-confirmed path.
+    cpu_transport_overhead = not cpu_netapp_attributed and cpu_ratio >= _CTRL_REJECT_RATIO
+    mem_transport_overhead = t_mem_delta > 10 and mem_ratio >= _CTRL_REJECT_RATIO
+    transport_overhead_confirmed = (not attributed) and (cpu_transport_overhead or mem_transport_overhead)
+
     details = {
-        "baseline_cpu_pct":    round(b_cpu, 2),
-        "target_cpu_mean_pct": round(t_cpu, 2),
-        "control_cpu_mean_pct": round(c_cpu, 2),
-        "cpu_delta_target":    round(t_cpu_delta, 2),
-        "cpu_delta_control":   round(c_cpu_delta, 2),
-        "cpu_ratio":           round(cpu_ratio, 3),
-        "cpu_ratio_attributed": cpu_ratio_attributed,
+        # Separate baselines — each delta uses its own container's idle measurement
+        "target_baseline_cpu_pct":   round(tb_cpu, 2),
+        "control_baseline_cpu_pct":  round(cb_cpu, 2),
+        "target_cpu_mean_pct":       round(t_cpu, 2),
+        "control_cpu_mean_pct":      round(c_cpu, 2),
+        "cpu_delta_target":          round(t_cpu_delta, 2),
+        "cpu_delta_control":         round(c_cpu_delta, 2),
+        "cpu_ratio":                 round(cpu_ratio, 3),
+        "cpu_ratio_attributed":      cpu_ratio_attributed,
         # TLS-calibrated net-app path
-        "tls_cpu_per_conn_s":  round(tls_cpu_per_conn_s, 5),
-        "attack_conn_rate":    round(attack_conn_rate, 1),
-        "expected_tls_cpu_pp": round(expected_tls_cpu, 2),
-        "net_app_cpu_delta_pp": round(net_app_cpu_delta, 2),
-        "cpu_netapp_attributed": cpu_netapp_attributed,
-        "cpu_attributed":      cpu_attributed,
+        "tls_cpu_per_conn_s":        round(tls_cpu_per_conn_s, 5),
+        "attack_conn_rate":          round(attack_conn_rate, 1),
+        "expected_tls_cpu_pp":       round(expected_tls_cpu, 2),
+        "net_app_cpu_delta_pp":      round(net_app_cpu_delta, 2),
+        "cpu_netapp_attributed":     cpu_netapp_attributed,
+        "cpu_attributed":            cpu_attributed,
         # Memory
-        "baseline_mem_mb":     round(b_mem, 2),
-        "target_mem_peak_mb":  round(t_mem, 2),
-        "control_mem_peak_mb": round(c_mem, 2),
-        "mem_delta_target":    round(t_mem_delta, 2),
-        "mem_delta_control":   round(c_mem_delta, 2),
-        "mem_ratio":           round(mem_ratio, 3),
-        "mem_attributed":      mem_attributed,
-        "attributed":          attributed,
-        "confirm_threshold":   _CTRL_CONFIRM_RATIO,
-        "reject_threshold":    _CTRL_REJECT_RATIO,
+        "target_baseline_mem_mb":    round(tb_mem, 2),
+        "control_baseline_mem_mb":   round(cb_mem, 2),
+        "target_mem_peak_mb":        round(t_mem, 2),
+        "control_mem_peak_mb":       round(c_mem, 2),
+        "mem_delta_target":          round(t_mem_delta, 2),
+        "mem_delta_control":         round(c_mem_delta, 2),
+        "mem_ratio":                 round(mem_ratio, 3),
+        "mem_attributed":            mem_attributed,
+        "attributed":                        attributed,
+        "transport_overhead_confirmed":      transport_overhead_confirmed,
+        "confirm_threshold":                 _CTRL_CONFIRM_RATIO,
+        "reject_threshold":                  _CTRL_REJECT_RATIO,
     }
 
     net_app_note = (
@@ -383,13 +429,14 @@ def _check_differential(baseline: dict, target: dict, control: dict,
         if tls_cpu_per_conn_s > 0 else ""
     )
     reason = (
-        f"CPU: target={t_cpu:.1f}% control={c_cpu:.1f}% base={b_cpu:.1f}% "
+        f"CPU: target={t_cpu:.1f}%(base={tb_cpu:.1f}%) control={c_cpu:.1f}%(base={cb_cpu:.1f}%) "
         f"(δtarget={t_cpu_delta:.1f}pp δcontrol={c_cpu_delta:.1f}pp ratio={cpu_ratio:.2f})"
         f"{net_app_note}; "
-        f"MEM: target_peak={t_mem:.0f}MB control_peak={c_mem:.0f}MB base={b_mem:.0f}MB "
+        f"MEM: target_peak={t_mem:.0f}MB(base={tb_mem:.0f}MB) "
+        f"control_peak={c_mem:.0f}MB(base={cb_mem:.0f}MB) "
         f"(ratio={mem_ratio:.2f})"
     )
-    return attributed, reason, details
+    return attributed, reason, details, transport_overhead_confirmed
 
 
 def _container_exited(container_id: str) -> bool:
@@ -736,19 +783,36 @@ def run(
             _atk_dur   = attack_metrics.get("_duration_s", attack_duration_s) or attack_duration_s
             attack_conn_rate = _atk_conns / _atk_dur if _atk_conns else 0.0
 
-            diff_attributed, diff_reason, diff_details = _check_differential(
-                baseline2, attack_metrics, control_metrics,
+            diff_attributed, diff_reason, diff_details, transport_confirmed = _check_differential(
+                target_baseline=baseline,     # Phase 1: same container as attack
+                target=attack_metrics,
+                control_baseline=baseline2,   # Phase 3: same container as control
+                control=control_metrics,
                 tls_cpu_per_conn_s=tls_cpu_per_conn_s,
                 attack_conn_rate=attack_conn_rate,
             )
             p2c_phase["differential"] = diff_details
             p2c_phase["attributed"]   = diff_attributed
             print(f"[verifier:{_run_id}] Phase 2c differential — {diff_reason}")
-            print(f"[verifier:{_run_id}] Phase 2c attributed={diff_attributed}")
+            print(f"[verifier:{_run_id}] Phase 2c attributed={diff_attributed} transport_confirmed={transport_confirmed}")
             phases.append(p2c_phase)
 
             if not diff_attributed:
-                # Control matched target → CPU/memory came from transport overhead.
+                if not transport_confirmed:
+                    # Ambiguous zone: 0.50 ≤ ratio < 0.80 — cannot distinguish application
+                    # overhead from transport overhead.
+                    note = (f"Control test inconclusive (ratio in ambiguous zone 0.50–0.80): "
+                            f"{diff_reason}. Cannot attribute overhead to application logic.")
+                    print(f"[verifier:{_run_id}] INCONCLUSIVE — {note}")
+                    return {
+                        "verdict": Verdict.INCONCLUSIVE,
+                        "baseline": baseline, "attack": attack_metrics,
+                        "attack2": control_metrics,
+                        "triggered": triggered, "phases": phases,
+                        "thresholds_config": thresholds_config,
+                        "notes": note,
+                    }
+                # Transport overhead confirmed (ratio >= 0.80): DEFECT or REJECTED.
                 if has_code_findings:
                     verdict = Verdict.DEFECT
                     note = (f"Control test shows transport overhead (not application-level): "
