@@ -366,8 +366,14 @@ def _check_differential(target_baseline: dict, target: dict,
     t_mem_delta = max(0.0, t_mem - tb_mem)
     c_mem_delta = max(0.0, c_mem - cb_mem)
 
-    cpu_ratio = (c_cpu_delta / t_cpu_delta) if t_cpu_delta > 5  else 1.0
-    mem_ratio = (c_mem_delta / t_mem_delta) if t_mem_delta > 10 else 1.0
+    cpu_ratio = (c_cpu_delta / t_cpu_delta) if t_cpu_delta > 5 else 1.0
+
+    # Memory ratio is only meaningful when the target's delta reaches the DoS memory
+    # threshold (_MEM_DELTA_MB = 100 MB).  Below that, fluctuations (GC, page-cache
+    # variation) produce a noisy ratio that is not evidence of DoS amplification.
+    # A sentinel value of 1.0 means "not enough memory signal to attribute."
+    mem_ratio = (c_mem_delta / t_mem_delta) if t_mem_delta >= _MEM_DELTA_MB else 1.0
+    mem_significant = t_mem_delta >= _MEM_DELTA_MB
 
     # Net application CPU: subtract the predicted TLS handshake contribution.
     # If the calibration was not run (tls_cpu_per_conn_s == 0), this collapses
@@ -375,21 +381,23 @@ def _check_differential(target_baseline: dict, target: dict,
     expected_tls_cpu  = tls_cpu_per_conn_s * attack_conn_rate
     net_app_cpu_delta = max(0.0, t_cpu_delta - expected_tls_cpu)
 
-    # Attribution: ratio path OR net-app path
-    cpu_ratio_attributed   = cpu_ratio < _CTRL_CONFIRM_RATIO
-    cpu_netapp_attributed  = (tls_cpu_per_conn_s > 0 and attack_conn_rate > 0
-                              and net_app_cpu_delta >= _CPU_DELTA_PP)
+    # CPU attribution — evaluated independently of memory.
+    cpu_ratio_attributed  = cpu_ratio < _CTRL_CONFIRM_RATIO
+    cpu_netapp_attributed = (tls_cpu_per_conn_s > 0 and attack_conn_rate > 0
+                             and net_app_cpu_delta >= _CPU_DELTA_PP)
     cpu_attributed = cpu_ratio_attributed or cpu_netapp_attributed
-    mem_attributed = mem_ratio < _CTRL_CONFIRM_RATIO
+
+    # Memory attribution — only counted when the delta is DoS-significant.
+    # A sub-threshold memory delta (even with ratio=0.00 due to GC variation on the
+    # control side) must not drive attributed=True when CPU is ambiguous.
+    mem_attributed = mem_significant and mem_ratio < _CTRL_CONFIRM_RATIO
+
     attributed = cpu_attributed or mem_attributed
 
     # transport_overhead_confirmed: ratio >= _CTRL_REJECT_RATIO means control ≈ target.
-    # When attributed=False and this is also False (0.50 ≤ ratio < 0.80), the result is
-    # ambiguous — caller should use INCONCLUSIVE rather than REJECTED/DEFECT.
-    # Memory transport overhead only applies when there IS a real memory delta (> 10 MB);
-    # a 1.0 sentinel (no memory effect) must not trigger the transport-confirmed path.
+    # Memory transport overhead requires a significant delta for the same reason.
     cpu_transport_overhead = not cpu_netapp_attributed and cpu_ratio >= _CTRL_REJECT_RATIO
-    mem_transport_overhead = t_mem_delta > 10 and mem_ratio >= _CTRL_REJECT_RATIO
+    mem_transport_overhead = mem_significant and mem_ratio >= _CTRL_REJECT_RATIO
     transport_overhead_confirmed = (not attributed) and (cpu_transport_overhead or mem_transport_overhead)
 
     details = {
@@ -416,6 +424,7 @@ def _check_differential(target_baseline: dict, target: dict,
         "control_mem_peak_mb":       round(c_mem, 2),
         "mem_delta_target":          round(t_mem_delta, 2),
         "mem_delta_control":         round(c_mem_delta, 2),
+        "mem_significant":           mem_significant,
         "mem_ratio":                 round(mem_ratio, 3),
         "mem_attributed":            mem_attributed,
         "attributed":                        attributed,
