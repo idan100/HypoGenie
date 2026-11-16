@@ -450,6 +450,7 @@ def run(
     attack_duration_s: int = 30,
     # differential attribution
     control_exploit_fn: Callable | None = None,
+    benign_exploit_fn: Callable | None = None,
     has_code_findings: bool = False,
     protocol: str = "",
 ) -> dict:
@@ -765,6 +766,65 @@ def run(
                     "thresholds_config": thresholds_config,
                     "notes": note,
                 }
+
+        # ── Phase 2d: Benign equivalent test ─────────────────────────────────────
+        # Answers the reviewer's key question: is the attack's CPU overhead
+        # disproportionate compared to ordinary protocol work at the same intensity?
+        # benign_ratio = benign_cpu_delta / attack_cpu_delta:
+        #   < 0.50 → attack is ≥2× more expensive than normal work → confirmed anomalous
+        #   ≥ 0.80 → attack costs ≈ normal work → overhead is from protocol machinery
+        #            alone, not from an exploitable amplification → downgrade verdict
+        _BENIGN_CONFIRM_RATIO   = 0.50   # below this: attack is disproportionate
+        _BENIGN_DOWNGRADE_RATIO = 0.80   # above this: not distinguishable from normal work
+        p2d_phase: dict = {"phase": "benign"}
+        benign_ratio: float | None = None
+        if benign_exploit_fn is not None:
+            print(f"[verifier:{_run_id}] Phase 2d — Benign equivalent test ({attack_duration_s}s) ...")
+            p2d_start = _now_iso()
+            benign_metrics = benign_exploit_fn(attack_metrics, new_cid, host, port, attack_duration_s)
+            p2d_phase["started_at"] = p2d_start
+            p2d_phase["ended_at"]   = _now_iso()
+            p2d_phase["sample_count"] = len(benign_metrics.get("cpu_pct", []))
+
+            idle_cpu    = _safe_mean(baseline2.get("cpu_pct", []))
+            attack_cpu  = _safe_mean(attack_metrics.get("cpu_pct", []))
+            benign_cpu  = _safe_mean(benign_metrics.get("cpu_pct", []))
+            attack_delta = max(attack_cpu - idle_cpu, 0.1)   # avoid div/0
+            benign_delta = max(benign_cpu - idle_cpu, 0.0)
+            benign_ratio = round(benign_delta / attack_delta, 3)
+
+            p2d_phase["idle_cpu_pct"]    = round(idle_cpu, 2)
+            p2d_phase["attack_cpu_pct"]  = round(attack_cpu, 2)
+            p2d_phase["benign_cpu_pct"]  = round(benign_cpu, 2)
+            p2d_phase["attack_delta_pp"] = round(attack_delta, 2)
+            p2d_phase["benign_delta_pp"] = round(benign_delta, 2)
+            p2d_phase["benign_ratio"]    = benign_ratio
+            print(f"[verifier:{_run_id}] Phase 2d benign_ratio={benign_ratio:.3f} "
+                  f"(attack+{attack_delta:.1f}pp  benign+{benign_delta:.1f}pp  idle={idle_cpu:.1f}%)")
+
+            if benign_ratio >= _BENIGN_DOWNGRADE_RATIO:
+                # Attack overhead is not distinguishable from normal protocol work.
+                p2d_phase["outcome"] = "proportionate_to_benign"
+                phases.append(p2d_phase)
+                note = (f"Phase 2d: benign equivalent costs {benign_ratio:.0%} of attack CPU "
+                        f"(≥{_BENIGN_DOWNGRADE_RATIO:.0%} threshold). "
+                        f"Attack overhead is not disproportionate to ordinary protocol work.")
+                print(f"[verifier:{_run_id}] DEFECT — {note}")
+                return {
+                    "verdict": Verdict.DEFECT,
+                    "baseline": baseline, "attack": attack_metrics, "attack2": benign_metrics,
+                    "triggered": triggered,
+                    "phases": phases,
+                    "thresholds_config": thresholds_config,
+                    "notes": note,
+                }
+            elif benign_ratio >= _BENIGN_CONFIRM_RATIO:
+                # Moderate: attack is somewhat more expensive but not dramatically so.
+                p2d_phase["outcome"] = "moderate_disproportionality"
+            else:
+                # Attack is ≥2× more expensive than benign work: confirmed disproportionate.
+                p2d_phase["outcome"] = "disproportionate"
+            phases.append(p2d_phase)
 
         # ── Phase 3: Repeatability (run target on the same restarted container) ──
         attack2 = exploit_fn(plan, new_cid, host, port, attack_duration_s)

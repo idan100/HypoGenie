@@ -31,6 +31,7 @@ from builder.builder import build, teardown
 from exploiter.exploiter import run as exploit_run
 from verifier.verifier import run as verify_run, Verdict
 from exploiter.exploiter import make_control_fn as _make_control_fn
+from exploiter.exploiter import make_benign_fn as _make_benign_fn
 import llm_client as _llm
 
 _PROJECT_ROOT = Path(__file__).parent
@@ -406,6 +407,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
                                protocol=ctx.protocol, dos_class=ctx.dos_class)
 
         _control_fn = _make_control_fn(ctx.protocol, ctx.dos_class)
+        _benign_fn  = _make_benign_fn(ctx.protocol, ctx.dos_class)
 
         conf_file   = str(_WORKSPACE / _id / "server.conf")
         verify_result = verify_run(
@@ -418,6 +420,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             conf_file=conf_file,
             config_path=container_info.get("config_path", ""),
             control_exploit_fn=_control_fn,
+            benign_exploit_fn=_benign_fn,
             has_code_findings=len(findings) > 0,
             protocol=ctx.protocol,
         )
