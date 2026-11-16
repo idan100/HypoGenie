@@ -1,0 +1,90 @@
+hypothesis:
+  description: |
+    RFC 9000 §4.6 controls peer-initiated stream concurrency through cumulative
+    stream limits advertised using initial_max_streams_bidi /
+    initial_max_streams_uni transport parameters and subsequently increased
+    through MAX_STREAMS frames. Closing a QUIC stream does not automatically
+    replenish the peer's stream credit; the receiving endpoint decides when
+    and how much additional credit to grant.
+
+    This implementation-policy flexibility may enable an HTTP/3
+    Rapid-Reset-like denial-of-service condition. If the server grants
+    MAX_STREAMS credit immediately after transport-level stream closure,
+    before the corresponding HTTP/3 request processing has completed, an
+    attacker may repeatedly initiate and cancel requests while causing the
+    server to process more work than it can retire. The same exposure may
+    exist when the server advertises an excessively large initial stream
+    limit. The suspected target is Caddy v2.11.4 using quic-go v0.59.1.
+
+    Unlike HTTP/2 Rapid Reset (CVE-2023-44487), QUIC uses a cumulative stream
+    limit rather than a concurrency counter that is locally replenished when
+    a stream is reset. Therefore, the attack depends on the implementation's
+    MAX_STREAMS granting policy and whether application-level work is
+    cancelled or retired promptly.
+
+    Assumptions:
+    - A1: The implementation grants MAX_STREAMS credit on transport-level
+          stream closure before application-level request processing completes,
+          or advertises an excessively large initial stream limit.
+    - A2: Per-stream HTTP/3 request processing incurs non-trivial CPU work
+          that is not cancelled promptly when the client cancels the stream.
+    - A3: No application-layer stream-churn or reset-rate limit exists.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/caddyserver/caddy
+  version: v2.11.4
+  protocol: QUIC
+  entry_point: "UDP port 443, QUIC with ALPN h3"
+  docker_image: "caddy:2.11.4"
+
+assumptions:
+  - id: A1
+    description: "The implementation grants MAX_STREAMS credit on transport-level stream closure before application-level request processing completes, or advertises an excessively large initial stream limit."
+    necessity: required
+
+  - id: A2
+    description: "Per-stream HTTP/3 request processing incurs non-trivial CPU work that is not cancelled promptly when the client cancels the stream."
+    necessity: required
+
+  - id: A3
+    description: "No application-layer stream-churn or reset-rate limit exists."
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "The client repeatedly initiates short-lived bidirectional QUIC streams carrying HTTP/3 requests and cancels them."
+
+  - step: 2
+    action: "If the implementation replenishes MAX_STREAMS credit upon transport-level closure, or provides an excessively large initial stream limit, additional streams can be admitted before the corresponding application work has completed."
+
+  - step: 3
+    action: "Repeated stream initiation and cancellation causes the HTTP/3 layer to process requests faster than outstanding application work is cancelled or retired, accumulating CPU consumption."
+
+  - step: 4
+    action: "Under sustained stream churn, server-side request processing consumes excessive CPU resources and can degrade service availability."
+
+rfc_sections:
+  - rfc: RFC 9000
+    section: "4.6"
+    dos_relevance: "Defines stream concurrency control through MAX_STREAMS and leaves the timing and amount of additional stream credit to implementation policy. This flexibility may allow aggressive credit granting that enables repeated stream churn."
+
+  - rfc: RFC 9000
+    section: "3.5"
+    dos_relevance: "Describes solicited stream state transitions involving RESET_STREAM and STOP_SENDING. These transitions are relevant to the suspected relationship between transport-level stream closure and application-level request completion."
+
+  - rfc: RFC 9000
+    section: "19.11"
+    dos_relevance: "Defines the MAX_STREAMS frame used to increase the cumulative stream limit. The implementation's decision to issue this frame determines when the peer can initiate additional streams."
+
+  - rfc: RFC 9114
+    section: "4.1.1"
+    dos_relevance: "Describes HTTP/3 request cancellation. The interaction between request cancellation and QUIC stream-credit replenishment may determine whether cancelled requests continue consuming server-side resources."
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+
+  - type: paper
+    id: "MadeYouReset: Exploiting HTTP/2 Server-Side Resets for Large-Scale DoS"
