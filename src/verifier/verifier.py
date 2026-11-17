@@ -600,7 +600,8 @@ def _container_exited(container_id: str) -> bool:
 
 
 def _restart_container(image: str, container_name: str, ports: str,
-                       certs_dir: str, conf_file: str, config_path: str) -> str:
+                       certs_dir: str, conf_file: str, config_path: str,
+                       env_vars: dict | None = None) -> str:
     """Cold restart: stop old, start fresh. Returns new container_id."""
     subprocess.run(["docker", "stop", container_name], capture_output=True, timeout=30)
     subprocess.run(["docker", "rm",   container_name], capture_output=True, timeout=30)
@@ -617,11 +618,15 @@ def _restart_container(image: str, container_name: str, ports: str,
     if config_path and conf_file:
         vol_args += ["-v", f"{conf_file}:{config_path}:ro"]
 
+    env_args = []
+    for k, v in (env_vars or {}).items():
+        env_args += ["-e", f"{k}={v}"]
+
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         "--cpus", "1",
-    ] + vol_args + port_args + [image]
+    ] + vol_args + env_args + port_args + [image]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
@@ -642,6 +647,7 @@ def run(
     certs_dir: str = "",
     conf_file: str = "",
     config_path: str = "",
+    env_vars: dict | None = None,
     baseline_duration_s: int = 10,
     attack_duration_s: int = 30,
     # differential attribution
@@ -946,7 +952,7 @@ def run(
     }
     new_cid = None
     try:
-        new_cid = _restart_container(image, container_name, ports, certs_dir, conf_file, config_path)
+        new_cid = _restart_container(image, container_name, ports, certs_dir, conf_file, config_path, env_vars)
         print(f"[verifier:{_run_id}] Restarted: {new_cid[:12]} — waiting for ready ...")
         ready = _wait_for_ready(host, port, tls, timeout_s=60, container_id=new_cid)
         if not ready:

@@ -145,6 +145,7 @@ def _setup_developer(product: str, version: str, entry_point: str,
         "config": d.get("config", ""),
         "config_path": d.get("config_path", ""),
         "ports": d.get("ports", ""),
+        "env_vars": d.get("env_vars", {}),
     }
 
 
@@ -318,6 +319,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
 
     certs_dir = str(_CERTS_DIR)
     config_path = setup["config_path"]
+    env_vars = setup.get("env_vars", {})
 
     cmd = [
         "docker", "run", "-d",
@@ -326,6 +328,8 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         "-v", f"{certs_dir}/server.crt:/certs/server.crt:ro",
         "-v", f"{certs_dir}/server.key:/certs/server.key:ro",
     ]
+    for k, v in env_vars.items():
+        cmd += ["-e", f"{k}={v}"]
     if config_path:
         cmd += ["-v", f"{conf_file}:{config_path}:ro"]
     cmd += port_args + [image]
@@ -346,6 +350,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         "config_path": config_path,
         "ports": setup["ports"],
         "run_dir": str(run_dir),
+        "env_vars": env_vars,
     }
 
 

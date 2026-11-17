@@ -105,12 +105,28 @@ Given a target server product, version, and entry point (protocol + port), gener
 - **http3-server** (hypogenie/http3-server:*): Custom HTTP/3 server. Handles all configuration
   internally (TLS certs mounted at /certs/). Return config_path = "" and config = "".
   ports = "443:443/udp".
+- **postgres** (postgres:*): Official PostgreSQL Docker image. IMPORTANT:
+  1. The image requires initialization env vars. Set env_vars = {"POSTGRES_PASSWORD": "hypogenie",
+     "POSTGRES_HOST_AUTH_METHOD": "trust"} so the server starts and allows unauthenticated connections.
+  2. Do NOT mount config inside /var/lib/postgresql/data/ — this is PGDATA and the mount
+     prevents initdb from running. Use config_path = "" (no custom config file mount).
+  3. Set config = "" (no config file needed; defaults are fine for exploit testing).
+  4. ports = "5432:5432/tcp".
+- **rabbitmq** (rabbitmq:*): Official RabbitMQ Docker image.
+  1. Set env_vars = {"RABBITMQ_DEFAULT_USER": "guest", "RABBITMQ_DEFAULT_PASS": "guest"}.
+  2. Use config_path = "" unless you need custom rabbitmq.conf (then /etc/rabbitmq/rabbitmq.conf).
+  3. ports = "5672:5672/tcp" for AMQP; "1883:1883/tcp" for MQTT.
+- **emqx** (emqx/emqx:*): Official EMQX MQTT broker Docker image.
+  1. No password needed by default. Set env_vars = {} unless overriding config.
+  2. Use config_path = "" (EMQX uses environment variable overrides for config).
+  3. ports = "1883:1883/tcp" for MQTT; "8883:8883/tcp" for MQTT/TLS.
 
 ## Output format (JSON only, no other text)
 {
-  "config": "<full server config file content as a string>",
-  "config_path": "<in-container path, e.g. /etc/nginx/nginx.conf>",
-  "ports": "<space-separated port mappings, e.g. 443:443/tcp>"
+  "config": "<full server config file content as a string, or empty string>",
+  "config_path": "<in-container path, e.g. /etc/nginx/nginx.conf, or empty string>",
+  "ports": "<space-separated port mappings, e.g. 443:443/tcp>",
+  "env_vars": {"KEY": "VALUE"}
 }
 """
 
@@ -122,9 +138,9 @@ Generate the server config, config_path, and ports for this target.
 """
 
 SETUP_CRITIC_SYSTEM = """You are a server config reviewer.
-Check that the config references /certs/server.crt and /certs/server.key (not any other cert paths).
-Check that config_path and ports are non-empty strings.
-Check that the config is syntactically appropriate for the stated product.
+If config is non-empty: check that it references /certs/server.crt and /certs/server.key (not any other cert paths), and that it is syntactically appropriate for the product.
+If config is empty (config_path is also empty): this is valid for images that handle config internally (postgres, rabbitmq, emqx, grpcgo-server, http3-server) — PASS immediately.
+Check that ports is a non-empty string.
 
 Output ONLY one of:
   PASS
