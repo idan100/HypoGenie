@@ -405,7 +405,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
 
         def _exploit_fn(p, cid, h, prt, dur):
             return exploit_run(p, container_id=cid, host=h, port=prt, attack_duration_s=dur,
-                               protocol=ctx.protocol, dos_class=ctx.dos_class)
+                               protocol=ctx.protocol, dos_class=ctx.dos_class,
+                               entry_point=ctx.entry_point)
 
         _control_fn = _make_control_fn(ctx.protocol, ctx.dos_class)
         _benign_fn  = _make_benign_fn(ctx.protocol, ctx.dos_class)
