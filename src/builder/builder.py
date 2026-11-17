@@ -128,7 +128,11 @@ def _setup_developer(product: str, version: str, entry_point: str) -> dict:
         role_env="BUILDER_MODEL", json_mode=True
     )
     raw = _extract_json(raw)
-    d = json.loads(raw)
+    try:
+        d = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        print(f"  [builder:{_run_id}] Setup Developer returned non-JSON — using empty config defaults.")
+        d = {}
     return {
         "config": d.get("config", ""),
         "config_path": d.get("config_path", ""),
@@ -191,7 +195,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         if _image_exists_locally(image):
             print(f"  [builder:{_run_id}] Image found in local store — skipping pull.")
         elif _docker_pull(image):
-            print(f"  [builder:{_run_id}] Pull succeeded.")
+            pass  # _docker_pull already prints success
         else:
             # Image not local and pull failed → source-build, then retag to the requested name
             print(f"  [builder:{_run_id}] Pull failed and image not local — falling back to source build ...")
