@@ -947,9 +947,27 @@ def run(
     try:
         new_cid = _restart_container(image, container_name, ports, certs_dir, conf_file, config_path)
         print(f"[verifier:{_run_id}] Restarted: {new_cid[:12]} — waiting for ready ...")
-        ready = _wait_for_ready(host, port, tls, timeout_s=30, container_id=new_cid)
+        ready = _wait_for_ready(host, port, tls, timeout_s=60, container_id=new_cid)
         if not ready:
-            raise RuntimeError("Server did not become ready within 30s after restart")
+            raise RuntimeError("Server did not become ready within 60s after restart")
+        # After a heavy attack phase the host CPU needs time to cool down before
+        # we can take a valid Phase 3 baseline.
+        _p3_settle_deadline = time.time() + 120
+        _p3_settle_target   = 15
+        print(f"[verifier:{_run_id}] Waiting for Phase 3 CPU to settle below {_p3_settle_target}% ...")
+        while time.time() < _p3_settle_deadline:
+            try:
+                r = subprocess.run(
+                    ["docker", "stats", new_cid, "--no-stream", "--no-trunc",
+                     "--format", "{{.CPUPerc}}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                cpu_s = r.stdout.strip().rstrip("%")
+                if cpu_s and float(cpu_s) < _p3_settle_target:
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
 
         # Verify new baseline
         col2 = MetricsCollector(new_cid, host, port, probe_tls=tls)
