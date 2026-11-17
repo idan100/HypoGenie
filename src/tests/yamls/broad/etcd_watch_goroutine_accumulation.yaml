@@ -1,0 +1,114 @@
+hypothesis:
+  description: |
+    etcd's Watch API (exposed via gRPC streaming, defined in the etcd v3
+    API proto) allows clients to open a bidirectional streaming RPC
+    (Watch/WatchRequest). Each Watch call opens a persistent gRPC stream.
+    Within that stream, a client can create multiple watchers by sending
+    WatchCreateRequest messages, each specifying a key or key range to
+    watch. etcd registers each watcher in a per-watcher goroutine and
+    an internal WatchStream.
+
+    The suspected vulnerability: an attacker opens many Watch streams
+    (each a gRPC streaming RPC) and within each stream creates many
+    watchers on the root prefix (key="" with range_end="\x00" to watch
+    all keys). Each watcher:
+    1. Allocates a watcher goroutine and a WatchResponse channel.
+    2. Subscribes to all KV events in the MVCC watchable store.
+    3. Holds an entry in the watchGroup for the entire lifetime of the stream.
+
+    If the attacker never reads from the Watch response stream (or reads
+    very slowly), gRPC back-pressure fills the per-stream send buffer.
+    However, etcd's internal WatchResponse channels continue accumulating
+    events because the MVCC layer pushes events to all watchers
+    unconditionally. Each enqueued event consumes heap memory in the
+    watcher goroutine's channel buffer.
+
+    Under a concurrent write workload (or even etcd's compaction events),
+    the aggregate per-watcher channel backlog across many slow watchers
+    can exhaust etcd heap memory and goroutine stack space.
+
+    Assumptions:
+    - A1: An authenticated etcd client can open an unlimited number of
+          Watch streams and watchers within those streams.
+    - A2: Each watcher holds a goroutine and a buffered event channel
+          allocated from the etcd heap.
+    - A3: The MVCC watchable store pushes events to all watchers without
+          checking whether the watcher's downstream gRPC stream has
+          backpressure applied.
+    - A4: Slow-reading watcher goroutines accumulate events in their
+          channels, growing heap memory proportionally to event rate
+          times the number of watchers.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/etcd-io/etcd
+  version: "v3.5.12"
+  protocol: gRPC
+  entry_point: "TCP port 2379, gRPC, etcd v3 API"
+  docker_image: "bitnami/etcd:3.5.12"
+  server_config: |
+    ALLOW_NONE_AUTHENTICATION: "yes"
+    ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+    ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+    ETCD_QUOTA_BACKEND_BYTES: "104857600"
+
+assumptions:
+  - id: A1
+    description: "etcd 3.5 allows an authenticated client to open many Watch streams and register many watchers per stream without a hard per-client cap."
+    necessity: required
+
+  - id: A2
+    description: "Each registered watcher allocates a goroutine and an event channel; these resources are held until the watcher is explicitly cancelled or the stream closes."
+    necessity: required
+
+  - id: A3
+    description: "The MVCC watchable store dispatches KV events to all registered watchers regardless of their downstream gRPC send buffer state."
+    necessity: required
+
+  - id: A4
+    description: "Buffered but unread events in watcher channels grow the etcd heap proportionally to event rate × watcher count, without a per-watcher event queue depth limit."
+    necessity: required
+
+  - id: A5
+    description: "Accumulation of watcher goroutines and channel buffers can exhaust etcd heap memory and degrade reads and writes for other clients."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens N gRPC streaming Watch connections (N = 50) using etcd v3 API without authentication."
+  - step: 2
+    action: "Within each Watch stream, attacker registers M watchers on the root prefix (all keys), setting range_end to the maximal value."
+  - step: 3
+    action: "Attacker issues a background PUT flood (e.g., 100 unique keys/s via a separate connection) to generate watcher events."
+  - step: 4
+    action: "Attacker's Watch streams read responses at a rate of 1 event/s per stream, causing event channel backlogs to grow."
+  - step: 5
+    action: "Measure etcd heap memory (via /metrics or pprof) and goroutine count as watcher count and backlog depth increase."
+  - step: 6
+    action: "Determine whether aggregate watcher memory exhausts the etcd process heap and degrades KV operations for unrelated clients."
+
+rfc_sections:
+  - rfc: "etcd API Reference v3 (etcd.io/docs/v3.5/learning/api)"
+    section: "Watch API"
+    dos_relevance: |
+      The Watch RPC uses a bidirectional gRPC stream. The server pushes all
+      matching KV events to each registered watcher as they occur. The
+      specification does not define a per-watcher event queue depth limit
+      or a maximum watcher count per connection. This leaves resource
+      accounting entirely to the implementation, which must balance event
+      dispatch latency with per-watcher memory consumption.
+
+  - rfc: "gRPC Core: Flow Control and Streaming (grpc.io/docs)"
+    section: "Flow Control"
+    dos_relevance: |
+      gRPC applies HTTP/2 flow control at the transport layer. If a slow
+      receiver exhausts the gRPC window, the server's transport-level
+      write blocks. However, etcd's internal event dispatch may continue
+      to push events into the watcher's in-process channel before the
+      transport blocks, so transport-level backpressure does not prevent
+      heap accumulation in the watcher layer.
+
+related_work:
+  - type: writeup
+    url: https://github.com/etcd-io/etcd/issues/15418

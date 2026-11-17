@@ -1,0 +1,122 @@
+hypothesis:
+  description: |
+    CVE-2024-27316 disclosed that Apache HTTP Server before 2.4.59 was
+    vulnerable to an HTTP/2 CONTINUATION frame flood: an attacker could
+    send an unlimited sequence of CONTINUATION frames completing a HEADERS
+    block, causing unbounded CPU and memory consumption in mod_http2.
+
+    Apache 2.4.59 patched this by adding a limit on the number of CONTINUATION
+    frames accepted per HEADERS block per stream. The patch tracks a per-stream
+    CONTINUATION frame counter and closes the connection when the limit is
+    exceeded.
+
+    The partial-fix hypothesis: the per-stream CONTINUATION counter is reset
+    when a HEADERS block is complete (i.e., the END_HEADERS flag is set on a
+    HEADERS or CONTINUATION frame). An attacker operating below the per-stream
+    limit on stream N can open stream N+2 immediately and repeat the pattern.
+    The question is whether the per-stream limit effectively bounds the total
+    CPU and memory cost per connection, or whether sending the maximum
+    allowed CONTINUATION frames across many streams in rapid succession
+    still creates disproportionate aggregate processing cost.
+
+    Additionally, Apache's CONTINUATION limit applies to the number of
+    frames but not to the aggregate header block size that can be built
+    across those frames. Sending the maximum CONTINUATION count with
+    maximum-sized header data per frame could still accumulate a large
+    header block that triggers expensive HPACK decoding even within the
+    patched limits.
+
+    This is not a claim that the original unlimited CONTINUATION bug remains
+    present. The candidate is a residual resource-accounting weakness in
+    the patched version: bounded-but-still-expensive CONTINUATION sequences
+    multiplied across many concurrent streams.
+
+    Assumptions:
+    - A1: Apache 2.4.59 enforces a per-stream CONTINUATION limit and resets
+          the counter after END_HEADERS is received.
+    - A2: The per-stream limit is below the threshold that made the original
+          vulnerability trivial but still allows enough frames to decode a
+          large header block.
+    - A3: The CPU and memory cost of decoding an HPACK header block built
+          from the maximum allowed CONTINUATION frames is non-trivial per stream.
+    - A4: Sending the maximum CONTINUATION sequence on many parallel streams
+          multiplies the per-stream cost, creating aggregate CPU pressure on
+          the mod_http2 worker without triggering the per-stream limit.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/apache/httpd
+  version: "2.4.59"
+  protocol: HTTP/2
+  entry_point: "TCP port 443, TLS ALPN h2"
+  docker_image: "httpd:2.4.59"
+  server_config: |
+    LoadModule http2_module modules/mod_http2.so
+    LoadModule ssl_module modules/mod_ssl.so
+    Protocols h2 http/1.1
+    H2MaxSessionStreams 200
+    SSLEngine on
+    SSLCertificateFile /usr/local/apache2/conf/cert.pem
+    SSLCertificateKeyFile /usr/local/apache2/conf/key.pem
+    <Location />
+      Require all granted
+    </Location>
+
+assumptions:
+  - id: A1
+    description: "Apache 2.4.59's CONTINUATION limit is enforced per stream and the counter resets when END_HEADERS is received."
+    necessity: required
+
+  - id: A2
+    description: "The per-stream CONTINUATION limit allows sending enough frames to encode a header block that is expensive to HPACK-decode."
+    necessity: required
+
+  - id: A3
+    description: "HPACK decoding of a maximum-size header block encoded across the allowed CONTINUATION frames takes non-trivial CPU per stream."
+    necessity: required
+
+  - id: A4
+    description: "Sending CONTINUATION sequences at the per-stream limit across many parallel streams multiplies the per-stream CPU cost without triggering the per-connection limit."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker sends a HEADERS frame with a Huffman-compressed header block fragment (END_HEADERS flag not set) on stream 1."
+  - step: 2
+    action: "Attacker follows with the maximum allowed CONTINUATION frames per stream, each carrying maximum-size header block fragments."
+  - step: 3
+    action: "The final CONTINUATION frame sets END_HEADERS, completing the block; Apache decodes the full HPACK header block."
+  - step: 4
+    action: "Attacker opens stream 3, 5, 7, … and immediately repeats the same pattern on each new stream."
+  - step: 5
+    action: "Measure Apache CPU under this bounded-but-repeated CONTINUATION pattern versus a baseline of normal HEADERS frames."
+  - step: 6
+    action: "Determine whether the patched per-stream limit is effective at bounding the aggregate CPU cost across many streams."
+
+rfc_sections:
+  - rfc: RFC 9113
+    section: "6.10"
+    dos_relevance: |
+      CONTINUATION frames extend a header block initiated by HEADERS or
+      PUSH_PROMISE. A HEADERS block may consist of a HEADERS frame followed
+      by zero or more CONTINUATION frames; END_HEADERS terminates the block.
+      RFC 9113 imposes no limit on CONTINUATION count per block. The Apache
+      2.4.59 patch adds an implementation-defined limit to bound the worst
+      case; the research question is whether that limit is sufficient.
+
+  - rfc: RFC 7541
+    section: "6.3"
+    dos_relevance: |
+      HPACK dynamic table size updates and Huffman-encoded header values
+      require CPU proportional to block size to decode. A header block
+      built from many CONTINUATION frames that fills the HPACK compression
+      budget can still require significant decoding work even if the
+      CONTINUATION frame count is bounded by the patch.
+
+related_work:
+  - type: cve
+    id: CVE-2024-27316
+    relevance: "The original vulnerability this test targets as a partial-fix variant."
+  - type: advisory
+    url: https://httpd.apache.org/security/vulnerabilities_24.html

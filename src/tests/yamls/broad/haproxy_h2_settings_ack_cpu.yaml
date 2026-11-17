@@ -1,0 +1,121 @@
+hypothesis:
+  description: |
+    RFC 9113 §6.5 defines the HTTP/2 SETTINGS frame. A peer that receives
+    a SETTINGS frame MUST acknowledge it by sending an empty SETTINGS frame
+    with the ACK flag set (§6.5.3). This mandatory acknowledgement creates
+    a symmetric CPU-and-I/O obligation: for every SETTINGS frame received
+    the endpoint must produce a SETTINGS ACK and process the new parameters.
+
+    HAProxy 2.9.x implements HTTP/2 for both frontend and backend connections.
+    When acting as an HTTP/2 frontend, HAProxy processes inbound SETTINGS
+    frames and sends SETTINGS ACK responses synchronously within the
+    multiplexer. HAProxy does not apply a per-connection rate limit on
+    inbound SETTINGS frames.
+
+    The suspected vulnerability: an attacker can send SETTINGS frames at
+    high frequency on established HTTP/2 connections. Each SETTINGS frame
+    is small (9-byte frame header + variable parameters) but forces:
+    1. HPACK dynamic table resize if HEADER_TABLE_SIZE changes.
+    2. Flow control window adjustments if INITIAL_WINDOW_SIZE changes.
+    3. A SETTINGS ACK write syscall.
+
+    By alternating SETTINGS payloads (e.g., toggling HEADER_TABLE_SIZE
+    between 0 and 65536 and INITIAL_WINDOW_SIZE between 65535 and 2147483647),
+    the attacker maximises the state-machine work per SETTINGS frame while
+    keeping the frame small and the connection persistent.
+
+    Assumptions:
+    - A1: HAProxy 2.9 accepts SETTINGS frames at any rate on established
+          HTTP/2 connections without a frequency cap.
+    - A2: Each SETTINGS frame containing HEADER_TABLE_SIZE triggers an
+          HPACK dynamic table resize operation in HAProxy.
+    - A3: The mandatory SETTINGS ACK write adds I/O pressure on the worker
+          thread proportional to the SETTINGS arrival rate.
+    - A4: No circuit breaker in HAProxy terminates connections that send
+          SETTINGS at high frequency without sending requests.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/haproxy/haproxy
+  version: "2.9.5"
+  protocol: HTTP/2
+  entry_point: "TCP port 443, TLS ALPN h2"
+  docker_image: "haproxy:2.9"
+  server_config: |
+    global
+      maxconn 500
+
+    defaults
+      timeout connect 5s
+      timeout client  60s
+      timeout server  60s
+
+    frontend fe_h2
+      bind *:443 ssl crt /etc/haproxy/cert.pem alpn h2,http/1.1
+      default_backend be_local
+
+    backend be_local
+      server s1 127.0.0.1:8080
+
+assumptions:
+  - id: A1
+    description: "HAProxy 2.9 does not rate-limit inbound SETTINGS frames per connection and processes each one synchronously."
+    necessity: required
+
+  - id: A2
+    description: "A SETTINGS frame with HEADER_TABLE_SIZE causes HAProxy's HPACK encoder to resize its dynamic table, which is a non-trivial in-memory operation."
+    necessity: required
+
+  - id: A3
+    description: "Each SETTINGS frame forces a SETTINGS ACK write, adding a syscall and kernel buffer pressure proportional to the inbound SETTINGS rate."
+    necessity: required
+
+  - id: A4
+    description: "HAProxy does not detect and terminate connections that send high-frequency SETTINGS frames without issuing requests."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker establishes N HTTP/2 connections to HAProxy (N = 50–200) with valid TLS and ALPN h2 negotiation."
+  - step: 2
+    action: "On each connection, attacker sends SETTINGS frames at the maximum accepted rate, alternating HEADER_TABLE_SIZE between 0 and 65536 and INITIAL_WINDOW_SIZE between 65535 and 2^31-1."
+  - step: 3
+    action: "HAProxy processes each SETTINGS, resizes the HPACK table, adjusts flow control state, and writes a SETTINGS ACK."
+  - step: 4
+    action: "Measure HAProxy worker CPU utilisation as SETTINGS frame rate increases across all connections."
+  - step: 5
+    action: "Determine whether SETTINGS-only connections (sending no requests) can saturate a HAProxy worker CPU core."
+
+rfc_sections:
+  - rfc: RFC 9113
+    section: "6.5"
+    dos_relevance: |
+      SETTINGS frames modify connection and stream state. The receiver MUST
+      apply each parameter change immediately and MUST send a SETTINGS ACK.
+      RFC 9113 imposes no limit on how often SETTINGS may be sent. The
+      mandatory symmetric ACK creates an amplification path: one small
+      inbound SETTINGS frame generates one outbound SETTINGS ACK plus
+      internal state machine work, with no provision to throttle the rate.
+
+  - rfc: RFC 9113
+    section: "6.5.3"
+    dos_relevance: |
+      Receipt of a SETTINGS frame with the ACK flag unset is a signal to
+      apply the settings and send an acknowledgement. No timeout or rate
+      limit is specified. An implementation that processes them without
+      frequency gating is exposed to CPU exhaustion via SETTINGS floods.
+
+  - rfc: RFC 7541
+    section: "4.2"
+    dos_relevance: |
+      HPACK dynamic table size updates are encoded in the first header block
+      after a SETTINGS_HEADER_TABLE_SIZE change. The encoder must resize its
+      dynamic table to conform. Alternating the declared size forces the HPACK
+      encoder to perform repeated table reallocation on the sender side and
+      resize acknowledgement processing on the receiver side.
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+    relevance: "HTTP/2 Rapid Reset — same connection-level amplification principle using RST_STREAM instead of SETTINGS."

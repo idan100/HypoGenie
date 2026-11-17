@@ -1,0 +1,117 @@
+hypothesis:
+  description: |
+    HTTP/2 (RFC 7540 §6.6, now RFC 9113 §8.5) defines PUSH_PROMISE frames
+    that allow a server to pre-emptively send resources to the client before
+    they are requested. Apache httpd's mod_http2 supports server push via
+    the H2Push directive and Link response headers with rel=preload.
+
+    The suspected vulnerability: when a client sends a request to an Apache
+    endpoint that returns many Link: <url>; rel=preload; nopush=0 headers,
+    Apache queues one PUSH_PROMISE frame followed by a pushed response for
+    each linked resource. The number of queued pushes is bounded by the
+    H2PushDiarySize and stream limits, but the per-request Link header list
+    is parsed and queued before those limits are enforced at the stream level.
+
+    An attacker can send rapid requests to an endpoint that generates a
+    large number of push candidates per response. If Apache queues push
+    metadata and allocates stream resources for each candidate before
+    applying the per-connection limit, a small number of connections can
+    cause disproportionate memory allocation in the server's push bookkeeping
+    structures.
+
+    Additionally, when the client's SETTINGS_MAX_CONCURRENT_STREAMS is set
+    to a low value (e.g., 1), Apache cannot open pushed streams but may
+    still allocate internal push-queue entries, retaining memory until the
+    queue drains or the connection closes.
+
+    Assumptions:
+    - A1: Apache httpd 2.4.59 with mod_http2 enabled processes H2Push
+          Link headers and queues push candidates per request.
+    - A2: Push candidates are allocated in memory before the stream limit
+          check determines whether they can be transmitted.
+    - A3: Sending SETTINGS_MAX_CONCURRENT_STREAMS=1 causes Apache to retain
+          push queue entries while they wait for stream capacity.
+    - A4: The number of push candidates per request is not bounded before
+          internal allocation occurs.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/apache/httpd
+  version: "2.4.59"
+  protocol: HTTP/2
+  entry_point: "TCP port 443, TLS ALPN h2"
+  docker_image: "httpd:2.4.59"
+  server_config: |
+    LoadModule http2_module modules/mod_http2.so
+    Protocols h2 http/1.1
+    SSLEngine on
+    SSLCertificateFile /usr/local/apache2/conf/cert.pem
+    SSLCertificateKeyFile /usr/local/apache2/conf/key.pem
+    H2Push on
+    H2PushDiarySize 256
+    H2MaxSessionStreams 100
+    <Location />
+      Header add Link "</a.css>; rel=preload; as=style"
+      Header add Link "</b.css>; rel=preload; as=style"
+      Header add Link "</c.js>; rel=preload; as=script"
+      Header add Link "</d.js>; rel=preload; as=script"
+      Header add Link "</e.png>; rel=preload; as=image"
+      Header add Link "</f.png>; rel=preload; as=image"
+      Header add Link "</g.woff2>; rel=preload; as=font"
+      Header add Link "</h.woff2>; rel=preload; as=font"
+    </Location>
+
+assumptions:
+  - id: A1
+    description: "mod_http2 in Apache 2.4.59 supports H2Push and queues push candidates from Link headers for each incoming request."
+    necessity: required
+
+  - id: A2
+    description: "Internal push queue entries are allocated before the stream limit check; blocked entries are retained in memory while awaiting capacity."
+    necessity: required
+
+  - id: A3
+    description: "The client's SETTINGS_MAX_CONCURRENT_STREAMS=1 is respected by Apache, preventing push stream creation and causing entries to accumulate in the push queue."
+    necessity: required
+
+  - id: A4
+    description: "No hard per-request or per-connection cap on queued push entries is enforced before memory allocation."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens an HTTP/2 connection to Apache and immediately sends SETTINGS with SETTINGS_MAX_CONCURRENT_STREAMS=1."
+  - step: 2
+    action: "Attacker sends a stream of GET requests to the configured endpoint, each of which returns 8 Link: preload headers."
+  - step: 3
+    action: "Apache queues 8 push candidates per request; the stream limit of 1 prevents any pushed stream from opening while requests continue."
+  - step: 4
+    action: "Push queue entries accumulate in Apache's per-connection push diary across many pending requests."
+  - step: 5
+    action: "Measure Apache httpd process memory as the queue depth grows and determine whether push bookkeeping memory is bounded."
+
+rfc_sections:
+  - rfc: RFC 9113
+    section: "8.5"
+    dos_relevance: |
+      Server push requires the server to send a PUSH_PROMISE frame before
+      sending the pushed response. The server must respect the client's
+      SETTINGS_MAX_CONCURRENT_STREAMS. If the limit is exhausted, pushes
+      are queued server-side. RFC 9113 does not mandate a maximum queue
+      depth for pending push promises, leaving implementations to bound
+      this independently.
+
+  - rfc: RFC 9113
+    section: "6.5.2"
+    dos_relevance: |
+      SETTINGS_MAX_CONCURRENT_STREAMS is set by the receiver to limit the
+      number of concurrently open streams. A client setting this to 1
+      prevents pushed streams while still allowing the client's own request
+      streams, creating a configuration that maximally stresses the push
+      queuing path.
+
+related_work:
+  - type: cve
+    id: CVE-2024-27316
+    relevance: "HTTP/2 CONTINUATION Flood against Apache httpd; different frame type but same mod_http2 connection handling path."

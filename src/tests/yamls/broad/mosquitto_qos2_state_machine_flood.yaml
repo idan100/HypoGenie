@@ -1,0 +1,114 @@
+hypothesis:
+  description: |
+    MQTT v3.1.1 (OASIS MQTT 3.1.1 §4.3.3) defines QoS 2 delivery as a
+    four-part handshake: PUBLISH → PUBREC → PUBREL → PUBCOMP. Each
+    step is mandatory; the protocol proceeds to the next step only after
+    the previous acknowledgement is received. The broker must retain a
+    QoS 2 transaction record from receipt of PUBLISH until it sends
+    PUBCOMP.
+
+    Mosquitto 2.0.x maintains in-memory per-client QoS 2 state for every
+    inflight PUBLISH. The state machine tracks: packet ID, payload pointer,
+    topic string, subscription QoS, and transaction phase. The number of
+    concurrent inflight QoS 2 messages per client is limited by
+    max_inflight_messages (default 20), but that limit applies per session,
+    not globally.
+
+    The suspected vulnerability: an attacker opens a large number of MQTT
+    connections (or creates many sessions with clean_session=false), each
+    publishing QoS 2 messages and then never sending PUBREL after receiving
+    PUBREC. Each stalled transaction:
+    1. Retains a QoS 2 state entry in Mosquitto's memory.
+    2. Holds the packet ID slot (1–65535 range).
+    3. Triggers Mosquitto's retry timer (retry_interval), which re-sends
+       PUBREC and re-traverses the state machine at every retry interval.
+
+    Under many parallel stalled QoS 2 handshakes, the aggregate retry
+    processing and in-memory state can degrade Mosquitto CPU and memory.
+    With persistent sessions, the state survives disconnection, so the
+    attacker can disconnect after stalling the handshakes and the state
+    persists until the session expires.
+
+    Assumptions:
+    - A1: Mosquitto 2.0 retains QoS 2 transaction state for all inflight
+          messages per session, including those where PUBREL was never received.
+    - A2: The retry_interval timer re-processes stalled QoS 2 entries at
+          every interval regardless of connection state.
+    - A3: The aggregate in-memory state from many sessions each with
+          max_inflight stalled QoS 2 entries can consume significant memory.
+    - A4: Many simultaneous retry timer callbacks across all stalled sessions
+          create measurable CPU overhead in Mosquitto's event loop.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/eclipse/mosquitto
+  version: "2.0.18"
+  protocol: TCP
+  entry_point: "TCP port 1883, MQTT v3.1.1"
+  docker_image: "eclipse-mosquitto:2.0.18"
+  server_config: |
+    listener 1883
+    allow_anonymous true
+    max_inflight_messages 20
+    max_queued_messages 1000
+    retry_interval 20
+    persistent_client_expiration 1h
+    persistence true
+    persistence_location /mosquitto/data/
+
+assumptions:
+  - id: A1
+    description: "Mosquitto 2.0 retains in-memory QoS 2 transaction state for each inflight PUBLISH where PUBREL has not been received, including across disconnections with persistent sessions."
+    necessity: required
+
+  - id: A2
+    description: "The retry_interval timer triggers re-transmission of PUBREC for all stalled QoS 2 transactions at the configured interval, performing state-machine traversal regardless of whether the client is connected."
+    necessity: required
+
+  - id: A3
+    description: "Many sessions each holding max_inflight_messages stalled QoS 2 entries can collectively consume significant broker memory proportional to sessions × max_inflight × (payload + state overhead)."
+    necessity: required
+
+  - id: A4
+    description: "The aggregate retry timer work across many stalled sessions creates measurable CPU overhead in Mosquitto's main event loop, degrading publish throughput for active legitimate clients."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens N MQTT connections with clean_session=false and unique client IDs."
+  - step: 2
+    action: "Each connection publishes max_inflight_messages QoS 2 messages with large payloads (e.g., 10 KB each)."
+  - step: 3
+    action: "Attacker waits to receive PUBREC for each PUBLISH but never sends PUBREL, stalling the QoS 2 handshake at the PUBREC phase."
+  - step: 4
+    action: "Attacker disconnects, leaving all stalled QoS 2 state in the persistent sessions."
+  - step: 5
+    action: "Mosquitto retains all stalled state and continues firing retry timers; attacker optionally reconnects to open new sessions and repeat."
+  - step: 6
+    action: "Measure Mosquitto memory usage and QoS 2 publish latency for a legitimate client as stalled session state and retry timer load accumulate."
+
+rfc_sections:
+  - rfc: "OASIS MQTT Version 3.1.1"
+    section: "4.3.3 QoS 2: Exactly once delivery"
+    dos_relevance: |
+      QoS 2 requires the broker to retain delivery state from PUBLISH receipt
+      until PUBCOMP is sent. The four-step handshake (PUBLISH→PUBREC→PUBREL→
+      PUBCOMP) requires the broker to hold per-message state through two
+      round trips. No timeout on the broker side is mandated by the MQTT
+      specification; retry behaviour is implementation-defined. This creates
+      an indefinite state retention obligation for stalled handshakes.
+
+  - rfc: "OASIS MQTT Version 3.1.1"
+    section: "3.1.2.4 Clean Session"
+    dos_relevance: |
+      With clean_session=false, QoS 2 transaction state persists across
+      disconnections. This means an attacker can disconnect after stalling
+      handshakes; the broker must retain the state for the full session
+      expiry period. The disconnect-and-reconnect cycle allows the attacker
+      to maximise stalled state without maintaining connections.
+
+related_work:
+  - type: cve
+    id: CVE-2023-28366
+    relevance: "Mosquitto memory leak in persistent session handling — same session persistence code path."

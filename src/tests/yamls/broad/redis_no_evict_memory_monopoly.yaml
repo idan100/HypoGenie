@@ -1,0 +1,107 @@
+hypothesis:
+  description: |
+    Redis 7.0 introduced the CLIENT NO-EVICT command (Redis documentation,
+    RESP3 protocol). When a client issues CLIENT NO-EVICT ON, the Redis
+    memory manager exempts that connection from the client eviction policy
+    even when the server is under memory pressure. Redis evicts other
+    clients first under maxmemory-policy noeviction or when
+    maxmemory-clients is exhausted.
+
+    The suspected vulnerability: an attacker with network access can open
+    one or more long-lived connections, issue CLIENT NO-EVICT ON, and then
+    flood the server with commands that expand per-client output buffers
+    (e.g., pipelining large LRANGE or SMEMBERS over large data sets) or
+    accumulate large client query buffers without reading. Because the
+    no-evict flag prevents Redis from reclaiming these connections under
+    memory pressure, the attacker monopolises memory while legitimate
+    clients are disconnected.
+
+    The key novelty is the interaction between CLIENT NO-EVICT (a
+    per-connection flag) and the global eviction algorithm: Redis resolves
+    the resource pressure by evicting other connections, effectively
+    allowing an authenticated attacker to weaponise the eviction system
+    against legitimate users.
+
+    This is not about exceeding maxmemory for keyspace; it is about
+    client-output-buffer and client-query-buffer memory that the no-evict
+    flag shields from reclamation.
+
+    Assumptions:
+    - A1: CLIENT NO-EVICT ON is accepted by the target Redis instance and
+          the flag is honoured by the memory management subsystem.
+    - A2: Under client output buffer or query buffer pressure, Redis
+          selects eviction victims from the pool of evictable clients
+          before disconnecting no-evict clients.
+    - A3: The attacker can generate enough per-connection buffered data
+          to trigger the eviction threshold using a small number of
+          no-evict connections.
+    - A4: The eviction of legitimate clients is observable as connection
+          drops or command failures for non-attacker connections.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/redis/redis
+  version: "7.2.4"
+  protocol: TCP
+  entry_point: "TCP port 6379, RESP3 protocol"
+  docker_image: "redis:7.2.4"
+  server_config: |
+    maxmemory 256mb
+    maxmemory-policy noeviction
+    maxmemory-clients 64mb
+    client-output-buffer-limit normal 32mb 8mb 60
+
+assumptions:
+  - id: A1
+    description: "CLIENT NO-EVICT ON is accepted without privilege and the flag prevents the connection from being selected for client eviction."
+    necessity: required
+
+  - id: A2
+    description: "Redis resolves client memory pressure by evicting other, evictable clients before it terminates no-evict connections."
+    necessity: required
+
+  - id: A3
+    description: "The attacker can accumulate sufficient buffered data on a no-evict connection using pipelined reads of large values before the global memory threshold is reached."
+    necessity: required
+
+  - id: A4
+    description: "Legitimate client connections are disconnected as a direct consequence of the eviction pass that protects the attacker's no-evict connections."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens one or more connections to Redis and immediately issues CLIENT NO-EVICT ON on each."
+  - step: 2
+    action: "Attacker prepopulates large lists or sets (e.g., 10,000-element lists with 1 KB values) using a seeding connection."
+  - step: 3
+    action: "Attacker pipelines LRANGE key 0 -1 commands without reading responses, filling the client output buffers on no-evict connections."
+  - step: 4
+    action: "Redis output buffer memory approaches maxmemory-clients; the eviction pass scans connected clients sorted by memory usage."
+  - step: 5
+    action: "Because the no-evict connections are excluded from eviction candidates, Redis disconnects legitimate clients to reclaim memory."
+  - step: 6
+    action: "Determine whether the legitimate clients receive unexpected disconnects and whether the attacker connections remain stable throughout."
+
+rfc_sections:
+  - rfc: "Redis RESP3 Specification (antirez/RESP3)"
+    section: "CLIENT NO-EVICT command"
+    dos_relevance: |
+      CLIENT NO-EVICT is a Redis 7.0+ extension to the RESP3 inline command
+      protocol. It modifies per-connection metadata used by the client
+      eviction subsystem. The command is available to any authenticated
+      client regardless of ACL privilege level. The interaction with
+      maxmemory-clients creates a priority inversion: protected connections
+      accumulate memory while unprotected connections are terminated.
+
+  - rfc: "Redis documentation: client eviction"
+    section: "maxmemory-clients and eviction policy"
+    dos_relevance: |
+      Redis selects eviction victims based on memory usage, excluding
+      no-evict clients. When all large-memory clients are marked no-evict,
+      the eviction pass must disconnect smaller legitimate clients instead,
+      inverting the intended policy.
+
+related_work:
+  - type: writeup
+    url: https://redis.io/docs/latest/commands/client-no-evict/

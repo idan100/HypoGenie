@@ -1,0 +1,103 @@
+hypothesis:
+  description: |
+    The MySQL Client/Server Protocol (documented in MySQL Internals §14)
+    defines COM_STMT_SEND_LONG_DATA (command code 0x18). This command
+    streams a large parameter value for a prepared statement in chunks,
+    accumulating the data server-side until the statement is executed.
+    Critically, COM_STMT_SEND_LONG_DATA has no server response: the MySQL
+    server does not send an OK or ERR packet after receiving it.
+
+    The absence of a response creates a pure one-way pipeline: the client
+    can stream an arbitrary number of COM_STMT_SEND_LONG_DATA packets back-
+    to-back without receiving any server acknowledgement. MySQL buffers each
+    chunk in a per-statement, per-parameter accumulation buffer allocated
+    in the thread's mem_root. The buffer grows until the statement is
+    executed (COM_STMT_EXECUTE) or the connection closes.
+
+    The suspected vulnerability: an attacker prepares a parameterised
+    statement on an authenticated connection and then sends thousands of
+    COM_STMT_SEND_LONG_DATA packets, each carrying the maximum allowed
+    payload (up to max_allowed_packet bytes). Because there is no response
+    and no mandatory server-side throttle, the server accumulates these
+    chunks in memory without any backpressure signal. Across multiple
+    connections, the aggregate accumulated parameter data can exhaust
+    MySQL's per-thread memory and the global innodb_buffer_pool, degrading
+    query throughput for unrelated sessions.
+
+    Assumptions:
+    - A1: MySQL 8.0 accepts COM_STMT_SEND_LONG_DATA packets without
+          sending a response, allowing unlimited pipeline depth.
+    - A2: Each COM_STMT_SEND_LONG_DATA packet appends to a per-statement
+          accumulation buffer in the connection thread's mem_root.
+    - A3: The accumulation buffer grows without a per-statement or
+          per-connection cap independent of max_allowed_packet.
+    - A4: Many parallel connections each accumulating large parameter
+          data can exhaust available memory before execution or close.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/mysql/mysql-server
+  version: "8.0.36"
+  protocol: TCP
+  entry_point: "TCP port 3306, MySQL Client/Server Protocol v10"
+  docker_image: "mysql:8.0.36"
+  server_config: |
+    MYSQL_ROOT_PASSWORD: rootpassword
+    MYSQL_DATABASE: testdb
+
+assumptions:
+  - id: A1
+    description: "MySQL 8.0 sends no response to COM_STMT_SEND_LONG_DATA, allowing the client to send arbitrarily many chunks without receiving acknowledgements."
+    necessity: required
+
+  - id: A2
+    description: "Each COM_STMT_SEND_LONG_DATA chunk is appended to a per-statement parameter buffer allocated in the connection thread's mem_root."
+    necessity: required
+
+  - id: A3
+    description: "The parameter accumulation buffer grows linearly with incoming chunks without a per-statement memory cap separate from max_allowed_packet."
+    necessity: required
+
+  - id: A4
+    description: "Multiple parallel connections each accumulating large parameter data simultaneously can exhaust MySQL's per-thread or global memory, degrading unrelated sessions."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens N authenticated connections to MySQL (N = 10–50)."
+  - step: 2
+    action: "On each connection, attacker sends COM_STMT_PREPARE for a single-parameter query (e.g., INSERT INTO t VALUES (?))."
+  - step: 3
+    action: "Attacker sends a stream of COM_STMT_SEND_LONG_DATA packets (parameter 0) with large payloads (each max_allowed_packet - 1 bytes) without executing the statement."
+  - step: 4
+    action: "MySQL accumulates the data in the thread's mem_root; no backpressure is sent to the client."
+  - step: 5
+    action: "Measure MySQL total memory (performance_schema.memory_summary) and query throughput for unrelated sessions as the accumulation grows."
+  - step: 6
+    action: "Determine whether the aggregate accumulated parameter data exhausts available memory before the connections close or time out."
+
+rfc_sections:
+  - rfc: "MySQL Internals Manual: COM_STMT_SEND_LONG_DATA (MySQL documentation §14.6.5)"
+    section: "COM_STMT_SEND_LONG_DATA"
+    dos_relevance: |
+      COM_STMT_SEND_LONG_DATA (0x18) has no response packet. The MySQL
+      server accumulates chunks in a per-statement parameter buffer.
+      The documentation states the data must be sent before COM_STMT_EXECUTE.
+      No per-statement memory cap is documented. The absence of a server
+      response eliminates all protocol-level backpressure, enabling
+      unlimited one-way data streaming directly into server memory.
+
+  - rfc: "MySQL Internals Manual: Prepared Statements (MySQL documentation §14.6)"
+    section: "Prepared statement memory model"
+    dos_relevance: |
+      Prepared statement state, including LONG_DATA accumulation buffers,
+      is allocated in the connection thread's mem_root. This memory is
+      released on COM_STMT_CLOSE or connection close. Under a slow-sending
+      or never-executing attack, the memory is held for the full duration
+      of the connection, with no intermediate reclamation path.
+
+related_work:
+  - type: cve
+    id: CVE-2017-10379
+    relevance: "MySQL prepared statement memory exhaustion; different parameter path but same COM_STMT subsystem."

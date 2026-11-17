@@ -1,0 +1,106 @@
+hypothesis:
+  description: |
+    RFC 7641 (Observing Resources in CoAP) extends CoAP (RFC 7252) with an
+    Observe option. A CoAP client registers an observation by sending a GET
+    request with an Observe option value of 0. The server then sends
+    notifications (responses) to the client whenever the observed resource
+    changes state. The client remains registered until it explicitly
+    deregisters (Observe=1) or the server removes the registration.
+
+    libcoap 4.3.4 (the reference CoAP implementation) maintains an observer
+    list per resource. Each registration stores:
+    - The client's transport address (IP + port).
+    - The token used for the observation.
+    - The Observe sequence counter.
+    - The registration timestamp.
+
+    The suspected vulnerability: an attacker floods the server with Observe
+    registration requests using many unique source ports (UDP) or tokens.
+    libcoap stores each unique (address, token) pair as an independent
+    observer. If no maximum observer count per resource or per server is
+    enforced, the observer list grows without bound, consuming memory and
+    increasing the per-notification processing time (which iterates over all
+    registered observers).
+
+    When the resource state changes (or is changed by the attacker via PUT),
+    libcoap iterates the full observer list to send notifications. With a
+    large observer list, this iteration becomes a CPU-intensive O(n)
+    operation performed on every resource change, allowing the attacker to
+    amplify the per-change CPU cost by pre-registering many observers.
+
+    Assumptions:
+    - A1: libcoap 4.3.4 stores each unique (address, token) observation
+          as a separate entry in the resource observer list.
+    - A2: No maximum observer count per resource or per server is enforced.
+    - A3: The notification dispatch loop iterates the full observer list
+          synchronously on every resource state change.
+    - A4: The attacker can register many observers from a single source
+          using unique tokens, as CoAP uses UDP and tokens are client-chosen.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/obgm/libcoap
+  version: "4.3.4"
+  protocol: UDP
+  entry_point: "UDP port 5683, CoAP (RFC 7252)"
+  docker_image: "obgm/libcoap:4.3.4"
+  server_config: |
+    # coap-server started with a single observable resource:
+    # coap-server -d 10 -v 3 -A 0.0.0.0 -p 5683
+    # Resource /obs is registered as observable via coap_resource_set_dirty()
+
+assumptions:
+  - id: A1
+    description: "libcoap 4.3.4 stores each (address, token) pair as an independent coap_subscription_t node in the resource's observer linked list."
+    necessity: required
+
+  - id: A2
+    description: "No per-resource or server-wide maximum observer count is enforced; the observer list grows linearly with registration requests."
+    necessity: required
+
+  - id: A3
+    description: "The notification dispatch loop in coap_resource_notify_observers() iterates the full subscriber list synchronously, so O(n) CPU is consumed per resource change event."
+    necessity: required
+
+  - id: A4
+    description: "An attacker can register many observers using different CoAP tokens from a single UDP source address, since tokens are client-chosen and the registration key is (address, token)."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker sends N CoAP GET requests to /obs with Observe=0 and unique token values (each request registers a distinct observer)."
+  - step: 2
+    action: "libcoap stores N coap_subscription_t nodes in the /obs resource's observer list."
+  - step: 3
+    action: "Attacker sends a CoAP PUT to /obs to trigger a resource state change, causing libcoap to iterate all N observers and send N CoAP 2.05 Content notifications."
+  - step: 4
+    action: "Each notification dispatch generates a UDP write; the total work is O(N) per PUT."
+  - step: 5
+    action: "Attacker repeatedly issues PUT requests to trigger notifications, measuring CPU consumption as N increases."
+  - step: 6
+    action: "Determine whether the O(N) notification dispatch per PUT can saturate the libcoap server CPU with a bounded N."
+
+rfc_sections:
+  - rfc: RFC 7641
+    section: "3"
+    dos_relevance: |
+      RFC 7641 §3 defines observer registration: a GET with Observe=0
+      registers the client; the server sends future resource notifications.
+      The RFC does not define a maximum observer count per resource and
+      does not mandate expiry or cleanup beyond what the server decides.
+      Implementations that do not bound the observer list expose an O(n)
+      CPU cost on every resource notification event.
+
+  - rfc: RFC 7252
+    section: "4.5"
+    dos_relevance: |
+      CoAP tokens are chosen by the client and may be 0–8 bytes. Because
+      the registration key includes the token, a client can register many
+      observers from a single address by varying tokens. This enables a
+      single attacker to populate large observer lists without spoofing.
+
+related_work:
+  - type: cve
+    id: CVE-2023-30362
+    relevance: "libcoap heap buffer overflow — different code path but same libcoap target."

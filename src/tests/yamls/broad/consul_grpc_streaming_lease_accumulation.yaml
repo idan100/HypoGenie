@@ -1,0 +1,113 @@
+hypothesis:
+  description: |
+    HashiCorp Consul exposes a gRPC streaming API for service discovery and
+    health watching (via the consul-server-discovery gRPC interface). Clients
+    can open streaming RPCs to subscribe to service health changes.
+    Internally, Consul registers each streaming subscriber in an in-memory
+    subscription manager and issues a session or lease for the duration of
+    the stream.
+
+    Consul also exposes an HTTP/2-based gRPC gateway and uses the raft
+    consensus protocol for state changes. Each watch stream requires Consul
+    to maintain a snapshot of the relevant state (service health, KV data)
+    and push delta updates on each state change.
+
+    The suspected vulnerability: an attacker opens many concurrent gRPC
+    streaming watch subscriptions using Consul's subscribe.Subscribe RPC
+    (or the equivalent gRPC endpoint). Each stream:
+    1. Allocates a subscription object in Consul's subscription manager.
+    2. Holds a reference to the current snapshot of watched state.
+    3. Receives delta events on each Consul raft state change.
+
+    If the attacker never reads from the gRPC stream (or reads slowly),
+    gRPC transport-level backpressure eventually fills the stream window.
+    However, Consul's internal event dispatcher may continue pushing delta
+    events into the subscription's buffer before transport backpressure
+    takes effect, consuming heap memory proportional to the event rate
+    times the number of open streams.
+
+    With enough parallel subscriptions and a moderate state-change rate,
+    the aggregate subscription buffer memory can exhaust Consul's heap
+    and degrade service registration and health check updates.
+
+    Assumptions:
+    - A1: Consul allows an authenticated client to open an unlimited number
+          of streaming watch subscriptions without a per-client cap.
+    - A2: Each open subscription allocates state snapshot and event buffer
+          memory that grows with the event rate if the stream is not consumed.
+    - A3: Consul's internal event dispatcher pushes events to subscription
+          buffers before gRPC transport backpressure takes effect.
+    - A4: Aggregate subscription buffer memory across many slow streams can
+          exhaust Consul's available heap and degrade raft and health check
+          operations.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/hashicorp/consul
+  version: "v1.18.1"
+  protocol: gRPC
+  entry_point: "TCP port 8502, Consul gRPC interface (grpc_port)"
+  docker_image: "hashicorp/consul:1.18.1"
+  server_config: |
+    # consul.hcl
+    server = true
+    bootstrap_expect = 1
+    bind_addr = "0.0.0.0"
+    client_addr = "0.0.0.0"
+    ports {
+      grpc = 8502
+      http = 8500
+    }
+    enable_debug = true
+
+assumptions:
+  - id: A1
+    description: "Consul 1.18 does not enforce a per-client or server-wide cap on concurrent streaming subscribe RPCs."
+    necessity: required
+
+  - id: A2
+    description: "Each streaming subscription allocates a snapshot buffer and an event channel; these grow with the event rate when the stream is consumed slowly."
+    necessity: required
+
+  - id: A3
+    description: "Consul's internal event dispatcher sends delta events into subscription buffers before gRPC flow control prevents further writes."
+    necessity: required
+
+  - id: A4
+    description: "Aggregate subscription buffer memory across many slow streams can exhaust available heap and degrade Consul's raft write throughput and health check propagation."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens N gRPC streaming subscribe RPCs to Consul on port 8502, each subscribing to all service health events (wildcard)."
+  - step: 2
+    action: "Attacker sends a background service registration flood (e.g., 10 service registrations/s via the HTTP API) to generate watch events."
+  - step: 3
+    action: "Each subscription receives delta events that the attacker's streams do not read, causing event buffers to accumulate."
+  - step: 4
+    action: "Measure Consul memory usage (from /v1/agent/metrics) and service registration latency as subscription count and event backlog grow."
+  - step: 5
+    action: "Determine whether the aggregate subscription memory exhausts Consul's heap and degrades service mesh operations for unrelated clients."
+
+rfc_sections:
+  - rfc: "gRPC Core: Bidirectional Streaming (grpc.io)"
+    section: "Bidirectional streaming RPCs"
+    dos_relevance: |
+      Bidirectional streaming RPCs allow both client and server to send a
+      stream of messages. The server must maintain state for each open stream
+      and dispatch messages to it. gRPC flow control operates at the HTTP/2
+      layer; Consul-level subscription state may accumulate before transport
+      backpressure prevents further events.
+
+  - rfc: "HashiCorp Consul Subscribe API (consul.io/docs)"
+    section: "Streaming subscribe endpoint"
+    dos_relevance: |
+      The Consul subscribe endpoint delivers initial state snapshots and
+      incremental delta events to streaming clients. The server-side
+      subscription manager must track each subscriber's current event
+      position. No per-client subscription limit is documented.
+
+related_work:
+  - type: writeup
+    url: https://github.com/hashicorp/consul/issues/19288

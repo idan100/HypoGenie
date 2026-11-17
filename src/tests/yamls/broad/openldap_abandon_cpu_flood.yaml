@@ -1,0 +1,107 @@
+hypothesis:
+  description: |
+    RFC 4511 §4.11 defines the LDAP Abandon operation. A client sends an
+    AbandonRequest containing the messageID of a previously submitted
+    operation. The server SHOULD stop processing the abandoned request
+    but is not required to respond. Crucially, RFC 4511 specifies that
+    there is no response to the Abandon operation itself (§4.11, last
+    paragraph).
+
+    The lack of a server response to Abandon creates an asymmetric
+    interaction: the client pays only the cost of encoding and sending
+    a small BER AbandonRequest PDU; the server must decode the BER, look
+    up the messageID in its in-flight operation table, and attempt to
+    cancel the referenced operation. This search is performed even when
+    no operation with the given messageID exists.
+
+    The suspected vulnerability: an attacker floods OpenLDAP with Abandon
+    requests referencing non-existent or already-completed messageIDs.
+    Each Abandon requires BER decoding, a mutex-guarded lookup in the
+    per-connection operation hash table, and potentially a cancellation
+    attempt on a background worker thread — all with no response (and
+    therefore no backpressure to the client). Over a high-bandwidth
+    connection, the aggregate CPU and mutex contention on the connection
+    daemon (slapd) can degrade search throughput for legitimate clients.
+
+    Assumptions:
+    - A1: OpenLDAP slapd processes each inbound AbandonRequest
+          synchronously on the connection read thread before dispatching
+          the next message.
+    - A2: The messageID lookup in the in-flight operation table is
+          performed even when the messageID does not correspond to an
+          active operation.
+    - A3: There is no rate limit on AbandonRequest messages per connection
+          in OpenLDAP 2.6.x.
+    - A4: slapd allocates at least minimal per-AbandonRequest resources
+          (e.g., BER decode buffer, operation struct) that are reclaimed
+          only after the lookup is complete.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/openldap/openldap
+  version: "2.6.7"
+  protocol: TCP
+  entry_point: "TCP port 389, LDAP v3 (RFC 4511), no TLS required for test"
+  docker_image: "osixia/openldap:1.5.0"
+  server_config: |
+    LDAP_ORGANISATION: "Test Org"
+    LDAP_DOMAIN: "test.local"
+    LDAP_ADMIN_PASSWORD: "adminpassword"
+    LDAP_TLS: "false"
+
+assumptions:
+  - id: A1
+    description: "slapd processes each AbandonRequest on the connection read path before reading the next message, with no skip-ahead for known-invalid messageIDs."
+    necessity: required
+
+  - id: A2
+    description: "A BER decode and in-flight-table lookup is performed for every AbandonRequest even when the referenced messageID has never been issued."
+    necessity: required
+
+  - id: A3
+    description: "OpenLDAP 2.6.x does not rate-limit AbandonRequest messages per connection or globally."
+    necessity: required
+
+  - id: A4
+    description: "The CPU cost per AbandonRequest is non-trivial relative to the cost of sending the request over a local connection."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker establishes an authenticated LDAP v3 connection to slapd on port 389."
+  - step: 2
+    action: "Attacker sends AbandonRequest PDUs at high speed, using incrementing messageIDs that do not correspond to any in-flight operation."
+  - step: 3
+    action: "slapd decodes each BER PDU, searches the in-flight operation table for the referenced messageID, finds nothing, and discards the request — with no response."
+  - step: 4
+    action: "No backpressure is sent to the client, allowing the attacker to pipeline Abandon requests without waiting."
+  - step: 5
+    action: "Measure slapd CPU under Abandon flood versus a baseline of equivalent SearchRequest traffic, to determine whether Abandon has an amplified cost per byte sent."
+  - step: 6
+    action: "Assess whether the Abandon flood degrades response latency for concurrent legitimate LDAP searches."
+
+rfc_sections:
+  - rfc: RFC 4511
+    section: "4.11"
+    dos_relevance: |
+      The Abandon operation has no corresponding response. The server SHOULD
+      stop processing the referenced operation. The absence of a response
+      removes all backpressure: the client can flood Abandon requests at the
+      full TCP send rate and slapd must process each one at a minimum cost
+      proportional to BER decoding and messageID lookup, with no mechanism
+      to signal the client to slow down.
+
+  - rfc: RFC 4511
+    section: "4.1.1.1"
+    dos_relevance: |
+      messageID is a non-negative integer identifying the operation for the
+      duration of a connection. Abandon references this ID. Processing an
+      Abandon for an ID that was never issued or was already completed is
+      defined behavior, so slapd cannot cheaply skip such requests without
+      inspecting the in-flight table.
+
+related_work:
+  - type: cve
+    id: CVE-2023-2953
+    relevance: "OpenLDAP null pointer dereference in parsing; different code path but same slapd target."

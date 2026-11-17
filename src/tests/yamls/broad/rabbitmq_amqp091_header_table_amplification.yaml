@@ -1,0 +1,104 @@
+hypothesis:
+  description: |
+    AMQP 0-9-1 (the protocol used by RabbitMQ by default) defines a "table"
+    type (§2.6): a dictionary of field names to typed field values. Tables
+    are used in method frames (e.g., AMQP Basic.Properties headers) and
+    can be nested: a field value may itself be a table (type 'F') or an
+    array (type 'A') of values, recursively.
+
+    RabbitMQ 3.13.x parses AMQP 0-9-1 tables in Erlang using recursive
+    decoding (rabbit_binary_parser:parse_table/1). Each table entry
+    produces an Erlang tuple; nested tables produce nested tuples. The
+    decoding is recursive with no explicit depth limit: a field of type
+    'F' (table) recursively calls parse_table, and a field of type 'A'
+    (array) recursively decodes each element.
+
+    The suspected vulnerability: an attacker sends AMQP messages (via the
+    Basic.Publish method) with headers containing deeply nested tables. For
+    example, a table containing a field of type F (sub-table) which itself
+    contains another F, repeated to depth D. The Erlang decoded
+    representation expands to O(D) nested tuples, each allocated on the
+    Erlang heap. Because AMQP header frames are limited by frame_max (usually
+    128 KB), the attacker can craft a maximally dense nested table that
+    produces a large Erlang term from a small encoded representation.
+
+    This is distinct from the AMQP 1.0 nested compound-array issue
+    (CVE-2026-67414) in RabbitMQ; it targets the AMQP 0-9-1 binary parser
+    via the default AMQP port (5672) and the frame_max constraint.
+
+    Assumptions:
+    - A1: RabbitMQ 3.13 parses AMQP 0-9-1 table fields recursively with
+          no depth limit or decoded-term budget.
+    - A2: Nested F (sub-table) fields can produce deeply nested Erlang
+          tuples whose heap size is disproportionate to the encoded size.
+    - A3: AMQP 0-9-1 frame_max (default 128 KB) allows encoding tables
+          with meaningful nesting depth that expand significantly when decoded.
+    - A4: The decoded Erlang terms are allocated in the channel process heap
+          and can degrade shared broker memory or trigger garbage collection.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/rabbitmq/rabbitmq-server
+  version: "3.13.3"
+  protocol: TCP
+  entry_point: "AMQP 0-9-1 listener, TCP port 5672"
+  docker_image: "rabbitmq:3.13.3-management"
+  server_config: |
+    # rabbitmq.conf
+    frame_max = 131072
+    channel_max = 2047
+
+assumptions:
+  - id: A1
+    description: "RabbitMQ 3.13 uses a recursive Erlang function to decode AMQP 0-9-1 table fields, with no maximum nesting depth or decoded-term size budget."
+    necessity: required
+
+  - id: A2
+    description: "A table field of type F (nested table) encodes in fewer bytes than the corresponding decoded Erlang term, so a dense nested structure amplifies memory usage on decode."
+    necessity: required
+
+  - id: A3
+    description: "The AMQP 0-9-1 frame_max allows encoding a table with enough nesting depth to produce a decoded Erlang term significantly larger than the encoded frame."
+    necessity: required
+
+  - id: A4
+    description: "Decoded header table terms are retained in the channel process or message memory context long enough for many simultaneous messages to accumulate significant heap usage."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker establishes an authenticated AMQP 0-9-1 connection to RabbitMQ on port 5672."
+  - step: 2
+    action: "Attacker constructs a Basic.Publish message with a headers table containing D levels of nested F-type (sub-table) fields, each contributing minimally to encoded size but maximally to decoded term count."
+  - step: 3
+    action: "RabbitMQ's rabbit_binary_parser:parse_table/1 recursively decodes the nested table, producing D levels of Erlang tuples."
+  - step: 4
+    action: "Attacker rapidly publishes many such messages on a queue with no consumers, causing the channel process to allocate many deeply nested decoded terms."
+  - step: 5
+    action: "Measure RabbitMQ process memory (via /api/nodes from the management API) and unrelated channel throughput as nested-table messages accumulate."
+
+rfc_sections:
+  - rfc: "AMQP 0-9-1 Specification (AMQP Working Group, 2008)"
+    section: "2.6 Field Tables"
+    dos_relevance: |
+      AMQP 0-9-1 field tables allow recursive nesting: a field value of
+      type 'F' is itself a field table, and type 'A' is an array of values
+      which may include nested tables. The specification imposes no maximum
+      nesting depth. Implementations that decode tables recursively without
+      a depth or term-size budget are exposed to amplified memory allocation
+      from small encoded inputs.
+
+  - rfc: "AMQP 0-9-1 Specification"
+    section: "2.3.5 Frame Body"
+    dos_relevance: |
+      Content header frames carry message properties including the headers
+      table. The frame size is bounded by frame_max. Within that bound,
+      a recursively nested table can encode many levels of indirection in
+      a small byte count, producing a decoded term whose memory footprint
+      significantly exceeds the encoded size.
+
+related_work:
+  - type: cve
+    id: CVE-2026-67414
+    relevance: "RabbitMQ AMQP 1.0 nested compound-array issue — analogous amplification in a different AMQP version and parser."

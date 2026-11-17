@@ -1,0 +1,117 @@
+hypothesis:
+  description: |
+    gRPC defines a keepalive protocol on top of HTTP/2 (gRPC documentation:
+    keepalive.md; grpc/grpc-go#1911). The gRPC keepalive implementation
+    sends HTTP/2 PING frames (RFC 9113 §6.7) to detect dead connections.
+    When a gRPC server receives a PING frame, it MUST respond with a PING
+    ACK (identical opaque data, ACK flag set) per the HTTP/2 specification.
+
+    gRPC-Go servers apply a PING_INTERVAL_MIN_TIME policy (default 5 minutes):
+    if a client sends PINGs more frequently than this interval, the server
+    sends a GOAWAY and closes the connection. This is the primary
+    protection against PING floods.
+
+    The partial-bypass hypothesis: the PING_INTERVAL_MIN_TIME check is
+    applied per-connection and uses wall-clock time. An attacker can:
+    1. Open C connections simultaneously.
+    2. Send exactly one PING per PING_INTERVAL_MIN_TIME per connection,
+       spacing pings to stay just above the threshold.
+    3. Scale C to maximise aggregate PING rate without triggering GOAWAY
+       on any individual connection.
+
+    Each PING forces the server to:
+    - Read and validate the 8-byte opaque payload.
+    - Write a PING ACK frame.
+    - If the PING is a keepalive-request PING (not user PING), update the
+      keepalive timer.
+
+    With C = 10,000 connections each sending one PING per 5 minutes, the
+    server processes 33 PINGs/second aggregate with no connection closed.
+    The CPU cost of I/O multiplexing across 10,000 idle-but-pinging
+    connections may be significant even at this sub-threshold rate.
+
+    Assumptions:
+    - A1: gRPC-Go's PING_INTERVAL_MIN_TIME check is per-connection with
+          no cross-connection aggregate rate limit.
+    - A2: The server-side PING ACK write path is non-trivial relative to
+          the cost of sending the PING from the client.
+    - A3: Maintaining 10,000 open gRPC connections consumes meaningful
+          per-connection state (goroutines, file descriptors) independently
+          of the PING rate.
+    - A4: The aggregate PING processing cost across many connections is
+          additive and can saturate a server CPU core.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/grpc/grpc-go
+  version: "v1.63.2"
+  protocol: gRPC
+  entry_point: "TCP port 50051, gRPC (HTTP/2 cleartext or TLS)"
+  docker_image: "golang:1.22-alpine"
+  server_config: |
+    # grpc-go server configured with default keepalive enforcement policy:
+    # grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+    #   MinTime: 5 * time.Minute,  // default
+    #   PermitWithoutStream: false,
+    # })
+    # grpc.KeepaliveParams(keepalive.ServerParameters{
+    #   MaxConnectionAge: 0,       // no max age
+    #   MaxConnectionIdle: 0,      // no idle timeout
+    # })
+    # Test service: simple unary RPC that returns immediately.
+
+assumptions:
+  - id: A1
+    description: "gRPC-Go v1.63.2 enforces PING_INTERVAL_MIN_TIME per connection; there is no cross-connection aggregate PING rate limit."
+    necessity: required
+
+  - id: A2
+    description: "The server-side PING ACK write (syscall + kernel buffer copy) is measurably more expensive than the client PING send over a loopback connection."
+    necessity: required
+
+  - id: A3
+    description: "Each open gRPC connection consumes at least one goroutine and one file descriptor; 10,000 connections impose measurable per-connection overhead independently of PING processing."
+    necessity: required
+
+  - id: A4
+    description: "The aggregate PING processing cost (read + validate + ACK write) across many connections is proportional to connection count and can saturate a server CPU."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens C connections to the gRPC-Go server (C = 1,000–10,000) with valid TLS negotiation."
+  - step: 2
+    action: "Each connection sends one HTTP/2 PING frame every PING_INTERVAL_MIN_TIME seconds, keeping each individual connection below the per-connection PING threshold."
+  - step: 3
+    action: "Measure server-side goroutine count, file descriptor usage, and CPU utilisation as C increases."
+  - step: 4
+    action: "Determine the per-connection CPU overhead of the idle-but-pinging state and whether the aggregate across C connections saturates the server."
+  - step: 5
+    action: "Compare to a baseline of C connections with no PINGs to separate PING processing cost from connection maintenance cost."
+
+rfc_sections:
+  - rfc: RFC 9113
+    section: "6.7"
+    dos_relevance: |
+      PING frames with the ACK flag unset require the recipient to send a
+      PING frame with the ACK flag set and the identical opaque payload.
+      RFC 9113 imposes no rate limit on PING frames. gRPC adds a per-
+      connection MinTime enforcement, but no cross-connection aggregate
+      limit. The asymmetry between PING (small, cheap to send) and PING ACK
+      (requires a write syscall plus connection state lookup) enables
+      amplification when scaled across many connections.
+
+  - rfc: "gRPC Keepalive documentation (grpc.io/docs/guides/keepalive)"
+    section: "PING_INTERVAL_MIN_TIME (MinTime)"
+    dos_relevance: |
+      The gRPC keepalive enforcement policy throttles PINGs per connection.
+      No aggregate server-wide PING rate limit is defined. An attacker
+      operating below the per-connection threshold across many connections
+      bypasses the enforcement policy while still generating measurable
+      aggregate CPU and I/O load.
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+    relevance: "HTTP/2 Rapid Reset — same HTTP/2 layer; different frame type (RST_STREAM vs PING)."

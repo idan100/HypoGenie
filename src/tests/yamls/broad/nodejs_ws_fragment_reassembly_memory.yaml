@@ -1,0 +1,115 @@
+hypothesis:
+  description: |
+    RFC 6455 §5.4 defines WebSocket message fragmentation. A message
+    can be split into an initial frame (FIN=0) followed by one or more
+    CONTINUATION frames, with the final frame setting FIN=1. The receiver
+    must reassemble the fragments into a complete message before dispatching
+    the 'message' event.
+
+    The ws library for Node.js (the most widely used WebSocket library,
+    ~100M downloads/week) performs fragment reassembly by concatenating
+    incoming frame payloads into a growing buffer. The maxPayload option
+    (default: 100 MB in ws 8.x) limits the total assembled message size
+    but does NOT limit the total memory allocated during reassembly across
+    concurrent connections.
+
+    The suspected vulnerability: an attacker opens many concurrent WebSocket
+    connections to a Node.js server using ws. On each connection, the
+    attacker sends a large number of small-payload CONTINUATION frames
+    (FIN=0) without ever sending a FIN=1 frame. ws accumulates each frame's
+    payload in an internal _fragments array. For each connection, the
+    _fragments array grows indefinitely (bounded only by maxPayload) and the
+    total memory across all connections is bounded by maxPayload × connections.
+
+    With maxPayload=100MB and 100 connections, the theoretical worst-case
+    memory is 10 GB. At smaller scales (e.g., 50 connections × 20 MB of
+    fragments each), memory pressure is enough to trigger Node.js heap OOM
+    or trigger the V8 garbage collector so aggressively that the event loop
+    stalls and legitimate WebSocket messages stop being processed.
+
+    Assumptions:
+    - A1: ws 8.x accumulates WebSocket fragment payloads in an internal
+          array and does not impose a per-connection partial-message timeout.
+    - A2: The maxPayload limit bounds per-connection fragment accumulation
+          but the aggregate across many connections is maxPayload × N.
+    - A3: Accumulating large fragments across many connections can exhaust
+          Node.js heap memory before maxPayload is reached on any single
+          connection.
+    - A4: No server-side ws option enforces a maximum number of concurrent
+          connections in partial-message state.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/websockets/ws
+  version: "8.16.0"
+  protocol: TCP
+  entry_point: "TCP port 8080, WebSocket (ws:// upgrade from HTTP/1.1)"
+  docker_image: "node:20-alpine"
+  server_config: |
+    # Dockerfile-equivalent: install ws@8.16.0 and run this server
+    # package.json: { "dependencies": { "ws": "8.16.0" } }
+    # server.js:
+    # const WebSocket = require('ws');
+    # const wss = new WebSocket.Server({
+    #   port: 8080,
+    #   maxPayload: 100 * 1024 * 1024,  // 100 MB per RFC default
+    #   perMessageDeflate: false
+    # });
+    # wss.on('connection', ws => {
+    #   ws.on('message', msg => {});   // silent handler
+    # });
+
+assumptions:
+  - id: A1
+    description: "ws 8.16.0 stores pending fragment payloads in a _fragments array per connection, with no per-connection partial-message timeout."
+    necessity: required
+
+  - id: A2
+    description: "The maxPayload option limits per-connection total fragment accumulation; the aggregate across N connections is N × maxPayload."
+    necessity: required
+
+  - id: A3
+    description: "Accumulating large fragment arrays across many concurrent connections exhausts Node.js V8 heap memory faster than GC can reclaim it."
+    necessity: required
+
+  - id: A4
+    description: "No ws option independently limits the number of connections that can simultaneously be in partial-message (fragmented, FIN=0) state."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens N concurrent WebSocket connections to the Node.js ws server (N = 50–200)."
+  - step: 2
+    action: "On each connection, attacker sends a WebSocket text frame with FIN=0 (initial fragment) followed by many CONTINUATION frames with FIN=0 and payloads of 1 MB each."
+  - step: 3
+    action: "ws accumulates each frame payload in _fragments without dispatching a 'message' event (since FIN=1 is never received)."
+  - step: 4
+    action: "Measure Node.js heap memory (from process.memoryUsage()) and event loop utilisation as fragment accumulation grows."
+  - step: 5
+    action: "Determine whether the aggregate fragment memory causes V8 GC pressure or heap OOM that disrupts message delivery for legitimate WebSocket clients."
+
+rfc_sections:
+  - rfc: RFC 6455
+    section: "5.4"
+    dos_relevance: |
+      WebSocket message fragmentation allows the receiver to handle messages
+      whose size is unknown when transmission begins. The receiver must
+      accumulate all fragments before processing the message. RFC 6455 does
+      not mandate a maximum fragment count, a maximum partial-message
+      reassembly time, or a maximum number of concurrent connections in
+      partial-message state. These resource bounds are left entirely to
+      implementations.
+
+  - rfc: RFC 6455
+    section: "10.4"
+    dos_relevance: |
+      RFC 6455 §10.4 notes that implementations should consider limiting
+      the message size to protect against large messages. The maxPayload
+      option in ws addresses this for single connections, but the aggregate
+      memory from many concurrent partial messages is not addressed.
+
+related_work:
+  - type: cve
+    id: CVE-2016-10518
+    relevance: "ws library DoS via large fragmented message — same ws target, single-connection variant of this multi-connection hypothesis."

@@ -1,0 +1,135 @@
+hypothesis:
+  description: |
+    RFC 7541 (HPACK: Header Compression for HTTP/2) §6.3 defines dynamic
+    table size updates. A compressor may change the maximum dynamic table
+    size by inserting a special "header block" entry (type 001xxxxx) at the
+    start of a header block. The decompressor MUST process this update,
+    which requires resizing the dynamic table: entries are evicted from the
+    table until it is within the new size limit.
+
+    Envoy Proxy 1.29.x uses its own HPACK implementation (nghttp2 or
+    codec_impl.cc). When a client sends a HEADERS frame whose header block
+    starts with a dynamic table size update instruction (signalling a size
+    change from, say, 65536 to 0, then 65536, then 0, …), Envoy must:
+    1. Resize the HPACK dynamic table (evicting entries or re-allocating).
+    2. Apply any subsequent HPACK instructions in the same header block.
+
+    The suspected vulnerability: by alternating dynamic table size updates
+    between 0 and the maximum value (65536) in every HEADERS frame, an
+    attacker forces Envoy to repeatedly:
+    - Evict all entries when size drops to 0.
+    - Re-allocate the dynamic table when size increases to 65536.
+    - Re-index any headers sent after the update.
+
+    This is distinct from HPACK bomb attacks (inflating a small input to
+    large headers) because it targets the table management overhead rather
+    than the decompression amplification ratio. Each size-change cycle
+    causes memory allocator traffic (alloc/free) on the HPACK internal
+    data structure proportional to the number of previously indexed headers.
+
+    With many concurrent HTTP/2 connections each sending rapid HEADERS with
+    alternating table-size updates, the aggregate HPACK table churn can
+    saturate Envoy worker thread CPU.
+
+    Assumptions:
+    - A1: Envoy's HPACK decoder processes dynamic table size update
+          instructions synchronously on the connection read path.
+    - A2: Alternating size updates (0 ↔ 65536) trigger meaningful
+          allocator activity per HEADERS frame in Envoy's HPACK implementation.
+    - A3: Envoy does not rate-limit HEADERS frames with dynamic table
+          size updates.
+    - A4: Many concurrent connections each sending alternating-size HEADERS
+          can generate aggregate HPACK churn sufficient to saturate a worker.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/envoyproxy/envoy
+  version: "v1.29.4"
+  protocol: HTTP/2
+  entry_point: "TCP port 10000, HTTP/2 cleartext (h2c) or TLS ALPN h2"
+  docker_image: "envoyproxy/envoy:v1.29.4"
+  server_config: |
+    static_resources:
+      listeners:
+      - name: listener_0
+        address:
+          socket_address: { address: 0.0.0.0, port_value: 10000 }
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              codec_type: HTTP2
+              stat_prefix: ingress_http
+              http2_protocol_options:
+                initial_stream_window_size: 65536
+                initial_connection_window_size: 1048576
+              route_config:
+                name: local_route
+                virtual_hosts:
+                - name: local_service
+                  domains: ["*"]
+                  routes:
+                  - match: { prefix: "/" }
+                    direct_response:
+                      status: 200
+                      body:
+                        inline_string: "ok"
+
+assumptions:
+  - id: A1
+    description: "Envoy 1.29 processes HPACK dynamic table size update instructions on the connection read thread before dispatching the request."
+    necessity: required
+
+  - id: A2
+    description: "Alternating the HPACK dynamic table size between 0 and 65536 on successive HEADERS frames triggers non-trivial allocator activity in Envoy's HPACK implementation."
+    necessity: required
+
+  - id: A3
+    description: "Envoy does not rate-limit HEADERS frames whose header blocks begin with dynamic table size update instructions."
+    necessity: required
+
+  - id: A4
+    description: "The aggregate table-resize work across many concurrent connections can saturate an Envoy worker thread CPU without reaching any stream-count or frame-count limit."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens N HTTP/2 connections to Envoy (N = 50–200) with valid TLS and ALPN h2."
+  - step: 2
+    action: "On each connection, attacker sends a stream of HEADERS frames where the header block begins with alternating HPACK dynamic table size updates: 0 then 65536, encoded as two 1-byte update instructions."
+  - step: 3
+    action: "Envoy's HPACK decoder resizes the dynamic table on every frame, evicting all entries on the 0-update and re-allocating on the 65536-update."
+  - step: 4
+    action: "Measure Envoy worker thread CPU utilisation under this HPACK churn versus a baseline of equivalent HEADERS with no size updates."
+  - step: 5
+    action: "Determine whether HPACK table resize churn across many connections is a viable CPU exhaustion vector."
+
+rfc_sections:
+  - rfc: RFC 7541
+    section: "6.3"
+    dos_relevance: |
+      Dynamic table size updates are encoded at the start of a header block
+      and MUST be processed by the decoder. Sending a size update that reduces
+      the table to zero evicts all current entries; a subsequent update that
+      increases the size re-enables indexing. RFC 7541 imposes no limit on
+      how often size updates may be sent, creating a potential for repeated
+      table management work per HEADERS frame.
+
+  - rfc: RFC 7541
+    section: "4.3"
+    dos_relevance: |
+      When the maximum table size is reduced, entries are evicted from the
+      dynamic table. When increased, new entries can be added. Each eviction-
+      or-addition cycle involves pointer manipulation and memory accounting.
+      Rapid alternation between 0 and maximum maximises the number of eviction
+      cycles per HEADERS frame.
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+    relevance: "HTTP/2 Rapid Reset — same Envoy target; different frame type (RST_STREAM vs HEADERS)."
+  - type: paper
+    id: "HPACK Bomb attacks"
+    url: https://portswigger.net/research/abusing-http-request-smuggling-to-perform-web-cache-deception

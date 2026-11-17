@@ -1,0 +1,116 @@
+hypothesis:
+  description: |
+    RFC 9112 §9.3 (HTTP/1.1 request pipelining) allows a client to send
+    multiple requests on a persistent connection without waiting for
+    individual responses. Varnish Cache 7.4.x fully implements HTTP/1.1
+    pipelining: it reads requests sequentially and queues responses.
+
+    The suspected vulnerability combines two RFC 9112 features:
+    1. Pipelining (§9.3): sending many requests without reading responses.
+    2. Persistent connections (§9.3): keeping the connection alive.
+
+    When a client sends a burst of pipelined GET requests and then reads
+    the response stream very slowly (or not at all), Varnish:
+    1. Fetches each requested object from the backend.
+    2. Accumulates response bodies in per-request workspace memory.
+    3. Holds the client connection open (up to timeout.idle).
+    4. Keeps the backend connection checked out until the client reads
+       the response (or the backend connection times out).
+
+    If Varnish's workspace_client and workspace_backend pools are not
+    bounded per-connection and the backend pool size is finite, an attacker
+    with a slow-reading pipelined connection can exhaust:
+    - Workspace memory (each pending response body).
+    - Backend connections (checked out waiting for the slow client to drain).
+
+    This degrades backend availability for legitimate clients: the backend
+    connection pool appears exhausted even though the objects are already
+    fetched.
+
+    Assumptions:
+    - A1: Varnish 7.4 supports HTTP/1.1 pipelining and queues multiple
+          in-flight requests per connection.
+    - A2: Each pipelined request causes Varnish to fetch from and hold a
+          backend connection until the response is fully delivered.
+    - A3: Varnish workspace memory for buffered responses is not bounded
+          per-client connection beyond workspace_client size.
+    - A4: Backend connection pool exhaustion is observable as timeout errors
+          for unrelated legitimate clients.
+
+  dos_class: connection
+
+target:
+  repo: https://github.com/varnishcache/varnish-cache
+  version: "7.4.3"
+  protocol: TCP
+  entry_point: "TCP port 80, HTTP/1.1"
+  docker_image: "varnish:7.4"
+  server_config: |
+    vcl 4.1;
+    backend default {
+      .host = "127.0.0.1";
+      .port = "8080";
+      .max_connections = 10;
+      .connect_timeout = 2s;
+      .first_byte_timeout = 10s;
+      .between_bytes_timeout = 5s;
+    }
+    sub vcl_recv {
+      return (pass);
+    }
+
+assumptions:
+  - id: A1
+    description: "Varnish 7.4 accepts pipelined HTTP/1.1 requests and processes them in order on a single connection."
+    necessity: required
+
+  - id: A2
+    description: "Each pipelined GET request causes Varnish to open (or reuse) a backend connection and buffer the fetched response body before the previous response is fully delivered to the client."
+    necessity: required
+
+  - id: A3
+    description: "The number of concurrently held backend connections per client connection is not independently bounded below the global backend max_connections."
+    necessity: required
+
+  - id: A4
+    description: "Backend connection exhaustion from slow pipelined clients causes connection failures or timeouts for unrelated clients within the same backend pool."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens a persistent HTTP/1.1 connection to Varnish and sends 10 pipelined GET requests targeting 100 KB backend objects."
+  - step: 2
+    action: "Varnish fetches each object from the backend, consuming up to 10 backend connections simultaneously."
+  - step: 3
+    action: "Attacker reads responses at a rate of 1 byte per second, keeping the connection alive but preventing response delivery."
+  - step: 4
+    action: "Backend connections remain checked out in Varnish while awaiting the slow drain; the backend pool (max_connections=10) is fully occupied."
+  - step: 5
+    action: "Legitimate clients attempting to reach the same backend receive connection-timeout errors because the pool is exhausted."
+  - step: 6
+    action: "Measure backend connection utilisation and legitimate client error rate as slow-drain pipelined connections occupy the pool."
+
+rfc_sections:
+  - rfc: RFC 9112
+    section: "9.3"
+    dos_relevance: |
+      HTTP/1.1 pipelining allows a client to send multiple requests without
+      waiting for responses. A server MUST process requests in the order
+      received and MUST send responses in the same order. This creates an
+      ordering dependency: a slow-reading client holding the first response
+      blocks delivery of all subsequent pipelined responses, keeping all
+      associated server resources (backend connections, response buffers)
+      tied to the stalled delivery.
+
+  - rfc: RFC 9112
+    section: "9.6"
+    dos_relevance: |
+      A server SHOULD limit the number of concurrent connections from a
+      single client. However, pipeline-based exhaustion uses a single
+      connection and relies on response backlog, not on connection count,
+      so a per-client connection limit does not mitigate it.
+
+related_work:
+  - type: cve
+    id: CVE-2015-8143
+    relevance: "Varnish ESI processing DoS — different code path, same Varnish target."

@@ -1,0 +1,113 @@
+hypothesis:
+  description: |
+    RFC 7858 (DNS over TLS) defines a 2-byte length-prefixed framing for
+    DNS messages sent over TLS connections (§3.3). The DNS message length
+    field is a uint16 in network byte order, allowing a declared message
+    size up to 65,535 bytes. The resolver MUST read exactly that many bytes
+    before processing the query.
+
+    Unbound 1.19.x implements DNS-over-TLS using a per-connection read
+    buffer. When the 2-byte length prefix is received, Unbound pre-allocates
+    a buffer of the declared size to accumulate the remaining bytes. If the
+    client then sends data slowly (or not at all), Unbound holds the
+    pre-allocated buffer and the associated TLS session state open for the
+    duration of the configured tcp-idle-timeout.
+
+    The suspected vulnerability: an attacker opens many concurrent DoT
+    connections, sends the 2-byte length prefix announcing a 65,535-byte
+    message, and then stops sending. Each connection:
+    1. Forces Unbound to pre-allocate a ~64 KB receive buffer.
+    2. Keeps the TLS session and associated connection metadata alive.
+    3. Consumes a file descriptor until tcp-idle-timeout expires.
+
+    With enough concurrent slow connections, the aggregate pre-allocated
+    buffer memory and open file descriptors can exceed Unbound's limits,
+    degrading or blocking service for legitimate DNS clients.
+
+    Assumptions:
+    - A1: Unbound pre-allocates the declared message buffer on receipt
+          of the 2-byte length prefix before waiting for the message body.
+    - A2: The tcp-idle-timeout (default 120 s) keeps partially received
+          connections open long enough for many simultaneous attacks to
+          accumulate.
+    - A3: The number of concurrently open DoT connections is bounded only
+          by the system file descriptor limit, not by an Unbound-specific
+          connection cap.
+    - A4: Aggregate pre-allocated buffer memory across slow connections
+          is sufficient to exhaust available memory before they time out.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/NLnetLabs/unbound
+  version: "1.19.3"
+  protocol: DNS-over-TLS
+  entry_point: "TCP port 853, TLS, DNS-over-TLS (RFC 7858)"
+  docker_image: "mvance/unbound:1.19.3"
+  server_config: |
+    server:
+      verbosity: 1
+      interface: 0.0.0.0@853
+      tls-service-key: /opt/unbound/etc/unbound/unbound_server.key
+      tls-service-pem: /opt/unbound/etc/unbound/unbound_server.pem
+      tls-port: 853
+      do-tcp: yes
+      tcp-idle-timeout: 120
+      num-threads: 1
+      so-reuseport: no
+      max-udp-size: 4096
+
+assumptions:
+  - id: A1
+    description: "Unbound pre-allocates a receive buffer of the declared DNS message size upon reading the 2-byte length prefix over a DoT connection."
+    necessity: required
+
+  - id: A2
+    description: "Connections with partially received messages are retained for up to tcp-idle-timeout seconds (default 120 s) before being closed."
+    necessity: required
+
+  - id: A3
+    description: "The number of simultaneously open DoT connections is not limited by Unbound independently of the OS file descriptor limit."
+    necessity: required
+
+  - id: A4
+    description: "Many simultaneous slow connections each pre-allocating 64 KB buffers and holding TLS state can collectively exhaust available memory before tcp-idle-timeout expires."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens N concurrent TLS connections to Unbound port 853, completing the TLS handshake on each."
+  - step: 2
+    action: "On each connection, attacker sends only the 2-byte length prefix 0xFF 0xFF (declaring a 65,535-byte DNS message) and then stops sending."
+  - step: 3
+    action: "Unbound pre-allocates a ~64 KB receive buffer for each connection and waits for the message body for up to tcp-idle-timeout seconds."
+  - step: 4
+    action: "Attacker opens additional connections at a rate that outpaces the timeout-and-close cycle."
+  - step: 5
+    action: "Measure Unbound memory usage and legitimate query latency as slow connections accumulate."
+  - step: 6
+    action: "Determine whether the aggregate pre-allocated buffers and TLS session state exhaust memory faster than connections are reaped."
+
+rfc_sections:
+  - rfc: RFC 7858
+    section: "3.3"
+    dos_relevance: |
+      DNS messages over TLS MUST be preceded by a 2-byte message length
+      field (network byte order). The receiver must accumulate the declared
+      number of bytes before processing the DNS message. RFC 7858 does not
+      specify a timeout for partial messages or a limit on concurrent
+      partially received connections, leaving implementations to choose
+      their own resource protection strategy.
+
+  - rfc: RFC 7858
+    section: "3.4"
+    dos_relevance: |
+      TCP/TLS connections for DoT should be reused across multiple DNS
+      queries. The long-lived connection model increases the value of each
+      connection to legitimate clients but also increases the resource cost
+      of holding many slow or idle connections open.
+
+related_work:
+  - type: cve
+    id: CVE-2023-50387
+    relevance: "Unbound KeyTrap — CPU exhaustion via crafted DNS responses; different mechanism but same Unbound target."

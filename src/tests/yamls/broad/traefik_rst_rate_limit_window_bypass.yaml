@@ -1,0 +1,139 @@
+hypothesis:
+  description: |
+    CVE-2023-44487 (HTTP/2 Rapid Reset) demonstrated that sending
+    RST_STREAM immediately after HEADERS — without waiting for a response
+    — allows a client to open and cancel an unlimited number of streams
+    while keeping only one stream active, bypassing MAX_CONCURRENT_STREAMS.
+
+    Traefik v2.10+ and v3.x patched this by adding a RST_STREAM rate
+    limiter: connections that exceed a configured threshold of RST_STREAM
+    frames per time window are penalised or terminated. The default
+    threshold is typically around 1000 RST_STREAM frames per second.
+
+    The partial-fix hypothesis: the RST_STREAM rate limiter uses a
+    sliding or tumbling window counter. If the window is tumbling (counter
+    resets at the boundary), an attacker can:
+    1. Send exactly (threshold - 1) RST_STREAMs in window W.
+    2. Pause until window W+1 starts.
+    3. Send exactly (threshold - 1) RST_STREAMs in window W+1.
+
+    Each window cycle the attacker performs 2 × (threshold - 1) RST_STREAM
+    operations across the boundary — always staying below the threshold —
+    while Traefik handles the full Rapid Reset processing cost for every
+    stream. If Traefik creates and immediately cancels a handler goroutine
+    or upstream connection attempt for each stream before the RST is
+    processed, the attacker achieves near-CVE-2023-44487 impact at a
+    rate just below the detection threshold.
+
+    Additionally, using multiple connections each at threshold - 1 per
+    second multiplies the total reset rate while each individual connection
+    appears legitimate.
+
+    Assumptions:
+    - A1: Traefik's RST_STREAM rate limiter uses a tumbling or coarsely
+          sliding window that can be gamed by pacing resets to the window
+          boundary.
+    - A2: Traefik allocates a handler goroutine or upstream dial for each
+          incoming request stream before the RST_STREAM is processed.
+    - A3: The goroutine allocation and cancellation cost per reset is
+          non-trivial relative to the RST_STREAM send cost.
+    - A4: Multiple connections each operating at threshold - 1 per second
+          multiply the total work without triggering per-connection limits.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/traefik/traefik
+  version: "v2.10.7"
+  protocol: HTTP/2
+  entry_point: "TCP port 443, TLS ALPN h2"
+  docker_image: "traefik:v2.10.7"
+  server_config: |
+    # traefik.yml
+    entryPoints:
+      websecure:
+        address: ":443"
+        http2:
+          maxConcurrentStreams: 250
+        http:
+          tls:
+            options: default
+    providers:
+      file:
+        filename: /etc/traefik/dynamic.yml
+    # dynamic.yml
+    # http:
+    #   routers:
+    #     test:
+    #       rule: "PathPrefix(`/`)"
+    #       service: backend
+    #   services:
+    #     backend:
+    #       loadBalancer:
+    #         servers:
+    #           - url: "http://127.0.0.1:8080"
+    tls:
+      options:
+        default:
+          minVersion: VersionTLS12
+
+assumptions:
+  - id: A1
+    description: "Traefik v2.10.7's RST_STREAM rate limiter uses a tumbling or low-resolution time window that resets at a fixed boundary, allowing burst-pause-burst patterns."
+    necessity: required
+
+  - id: A2
+    description: "Traefik allocates at least a lightweight handler struct or goroutine for each incoming request stream before reading or discarding an immediately following RST_STREAM."
+    necessity: required
+
+  - id: A3
+    description: "The per-reset goroutine allocation and cancellation overhead is measurably higher than the cost of sending the RST_STREAM from the client."
+    necessity: required
+
+  - id: A4
+    description: "Using C concurrent connections each sending threshold-1 RST_STREAMs per second increases total reset processing cost by a factor of C without triggering per-connection rate limits."
+    necessity: required
+
+  - id: A5
+    description: "The residual CPU impact below the detection threshold is sufficient to degrade legitimate request throughput on a constrained server."
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Determine empirically whether Traefik's RST_STREAM rate limiter uses a tumbling window by measuring when a connection is penalised relative to the first RST_STREAM sent."
+  - step: 2
+    action: "Establish the effective threshold T (RST_STREAMs per window period W) by binary search on a test Traefik instance."
+  - step: 3
+    action: "Open C connections (C = 10–50) and on each send exactly T-1 RST_STREAM frames per window, pacing to the window boundary."
+  - step: 4
+    action: "Measure Traefik CPU utilisation and goroutine count under this paced pattern versus a baseline of normal requests."
+  - step: 5
+    action: "Determine whether C × (T-1) RST_STREAMs per second causes CPU utilisation comparable to the original Rapid Reset vulnerability."
+
+rfc_sections:
+  - rfc: RFC 9113
+    section: "6.4"
+    dos_relevance: |
+      RST_STREAM allows a client to cancel any stream immediately. RFC 9113
+      imposes no rate limit on RST_STREAM. The Rapid Reset pattern exploits
+      the asymmetry between the cost of sending RST_STREAM (negligible) and
+      the server-side cost of creating and immediately cancelling a request
+      handler. A rate limiter with a coarse window still allows significant
+      server-side work at rates below the threshold.
+
+  - rfc: RFC 9113
+    section: "5.1"
+    dos_relevance: |
+      HTTP/2 stream states define the lifecycle from idle to closed. A
+      server processes a HEADERS frame to advance a stream from idle to
+      open (and possibly to half-closed remote). If RST_STREAM arrives
+      before the handler completes, the server must still transition the
+      stream and release its resources. This transition has non-zero cost
+      even if the stream lifetime is very short.
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+    relevance: "The original HTTP/2 Rapid Reset vulnerability that this test targets as a partial-fix variant."
+  - type: advisory
+    url: https://github.com/traefik/traefik/security/advisories/GHSA-vgvp-33f7-96h7

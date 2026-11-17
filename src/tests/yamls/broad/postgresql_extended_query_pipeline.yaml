@@ -1,0 +1,105 @@
+hypothesis:
+  description: |
+    PostgreSQL 14 introduced pipeline mode (libpq PQpipelineStatus API and
+    the corresponding wire-protocol semantics). In pipeline mode a client
+    sends many Frontend messages — Parse, Bind, Execute, Describe, Sync —
+    without waiting for Backend responses. The server processes them in
+    order, buffering responses until a Sync message is received.
+
+    PostgreSQL's wire protocol (documented in the PostgreSQL Server
+    Programming Interface) has no mandatory per-connection message backlog
+    limit. The server allocates a PortalData structure for each pending
+    Execute command and a PreparedStatement for each Parse. Under pipeline
+    mode a client can enqueue thousands of Bind/Execute sequences before
+    sending a single Sync.
+
+    The suspected vulnerability: an attacker opens one or more connections
+    in pipeline mode and sends a large number of Parse/Bind/Execute triples
+    without reading any results. The server buffers:
+    - PreparedStatement objects in the memory context of the session.
+    - Portal (cursor) objects for each queued Execute.
+    - Output tuples accumulated in the pipeline response buffer.
+
+    The session's memory context is not bounded by work_mem (which applies
+    to individual sort/hash operations) or by any pipeline-specific cap.
+    Enough pipelined commands without a Sync can exhaust session memory
+    and, through the shared buffer pool's memory pressure, degrade other
+    sessions.
+
+    Assumptions:
+    - A1: PostgreSQL 16 supports pipeline mode and allows multiple
+          Bind/Execute messages before a Sync.
+    - A2: Each Bind/Execute allocates Portal memory in the session memory
+          context before the Sync is processed.
+    - A3: There is no per-connection cap on the number of pending pipeline
+          messages before a Sync is required.
+    - A4: Session memory growth under pipeline accumulation is not bounded
+          by work_mem or statement_mem and can affect shared server memory.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/postgres/postgres
+  version: "16.2"
+  protocol: TCP
+  entry_point: "TCP port 5432, PostgreSQL wire protocol v3"
+  docker_image: "postgres:16.2"
+  server_config: |
+    max_connections = 100
+    shared_buffers = 128MB
+    work_mem = 4MB
+    # No pipeline-specific limits exist in PostgreSQL 16
+
+assumptions:
+  - id: A1
+    description: "PostgreSQL 16 accepts pipelined Parse/Bind/Execute messages and queues them before a Sync is processed."
+    necessity: required
+
+  - id: A2
+    description: "Each queued Execute allocates a Portal object in the session memory context, and each queued Parse allocates a PreparedStatement; these are retained until Sync flushes them."
+    necessity: required
+
+  - id: A3
+    description: "PostgreSQL does not enforce a maximum number of outstanding pipeline messages before requiring a Sync."
+    necessity: required
+
+  - id: A4
+    description: "Session memory growth from accumulated Portals is not bounded by work_mem and can consume shared server resources, degrading other connections."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker opens an authenticated connection to PostgreSQL and negotiates pipeline mode via the wire protocol."
+  - step: 2
+    action: "Attacker sends a large batch of Parse/Bind/Execute triples targeting a cheap query (e.g., SELECT pg_sleep(0)) without sending a Sync message."
+  - step: 3
+    action: "PostgreSQL allocates a Portal for each Execute and queues the response in the session memory context."
+  - step: 4
+    action: "Attacker opens additional connections and repeats, never reading responses or sending Sync messages."
+  - step: 5
+    action: "Measure total PostgreSQL memory usage (from pg_stat_activity) as pipelined pending work accumulates."
+  - step: 6
+    action: "Determine whether the memory growth is bounded and whether it affects the response time of unrelated sessions."
+
+rfc_sections:
+  - rfc: "PostgreSQL Frontend/Backend Protocol (PostgreSQL documentation §55)"
+    section: "55.2.4 Pipeline Mode"
+    dos_relevance: |
+      The PostgreSQL wire protocol allows clients to send multiple messages
+      before receiving a response (pipeline mode). The protocol defines no
+      maximum backlog depth. The server must buffer responses in order until
+      a Sync message is processed. The absence of a mandatory pipeline depth
+      limit creates a resource accumulation path proportional to the number
+      of messages sent before each Sync.
+
+  - rfc: "PostgreSQL documentation: Memory Architecture"
+    section: "Session memory context"
+    dos_relevance: |
+      Each session has a top-level memory context. PreparedStatements and
+      Portals are allocated within the session context and persist until
+      the corresponding Close or Sync message. No aggregate session memory
+      limit is enforced independently of work_mem or statement-level limits.
+
+related_work:
+  - type: writeup
+    url: https://www.postgresql.org/docs/16/protocol-flow.html#PROTOCOL-FLOW-PIPELINING

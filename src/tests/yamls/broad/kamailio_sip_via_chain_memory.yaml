@@ -1,0 +1,112 @@
+hypothesis:
+  description: |
+    RFC 3261 §16.6 (Step 8) requires a SIP proxy to append a Via header
+    field to every request it forwards. When a request arrives at Kamailio,
+    the existing Via header chain is preserved and a new Via is prepended.
+    On the response path, Kamailio uses the Via chain to route responses
+    back to the originating client.
+
+    SIP requests have no maximum Via header count defined in RFC 3261 or
+    its updates (RFC 3581, RFC 7118). Kamailio parses and stores every Via
+    header in the transaction memory context. Each Via header value
+    contains up to: a protocol identifier, a sent-by address:port, a branch
+    parameter (required, min ~32 chars), and optional parameters (rport,
+    received, maddr, ttl).
+
+    The suspected vulnerability: an attacker crafts SIP INVITE requests
+    with hundreds or thousands of pre-existing Via headers, each containing
+    a unique branch parameter. Kamailio processes these in the t_relay() /
+    record_route() path, storing the full Via chain in the SIP message
+    memory context. If no maximum Via chain length is enforced before
+    allocation, an attacker can cause disproportionate per-transaction
+    memory allocation relative to the network byte cost of the request.
+
+    Additionally, the Via parsing loop is linear in the number of Via
+    headers, so CPU cost scales with chain length. Under load, many
+    simultaneous requests with deep Via chains can exhaust shared
+    transaction memory (tm_shm_avail) and stall legitimate calls.
+
+    Assumptions:
+    - A1: Kamailio does not enforce a maximum Via header count per SIP
+          request before allocating transaction memory.
+    - A2: Each Via header is stored as a parsed structure in shared memory
+          (shm) within the transaction context.
+    - A3: Transaction memory (tm module shm_size) is shared across all
+          concurrent SIP transactions; exhausting it blocks new call setup.
+    - A4: The Via parsing loop in Kamailio is O(n) in the number of Via
+          headers with no early-exit cap.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/kamailio/kamailio
+  version: "5.7.6"
+  protocol: UDP
+  entry_point: "UDP port 5060, SIP v2.0 (RFC 3261)"
+  docker_image: "kamailio/kamailio:5.7.6-bullseye"
+  server_config: |
+    # kamailio.cfg
+    #!define WITH_MYSQL 0
+    listen=udp:0.0.0.0:5060
+    loadmodule "tm.so"
+    loadmodule "sl.so"
+    loadmodule "rr.so"
+    loadmodule "maxfwd.so"
+    modparam("tm", "shm_size", 32)
+    request_route {
+      if (!mf_process_maxfwd_header(10)) { sl_send_reply(483, "Too Many Hops"); exit; }
+      if (is_method("INVITE")) { t_relay(); }
+    }
+
+assumptions:
+  - id: A1
+    description: "Kamailio 5.7.6 does not cap the number of Via headers parsed per request before allocating transaction shared memory."
+    necessity: required
+
+  - id: A2
+    description: "Each Via header in the parsed SIP message is stored as a hdr_field_t node in shared memory (shm) for the lifetime of the transaction."
+    necessity: required
+
+  - id: A3
+    description: "The tm module's shared memory pool is shared across all active SIP transactions; exhausting it causes t_relay() to fail for unrelated calls."
+    necessity: required
+
+  - id: A4
+    description: "The maxfwd module's check only limits the Max-Forwards hop count, not the Via chain length, so deep Via chains bypass the hop guard."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker crafts SIP INVITE requests with 500 Via headers, each with a unique branch parameter and a fake sent-by address."
+  - step: 2
+    action: "Kamailio's SIP parser allocates one hdr_field_t per Via header in shared memory and stores the full chain in the transaction context."
+  - step: 3
+    action: "Attacker sends these crafted INVITEs at high rate (e.g., 100/s), each consuming several hundred KB of shared transaction memory."
+  - step: 4
+    action: "The tm shm pool depletes; Kamailio begins dropping or rejecting legitimate INVITE transactions for unrelated users."
+  - step: 5
+    action: "Measure tm shared memory consumption and legitimate call setup success rate as the Via chain flood continues."
+
+rfc_sections:
+  - rfc: RFC 3261
+    section: "16.6"
+    dos_relevance: |
+      A SIP proxy MUST append a Via header to every forwarded request and
+      MUST preserve all existing Via headers. RFC 3261 specifies no maximum
+      Via chain length. The mandatory preservation requirement means a proxy
+      cannot discard Via headers without breaking response routing, so the
+      full chain must be retained in transaction state.
+
+  - rfc: RFC 3261
+    section: "20.42"
+    dos_relevance: |
+      The Via header defines the transport parameters for each hop. The
+      branch parameter (required since RFC 3261) adds at least 32 bytes per
+      Via header. A chain of 500 Via headers with branch values represents
+      roughly 20–40 KB of header data that must be parsed and stored per
+      request.
+
+related_work:
+  - type: cve
+    id: CVE-2017-7508
+    relevance: "Kamailio SIP message parsing crash — different code path but same Via/header parsing subsystem."

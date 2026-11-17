@@ -1,0 +1,115 @@
+hypothesis:
+  description: |
+    RFC 6455 §5.5.2 defines the WebSocket Ping control frame. A WebSocket
+    endpoint MUST respond to each Ping with a corresponding Pong (RFC 6455
+    §5.5.3). nginx in WebSocket proxy mode (proxy_pass + upgrade headers)
+    transparently forwards both Ping and Pong frames between the client and
+    the upstream. The nginx worker that handles the WebSocket connection
+    processes each frame in its event loop.
+
+    The suspected vulnerability: an attacker can open a large number of
+    WebSocket connections through nginx and flood each with Ping frames.
+    nginx has no configurable rate limit for WebSocket control frames. Each
+    Ping read-and-forward occupies the worker's event loop slice. At high
+    enough rates, the aggregate CPU cost of processing and forwarding Ping
+    frames across many connections can saturate the nginx worker process.
+
+    Additionally, RFC 6455 §5.5.2 permits application data payloads in
+    Ping frames of up to 125 bytes. Sending the maximum payload on every
+    Ping increases per-frame processing cost and upstream write pressure.
+
+    This is distinct from a simple connection flood: the attacker uses
+    legitimate, fully established WebSocket connections, each consuming
+    low memory but high event-loop throughput for control-frame processing.
+
+    Assumptions:
+    - A1: nginx is configured as a WebSocket reverse proxy and forwards
+          control frames to an upstream endpoint.
+    - A2: nginx does not rate-limit WebSocket Ping frames per connection
+          or per worker.
+    - A3: The aggregate CPU cost of processing Ping frames across many
+          concurrent WebSocket connections is proportional to the number
+          of frames per second, without a backpressure mechanism.
+    - A4: The upstream endpoint responds to each Ping with a Pong,
+          creating a bidirectional frame flood that doubles worker I/O.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/nginx/nginx
+  version: "1.25.4"
+  protocol: TCP
+  entry_point: "TCP port 443, TLS, WebSocket upgrade on path /ws"
+  docker_image: "nginx:1.25.4"
+  server_config: |
+    events { worker_processes 1; worker_connections 1024; }
+    http {
+      map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+      }
+      server {
+        listen 443 ssl;
+        ssl_certificate     /etc/nginx/cert.pem;
+        ssl_certificate_key /etc/nginx/key.pem;
+        location /ws {
+          proxy_pass http://127.0.0.1:8080;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection $connection_upgrade;
+          proxy_read_timeout 3600s;
+        }
+      }
+    }
+
+assumptions:
+  - id: A1
+    description: "nginx is configured to proxy WebSocket connections and forwards RFC 6455 control frames to the upstream without filtering."
+    necessity: required
+
+  - id: A2
+    description: "No per-connection or per-worker rate limit exists for WebSocket Ping control frames in nginx 1.25.x."
+    necessity: required
+
+  - id: A3
+    description: "Each Ping frame causes at minimum one upstream write and one client read in the worker event loop, and this cost scales linearly with frame rate."
+    necessity: required
+
+  - id: A4
+    description: "The upstream echo server responds to each Ping with a Pong, so the total frame throughput the worker handles is twice the client send rate."
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Attacker establishes N concurrent WebSocket connections through nginx (N = 50–200 to stay within connection limits)."
+  - step: 2
+    action: "Each connection continuously sends WebSocket Ping frames with 125-byte payloads at the maximum rate the connection will accept."
+  - step: 3
+    action: "nginx forwards each Ping to the upstream echo server and returns each Pong to the client, doubling the frame throughput per worker."
+  - step: 4
+    action: "Measure the nginx worker CPU as frame rate increases, comparing to a baseline of idle WebSocket connections."
+  - step: 5
+    action: "Determine whether the aggregate Ping frame processing rate can saturate a single nginx worker CPU without triggering connection eviction."
+
+rfc_sections:
+  - rfc: RFC 6455
+    section: "5.5"
+    dos_relevance: |
+      Defines control frames (Ping, Pong, Close). Control frames may be
+      injected in the middle of a fragmented message and must be processed
+      immediately. The mandatory Pong response to every Ping (§5.5.3)
+      means a Ping flood generates symmetric bidirectional frame traffic,
+      amplifying the event-loop cost on the proxy.
+
+  - rfc: RFC 6455
+    section: "5.5.2"
+    dos_relevance: |
+      A Ping frame MAY include application data up to 125 bytes. The
+      recipient MUST send a Pong with the same application data as a
+      payload. Maximum-payload Pings increase per-frame processing cost
+      and the total byte volume forwarded by the proxy.
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+    relevance: "HTTP/2 Rapid Reset — analogous amplification via protocol-mandated responses, but at the WebSocket/TCP layer instead of HTTP/2 stream layer."
