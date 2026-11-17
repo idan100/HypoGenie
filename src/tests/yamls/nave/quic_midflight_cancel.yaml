@@ -1,0 +1,241 @@
+hypothesis:
+  description: |
+    RFC 9114 §4.1.1 defines HTTP/3 request cancellation and recommends
+    abruptly terminating any directions of a stream that remain open.
+    However, cancellation of an HTTP request does not necessarily undo
+    application processing that has already been initiated by a higher
+    software layer.
+
+    Caddy v2.11.4 accepts HTTP/3 requests through quic-go v0.59.1 and
+    forwards reverse-proxy requests using the incoming request context.
+    quic-go connects the HTTP request context to the QUIC stream context,
+    allowing stream cancellation to propagate into the HTTP handler.
+
+    This creates a potential resource-lifecycle issue worth investigating:
+    whether cancellation of an HTTP/3 request reliably terminates all
+    associated upstream work, or whether backend operations can remain
+    active after the corresponding QUIC stream has been closed.
+
+    The suspected mechanism is a timing gap between transport-level stream
+    completion, Caddy reverse-proxy cleanup, and termination of the
+    corresponding backend operation.
+
+    If QUIC stream capacity is replenished while previous application-level
+    operations remain active, a client might be able to initiate additional
+    requests without waiting for all resources associated with earlier
+    cancelled requests to be released.
+
+    Two possible resource-retention mechanisms must be distinguished:
+
+    - Proxy-side retention: Caddy goroutines, transport operations, or
+      upstream connections remain active after request cancellation.
+    - Backend-side retention: Caddy's proxy operation terminates, but the
+      backend continues processing requests that were already dispatched.
+
+    Either mechanism could potentially create resource pressure if the
+    retained operations accumulate faster than they complete.
+
+    Importantly, the previously identified backConnCloseCh code in
+    streaming.go belongs to handleUpgradeResponse(), which handles
+    upgraded connections. It is not evidence of blocked goroutines in
+    Caddy's ordinary reverse-proxy request path.
+
+    The hypothesis therefore requires independent validation of the
+    ordinary HTTP/3 reverse-proxy path.
+
+    Expected impact, if the mechanism is confirmed:
+    - Accumulation of backend requests or application-level operations.
+    - Increased backend worker and connection utilization.
+    - Increased latency for legitimate requests.
+    - Potential exhaustion of finite backend resources.
+    - Possible request timeouts and service unavailability.
+
+    No unbounded accumulation or denial-of-service impact is currently
+    established.
+
+    Assumptions:
+    - A1: HTTP/3 stream cancellation is propagated to the HTTP request
+          context by quic-go.
+    - A2: Caddy's ordinary reverse-proxy path propagates the incoming
+          request context to the upstream RoundTrip operation.
+    - A3: Some upstream operations may continue consuming resources after
+          the corresponding request context has been cancelled.
+    - A4: QUIC stream credit may be replenished before all associated
+          application-level cleanup has completed.
+    - A5: Repeated cancellations can cause retained application-level
+          resources to accumulate faster than they are released.
+    - A6: The affected deployment has a finite shared backend resource
+          whose exhaustion can affect legitimate requests.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/caddyserver/caddy
+  version: v2.11.4
+  protocol: QUIC
+  entry_point: "UDP port 443, HTTP/3 with ALPN h3, Caddy configured as a reverse proxy to an instrumented HTTP backend"
+  docker_image: "caddy:2.11.4"
+
+assumptions:
+  - id: A1
+    description: >
+      A valid HTTP/3 request cancellation causes quic-go v0.59.1 to
+      propagate cancellation to the corresponding HTTP request context.
+      The exact cancellation and stream-completion ordering must be verified.
+    necessity: required
+
+  - id: A2
+    description: >
+      Caddy's ordinary reverse-proxy implementation preserves the incoming
+      request context when invoking the upstream Transport.RoundTrip operation.
+      Cancellation therefore reaches the upstream transport.
+    necessity: required
+
+  - id: A3
+    description: >
+      Cancellation does not necessarily terminate all work already initiated
+      by the upstream backend. Backend requests or associated resources may
+      remain active after Caddy's RoundTrip operation has returned.
+      Alternatively, Caddy-side cleanup may itself be delayed.
+      At least one persistent resource-retention mechanism must be demonstrated.
+    necessity: required
+
+  - id: A4
+    description: >
+      quic-go can advertise additional incoming bidirectional stream credit
+      when transport-level stream state is completed, potentially before
+      application-level processing and cleanup have finished.
+      The actual ordering must be established from the pinned implementation.
+    necessity: required
+
+  - id: A5
+    description: >
+      Repeated request cancellations can create an increasing number of
+      simultaneously retained proxy-side or backend-side resources rather
+      than reaching a stable bounded level.
+    necessity: required
+
+  - id: A6
+    description: >
+      A realistic deployment contains a finite shared backend resource,
+      such as a worker pool, database connection pool, request concurrency
+      limit, or connection quota, whose exhaustion affects legitimate traffic.
+      Caddy's default upstream connection configuration must not be assumed
+      to provide such a limit.
+    necessity: required
+
+  - id: A7
+    description: >
+      The reverse-proxy endpoint is reachable by the requesting client,
+      and no effective application-layer protection prevents the relevant
+      cancellation pattern.
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: >
+      Establish an HTTP/3 reverse-proxy request through Caddy and verify
+      that the ordinary reverse-proxy handler dispatches the request to
+      the instrumented backend.
+
+  - step: 2
+    action: >
+      In an isolated test environment, cancel selected requests after
+      the backend confirms that processing has started. Use valid HTTP/3
+      cancellation semantics and record the relevant QUIC stream events.
+
+  - step: 3
+    action: >
+      Measure the ordering of QUIC stream completion, request-context
+      cancellation, Caddy RoundTrip completion, proxy goroutine termination,
+      upstream connection release, and backend handler completion.
+
+  - step: 4
+    action: >
+      Determine whether additional streams can be admitted while resources
+      associated with previously cancelled requests remain active.
+      Distinguish transport-level stream completion from application-level
+      resource cleanup.
+
+  - step: 5
+    action: >
+      Repeat bounded cancellation experiments in an isolated environment.
+      Measure whether active backend operations, proxy goroutines, or
+      retained connections increase over successive batches and whether
+      they return to baseline after cancellations stop.
+
+  - step: 6
+    action: >
+      Compare the results against matched complete-request controls and
+      cancellation-before-backend-dispatch controls. Determine whether
+      cancellation itself causes additional resource retention.
+
+  - step: 7
+    action: >
+      Evaluate whether any confirmed resource accumulation affects
+      independent legitimate requests through measurable latency
+      degradation, request failures, or exhaustion of a documented
+      backend resource limit.
+
+  - step: 8
+    action: >
+      Reject the hypothesis if upstream operations terminate promptly,
+      retained resources remain bounded, or the measured impact is
+      indistinguishable from the matched controls.
+
+rfc_sections:
+  - rfc: RFC 9114
+    section: "4.1.1"
+    dos_relevance: >
+      Defines HTTP/3 request cancellation and rejection. Implementations
+      SHOULD abruptly terminate directions of a stream that remain open.
+      The section also distinguishes requests that have already undergone
+      application processing from requests rejected before processing.
+      It provides the cancellation semantics relevant to investigating
+      whether previously dispatched backend work is properly cleaned up.
+
+  - rfc: RFC 9000
+    section: "4.6"
+    dos_relevance: >
+      Defines QUIC stream concurrency limits using cumulative stream
+      counts. Implementations control when additional stream credit is
+      advertised. The timing of stream-credit replenishment relative to
+      application-level cleanup is relevant to the suspected lifecycle
+      mismatch.
+
+  - rfc: RFC 9000
+    section: "19.11"
+    dos_relevance: >
+      Defines MAX_STREAMS frames. The advertised value represents the
+      cumulative number of streams that can be opened over a connection's
+      lifetime, not simply the number of simultaneously active streams.
+      This is relevant when analyzing whether completed transport streams
+      permit additional application requests while previous processing
+      remains active.
+
+  - rfc: RFC 9000
+    section: "2.4"
+    dos_relevance: >
+      Describes aborting and cancelling QUIC streams, including RESET_STREAM
+      and STOP_SENDING. These mechanisms are relevant to understanding
+      how cancellation affects the independent sending and receiving
+      directions of a bidirectional HTTP/3 request stream.
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+    relevance: >
+      HTTP/2 Rapid Reset. Related resource-exhaustion research involving
+      stream cancellation, but not evidence of the proposed HTTP/3 issue.
+
+  - type: cve
+    id: CVE-2024-27316
+    relevance: >
+      Related HTTP/2 denial-of-service research. Not evidence of the
+      proposed Caddy-specific cancellation-cleanup mechanism.
+
+  - type: paper
+    id: "MadeYouReset: Exploiting HTTP/2 Server-Side Resets for Large-Scale DoS"
+    relevance: >
+      Research on HTTP/2 reset behavior and resource-exhaustion implications.
+      Provides related background, but uses a different protocol mechanism.

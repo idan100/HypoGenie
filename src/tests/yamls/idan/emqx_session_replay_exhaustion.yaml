@@ -1,0 +1,132 @@
+hypothesis:
+  description: |
+    EMQX may be vulnerable to resource exhaustion through oversized
+    session-resumption replay batches. When an MQTT persistent session
+    reconnects, the in-memory session implementation retransmits all
+    unacknowledged QoS 1 and QoS 2 messages by converting the entire
+    inflight window into a reply list and appending newly dequeued messages.
+    The replay operation does not impose an explicit serialized-byte budget
+    or split the inflight replay into bounded batches.
+
+    The configured mqtt.max_inflight setting limits the number of messages,
+    not their aggregate byte size. Consequently, a session containing a
+    relatively small number of large unacknowledged messages can cause a
+    substantial burst of outbound data during reconnection.
+
+    On a TCP listener using the gen_tcp backend, a client that stops reading
+    can cause outbound socket congestion and keep the connection process
+    occupied while the replay is being sent. The security question is
+    whether an authenticated client can repeatedly trigger this behavior
+    across enough persistent sessions to exhaust shared broker resources
+    and degrade service for unrelated clients.
+
+    This hypothesis is specifically about broker-wide resource exhaustion,
+    not merely a slow or stalled connection belonging to the client that
+    initiated the replay.
+
+    Assumptions:
+    - A1: A client can establish an MQTT 5.0 persistent session and is
+          authorized to receive QoS 1 or QoS 2 messages.
+    - A2: The client can accumulate multiple unacknowledged deliveries in
+          its session inflight window without acknowledging them.
+    - A3: The session is handled by the in-memory session implementation,
+          and reconnecting invokes the session replay path.
+    - A4: The replay path emits the complete inflight window as a reply
+          batch without a serialized-byte budget or equivalent bounded
+          replay mechanism.
+    - A5: A slow-reading peer can cause sustained outbound TCP congestion
+          on the gen_tcp listener.
+    - A6: A normal client principal can create or control enough persistent
+          sessions or reconnect cycles to place meaningful pressure on
+          shared broker resources.
+    - A7: The resulting resource pressure affects unrelated clients or
+          node-wide service availability, rather than only the attacker's
+          own connection.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/emqx/emqx
+  version: 6.3.3
+  protocol: TCP
+  entry_point: "TCP port 1883, MQTT 5.0 CONNECT with persistent-session resumption"
+  docker_image: "emqx/emqx:6.3.3"
+  server_config: |
+    authentication = []
+
+    listeners.tcp.default {
+      tcp_backend = gen_tcp
+    }
+
+    mqtt {
+      max_inflight = 32
+      max_packet_size = 1MB
+    }
+
+assumptions:
+  - id: A1
+    description: "An ordinary authenticated MQTT client can establish a persistent session and subscribe to topics from which it is authorized to receive QoS 1 or QoS 2 messages."
+    necessity: required
+
+  - id: A2
+    description: "The client can cause its session to accumulate multiple unacknowledged QoS 1 or QoS 2 deliveries."
+    necessity: required
+
+  - id: A3
+    description: "The session is managed by emqx_session_mem and the reconnect path invokes its replay implementation."
+    necessity: required
+
+  - id: A4
+    description: "The replay implementation constructs a reply batch from the complete inflight table without imposing a serialized-byte budget."
+    necessity: required
+
+  - id: A5
+    description: "A slow-reading client can cause outbound send-queue congestion on a TCP listener using the gen_tcp backend."
+    necessity: required
+
+  - id: A6
+    description: "The attacker can create or control enough persistent sessions or reconnect cycles to accumulate resource pressure beyond an individual connection."
+    necessity: required
+
+  - id: A7
+    description: "The replay-induced resource pressure degrades unrelated clients or shared broker functionality."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "An authenticated test client establishes a persistent MQTT 5.0 session and subscribes to a controlled topic at QoS 1 or QoS 2."
+
+  - step: 2
+    action: "The session accumulates unacknowledged deliveries until its inflight window contains multiple messages with substantial payload sizes."
+
+  - step: 3
+    action: "The client disconnects without completing the outstanding deliveries, preserving the session state for subsequent reconnection."
+
+  - step: 4
+    action: "When the client reconnects using the same session identity, emqx_session_mem:replay/2 converts the inflight table into a replay list and appends newly dequeued messages."
+
+  - step: 5
+    action: "The client reads slowly or stops reading, causing outbound TCP congestion while the broker handles the replay batch."
+
+  - step: 6
+    action: "Under a bounded number of independent sessions or reconnect cycles, determine whether connection processes, queued output, memory, or CPU consumption accumulate sufficiently to impair unrelated MQTT clients."
+
+rfc_sections:
+  - rfc: "OASIS MQTT Version 5.0"
+    section: "4.1 Session State; 4.1.1 Storing Session State"
+    dos_relevance: |
+      MQTT permits a session to continue across multiple network connections.
+      Server-side session state includes QoS 1 and QoS 2 messages that have
+      been sent but not completely acknowledged. This makes replay on
+      reconnection a legitimate protocol operation. The specification also
+      recognizes that implementations have finite storage capacity and may
+      apply administrative resource policies. The research question is
+      whether EMQX's replay batching and transport behavior create a resource
+      exhaustion weakness despite the existing inflight message-count limit.
+
+related_work:
+  - type: writeup
+    url: https://github.com/emqx/emqx/issues/18460
+
+  - type: writeup
+    url: https://github.com/emqx/emqx/issues/10658

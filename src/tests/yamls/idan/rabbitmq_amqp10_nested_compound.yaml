@@ -1,0 +1,98 @@
+hypothesis:
+  description: |
+    Investigate whether RabbitMQ's AMQP 1.0 binary parser retains a
+    resource-amplification weakness in nested compound-array decoding
+    after the fix for CVE-2026-67414.
+
+    The CVE-2026-67414 patch changed the representation of zero-width
+    primitive arrays to opaque values, preventing their declared element
+    counts from directly producing large Erlang lists. It also rejects
+    described zero-width arrays.
+
+    However, the parser continues to support recursive decoding of
+    non-zero-width AMQP compound values. The research question is whether
+    nested compound arrays can cause disproportionate Erlang heap
+    allocation or CPU work relative to the encoded frame size, because
+    recursive materialization may create many Erlang terms and intermediate
+    structures.
+
+    This is not a claim that the original zero-width bug remains present.
+    The candidate is a potentially distinct resource-accounting weakness
+    in the same parser, which must be demonstrated on a patched release.
+
+    Assumptions:
+    - A1: The AMQP 1.0 listener is enabled and accepts the test client's
+          authenticated connection.
+    - A2: The patched parser still recursively materializes some
+          non-zero-width compound array values.
+    - A3: The aggregate decoded-memory cost is not sufficiently bounded
+          relative to the encoded input size.
+    - A4: The parser's recursive work can create measurable CPU or heap
+          amplification beyond ordinary protocol decoding overhead.
+    - A5: Any observed amplification can affect shared broker resources
+          or unrelated clients.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/rabbitmq/rabbitmq-server
+  version: v4.4.0
+  protocol: TCP
+  entry_point: "AMQP 1.0 listener, TCP port 5672"
+  docker_image: "rabbitmq:4-management"
+
+assumptions:
+  - id: A1
+    description: "The AMQP 1.0 listener is enabled and accepts authenticated client connections."
+    necessity: required
+
+  - id: A2
+    description: "The patched parser recursively materializes non-zero-width compound array values into Erlang terms."
+    necessity: required
+
+  - id: A3
+    description: "No effective aggregate decoded-memory budget bounds recursive compound-value materialization."
+    necessity: required
+
+  - id: A4
+    description: "The decoded representation can consume materially more CPU or heap than expected from the encoded frame size."
+    necessity: required
+
+  - id: A5
+    description: "The resulting resource consumption can affect shared broker resources or unrelated clients."
+    necessity: required
+
+  - id: A6
+    description: "The behavior is distinct from the zero-width primitive-array issue fixed by CVE-2026-67414 and its regression tests."
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "An authenticated client establishes an AMQP 1.0 connection to the broker."
+  - step: 2
+    action: "The parser receives a bounded compound-value structure containing nested non-zero-width arrays."
+  - step: 3
+    action: "The parser recursively materializes the compound values into Erlang terms and intermediate structures."
+  - step: 4
+    action: "Measure whether the decoded representation causes disproportionate heap allocation or CPU work relative to the encoded input."
+  - step: 5
+    action: "Determine whether the resource consumption remains isolated to the connection reader or degrades shared broker functionality and unrelated clients."
+
+rfc_sections:
+  - rfc: "OASIS AMQP 1.0"
+    section: "Type system; Arrays; Compound types"
+    dos_relevance: |
+      AMQP 1.0 defines arrays, compound values, and their encoded
+      representations. The parser must decode these structures while
+      respecting frame boundaries and implementation resource limits.
+      The research question concerns the resource cost of recursively
+      materializing valid compound values, rather than malformed
+      zero-width primitive arrays.
+
+related_work:
+  - type: cve
+    id: CVE-2026-67414
+  - type: writeup
+    url: https://github.com/rabbitmq/rabbitmq-server/commit/3f0f67dfb7c4390e3cbfa25ab3ee19dcb0845bd4
+  - type: writeup
+    url: https://github.com/rabbitmq/rabbitmq-server/security/advisories/GHSA-w6mq-4qpx-v7mh
