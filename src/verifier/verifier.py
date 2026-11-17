@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from run_context import run_id as _run_id
 from exploiter.tools import MetricsCollector, _probe_latency_ms
 from exploiter.prompts import QUIC_CONTROL_SKELETON_TEMPLATE
+from verifier.dynamic_baseline import AttributionEngine as _AttributionEngine, ATTRIBUTED as _ATTR_YES
 
 def _wait_for_ready(host: str, port: int, tls: bool, timeout_s: int = 30,
                     container_id: str = "") -> bool:
@@ -998,6 +999,10 @@ def run(
         # Send a cheap-payload equivalent at the same intensity as the target.
         # If control ≈ target → CPU is from TLS/kernel overhead, not application logic.
         benign_already_run: bool = False
+        # Attribution tracking: did Phase 2c run, and was differential attribution confirmed?
+        # Used by AttributionEngine.check_control_requirement() before CONFIRMED_DOS.
+        _p2c_ran: bool = False
+        _p2c_diff_attributed: bool = False
         p2c_phase: dict = {"phase": "control"}
         if control_exploit_fn is not None:
             print(f"[verifier:{_run_id}] Phase 2c — Control test ({attack_duration_s}s) ...")
@@ -1025,6 +1030,10 @@ def run(
             print(f"[verifier:{_run_id}] Phase 2c differential — {diff_reason}")
             print(f"[verifier:{_run_id}] Phase 2c attributed={diff_attributed} transport_confirmed={transport_confirmed}")
             phases.append(p2c_phase)
+            # Record that Phase 2c ran; diff_attributed will be updated after the
+            # fall-through logic below if secondary evidence changes the decision.
+            _p2c_ran = True
+            _p2c_diff_attributed = diff_attributed
 
             if not diff_attributed:
                 if not transport_confirmed:
@@ -1229,6 +1238,35 @@ def run(
         print(f"[verifier:{_run_id}] Phase 3 triggered={triggered3} attributed={attributed3}")
 
         if triggered3 and attributed3:
+            # Require causal attribution evidence before issuing CONFIRMED_DOS.
+            # High CPU/memory alone is insufficient — we need a matched control
+            # showing the hypothesized behavior causes disproportionate overhead.
+            _attr_engine = _AttributionEngine()
+            _attr_check = _attr_engine.check_control_requirement(
+                protocol=protocol,
+                control_exploit_fn_provided=control_exploit_fn is not None,
+                p2c_attribution_ran=_p2c_ran,
+                p2c_diff_attributed=_p2c_diff_attributed,
+            )
+            if _attr_check.status != _ATTR_YES:
+                p3_phase["outcome"] = "attribution_inconclusive"
+                phases.append(p3_phase)
+                print(f"[verifier:{_run_id}] INCONCLUSIVE — Phase 3 triggered but "
+                      f"attribution evidence insufficient: {_attr_check.reason[:120]}")
+                return {
+                    "verdict": Verdict.INCONCLUSIVE,
+                    "baseline": baseline,
+                    "attack": attack_metrics,
+                    "attack2": attack2,
+                    "triggered": triggered3,
+                    "phases": phases,
+                    "thresholds_config": thresholds_config,
+                    "notes": (
+                        f"Phase 3 thresholds triggered ({triggered3}) but causal attribution "
+                        f"could not be established: {_attr_check.reason}"
+                    ),
+                    "attribution": _attr_check.details,
+                }
             p3_phase["outcome"] = "confirmed"
             phases.append(p3_phase)
             return {
