@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 from datetime import datetime, timezone
 from statistics import mean
 from typing import Callable
@@ -46,6 +47,16 @@ _UNREACHABLE_S    = 3      # alive=False for >= 3 consecutive samples
 # control_delta / target_delta >= REJECT  → control ≈ target → transport overhead only
 _CTRL_CONFIRM_RATIO = 0.50   # control must be < 50% of target to confirm
 _CTRL_REJECT_RATIO  = 0.80   # control >= 80% of target → reject as transport overhead
+
+# In-process CPU profiling via Go pprof admin API
+_PPROF_PROFILE_S    = 15     # CPU profile capture duration in seconds
+_PPROF_APP_ATTR_PCT = 25.0   # min % of CPU in application code to attribute via pprof
+_PPROF_ADMIN_PORTS  = (2019, 6060)  # common Go pprof admin ports to probe
+
+# Benign-equivalent thresholds (Phase 2c-alt / Phase 2d)
+# benign_ratio = benign_cpu_delta / attack_cpu_delta
+_BENIGN_CONFIRM_RATIO   = 0.50   # below this: attack ≥2× more expensive than normal work
+_BENIGN_DOWNGRADE_RATIO = 0.80   # above this: attack ≈ normal work → not disproportionate
 
 # TLS calibration: measures per-connection TLS CPU cost during Phase 1b
 _TLS_CAL_RATE     = 100   # TCP/TLS handshakes/s during calibration
@@ -448,6 +459,134 @@ def _check_differential(target_baseline: dict, target: dict,
     return attributed, reason, details, transport_overhead_confirmed
 
 
+# ── pprof — in-process CPU attribution for Go servers ────────────────────────
+# Token sets for classifying pprof function names by layer (substring match).
+_PPROF_TRANSPORT_TOKENS = (
+    "quic-go/", "crypto/tls.", "runtime.gc", "runtime.mallo",
+    "syscall.", "net.(*netFD", "net.(*conn.Read",
+    "golang.org/x/net/", "net/http.(*Transport",
+    "runtime/pprof",
+)
+_PPROF_APP_TOKENS = (
+    "caddyhttp/", "reverseproxy/", "caddytls/",
+    "net/http.(*Server).Serve", "net/http.(*serverConn",
+    "net/http.(*response).", "net/http.(*conn).serve",
+    "net/http.(*ServeMux", "bufio.",
+)
+
+
+def _pprof_find_port(container_id: str) -> int | None:
+    """Probe common pprof admin ports inside the container. Returns port or None."""
+    for port in _PPROF_ADMIN_PORTS:
+        r = subprocess.run(
+            ["docker", "exec", container_id, "sh", "-c",
+             f"curl -sf http://localhost:{port}/debug/pprof/ > /dev/null 2>&1"],
+            capture_output=True, timeout=5,
+        )
+        if r.returncode == 0:
+            return port
+    return None
+
+
+def _pprof_capture(container_id: str, admin_port: int, duration_s: int) -> dict | None:
+    """
+    Capture a CPU profile from the container's Go pprof endpoint.
+    Returns classification dict or None on any failure.
+    """
+    print(f"  [pprof] Capturing {duration_s}s CPU profile "
+          f"(container {container_id[:12]}, port {admin_port}) ...")
+    inner_path = "/tmp/_hypogenie_pprof.pb.gz"
+    capture_cmd = (
+        f"curl -sf 'http://localhost:{admin_port}/debug/pprof/profile?seconds={duration_s}'"
+        f" -o {inner_path}"
+    )
+    r = subprocess.run(
+        ["docker", "exec", container_id, "sh", "-c", capture_cmd],
+        capture_output=True, timeout=duration_s + 15,
+    )
+    if r.returncode != 0:
+        print(f"  [pprof] Profile capture failed (exit {r.returncode})")
+        return None
+
+    local_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pb.gz", delete=False) as tmp:
+            local_path = tmp.name
+        cp = subprocess.run(
+            ["docker", "cp", f"{container_id}:{inner_path}", local_path],
+            capture_output=True, timeout=15,
+        )
+        if cp.returncode != 0:
+            return None
+        return _pprof_analyze(local_path)
+    finally:
+        if local_path:
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
+
+
+def _pprof_analyze(profile_path: str) -> dict | None:
+    """Run `go tool pprof -text` and classify CPU usage by layer."""
+    r = subprocess.run(
+        ["go", "tool", "pprof", "-text", "-nodecount=200", profile_path],
+        capture_output=True, text=True, timeout=20,
+    )
+    if r.returncode != 0:
+        print(f"  [pprof] go tool pprof not available — skipping in-process profiling")
+        return None
+    return _pprof_classify(r.stdout)
+
+
+def _pprof_classify(pprof_text: str) -> dict | None:
+    """
+    Parse `go tool pprof -text` output and classify CPU by layer.
+
+    Format per line: flat  flat%  sum%  cum  cum%  <function name>
+    Returns {app_pct, transport_pct, unknown_pct, total_s, top_functions} or None.
+    """
+    app_s = transport_s = unknown_s = 0.0
+    top: list[tuple[float, str]] = []
+
+    for line in pprof_text.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        try:
+            flat_str = parts[0]
+            if not flat_str.endswith("s"):
+                continue
+            flat_s = float(flat_str[:-1])
+            if flat_s <= 0:
+                continue
+        except ValueError:
+            continue
+
+        fn_name = " ".join(parts[5:])
+        if any(tok in fn_name for tok in _PPROF_APP_TOKENS):
+            app_s += flat_s
+        elif any(tok in fn_name for tok in _PPROF_TRANSPORT_TOKENS):
+            transport_s += flat_s
+        else:
+            unknown_s += flat_s
+
+        top.append((flat_s, fn_name))
+
+    top.sort(reverse=True)
+    total = app_s + transport_s + unknown_s
+    if total <= 0:
+        return None
+
+    return {
+        "app_pct":       round(100 * app_s / total, 1),
+        "transport_pct": round(100 * transport_s / total, 1),
+        "unknown_pct":   round(100 * unknown_s / total, 1),
+        "total_s":       round(total, 2),
+        "top_functions": [(fn, round(s, 3)) for s, fn in top[:10]],
+    }
+
+
 def _container_exited(container_id: str) -> bool:
     result = subprocess.run(
         ["docker", "inspect", "--format", "{{.State.ExitCode}}", container_id],
@@ -535,6 +674,20 @@ def run(
     }
 
     # ── Phase 1: Baseline ──────────────────────────────────────────────────────
+    # Wait for the server to accept connections before measuring baseline.
+    # Slow-starting runtimes (Erlang/OTP, JVM, etc.) can spike CPU during
+    # init; measuring before they settle produces false ENVIRONMENT_ERROR.
+    print(f"[verifier:{_run_id}] Waiting for server ready (up to 60s) ...")
+    if not _wait_for_ready(host, port, tls, timeout_s=60, container_id=container_id):
+        return {
+            "verdict": "ENVIRONMENT_ERROR",
+            "triggered": [],
+            "notes": "Server did not become reachable within 60s of startup",
+            "lab_tests": [],
+            "thresholds_config": thresholds_config,
+        }
+    # Give slow-starting runtimes a few extra seconds for CPU to settle.
+    time.sleep(5)
     p1_start = _now_iso()
     print(f"[verifier:{_run_id}] Phase 1 — Baseline ({baseline_duration_s}s) ...")
     collector = MetricsCollector(container_id, host, port, probe_tls=tls)
@@ -600,11 +753,31 @@ def run(
         print(f"[verifier:{_run_id}] {label}: cpu={cal_cpu:.1f}% "
               f"idle={idle_cpu:.1f}% per_conn_s={tls_cpu_per_conn_s:.4f}%")
 
+    # Probe for Go pprof admin API — available on most Go servers at :2019 or :6060.
+    # Used in Phase 2c to break differential ambiguity via in-process CPU classification.
+    pprof_port: int | None = _pprof_find_port(container_id) if tls else None
+    pprof_data: dict | None = None
+    if pprof_port:
+        print(f"[verifier:{_run_id}] pprof admin API found on port {pprof_port}")
+
     # ── Phase 2: Attack + Attribution ─────────────────────────────────────────
+    # Start pprof CPU capture concurrently so a profile is ready for Phase 2c.
+    _pprof_box: list = [None]
+    def _pprof_bg() -> None:
+        _pprof_box[0] = _pprof_capture(container_id, pprof_port, _PPROF_PROFILE_S)
+    _pprof_t: threading.Thread | None = None
+    if pprof_port:
+        _pprof_t = threading.Thread(target=_pprof_bg, daemon=True)
+        _pprof_t.start()
+
     p2_start = _now_iso()
     print(f"[verifier:{_run_id}] Phase 2 — Attack ({attack_duration_s}s) ...")
     attack_metrics = exploit_fn(plan, container_id, host, port, attack_duration_s)
     p2_end = _now_iso()
+
+    if _pprof_t is not None:
+        _pprof_t.join(timeout=_PPROF_PROFILE_S + 10)
+    pprof_data = _pprof_box[0]
 
     crash = _container_exited(container_id)
     if crash:
@@ -684,11 +857,22 @@ def run(
         }
 
     if not triggered or not attributed:
-        # Escalate once at higher intensity
+        # Escalate once at higher intensity — also capture a fresh pprof profile.
         p2_esc_start = _now_iso()
         print(f"[verifier:{_run_id}] No threshold crossed — escalating intensity ...")
+        _pprof_box_e: list = [None]
+        def _pprof_bg_e() -> None:
+            _pprof_box_e[0] = _pprof_capture(container_id, pprof_port, _PPROF_PROFILE_S)
+        _pprof_t_e: threading.Thread | None = None
+        if pprof_port:
+            _pprof_t_e = threading.Thread(target=_pprof_bg_e, daemon=True)
+            _pprof_t_e.start()
         attack_metrics2 = exploit_fn(plan, container_id, host, port, attack_duration_s * 2)
         p2_esc_end = _now_iso()
+        if _pprof_t_e is not None:
+            _pprof_t_e.join(timeout=_PPROF_PROFILE_S + 10)
+        if _pprof_box_e[0] is not None:
+            pprof_data = _pprof_box_e[0]
         if attack_metrics2.get("_invalid"):
             note2 = attack_metrics2.get("_invalid_reason", "exploit invalid on escalation")
             print(f"[verifier:{_run_id}] Escalated exploit invalid — {note2}; INVALID_TEST")
@@ -778,6 +962,7 @@ def run(
         # ── Phase 2c: Differential control test (runs on the Phase-3 container) ──
         # Send a cheap-payload equivalent at the same intensity as the target.
         # If control ≈ target → CPU is from TLS/kernel overhead, not application logic.
+        benign_already_run: bool = False
         p2c_phase: dict = {"phase": "control"}
         if control_exploit_fn is not None:
             print(f"[verifier:{_run_id}] Phase 2c — Control test ({attack_duration_s}s) ...")
@@ -808,50 +993,128 @@ def run(
 
             if not diff_attributed:
                 if not transport_confirmed:
-                    # Ambiguous zone: 0.50 ≤ ratio < 0.80 — cannot distinguish application
-                    # overhead from transport overhead.
-                    note = (f"Control test inconclusive (ratio in ambiguous zone 0.50–0.80): "
-                            f"{diff_reason}. Cannot attribute overhead to application logic.")
-                    print(f"[verifier:{_run_id}] INCONCLUSIVE — {note}")
+                    # Ambiguous zone: 0.50 ≤ ratio < 0.80.
+                    # Two secondary signals can break the tie before returning INCONCLUSIVE:
+                    #  1. Complete-request baseline (Phase 2c-alt): run benign_exploit_fn.
+                    #     benign_ratio = FIN-stream CPU delta / RESET-stream CPU delta.
+                    #     < _BENIGN_CONFIRM_RATIO   → cancellation ≥2× costlier than normal work
+                    #     ≥ _BENIGN_DOWNGRADE_RATIO → RESET ≈ FIN cost → not disproportionate
+                    #  2. pprof: in-process CPU fraction in application-layer code.
+                    _p2c_alt_ratio: float | None = None
+                    if benign_exploit_fn is not None:
+                        print(f"[verifier:{_run_id}] Phase 2c-alt — Complete-request baseline "
+                              f"({attack_duration_s}s) ...")
+                        _p2c_alt_m = benign_exploit_fn(
+                            attack_metrics, new_cid, host, port, attack_duration_s
+                        )
+                        _alt_base   = _safe_mean(baseline.get("cpu_pct", []))
+                        _alt_idle   = _safe_mean(baseline2.get("cpu_pct", []))
+                        _alt_atk    = _safe_mean(attack_metrics.get("cpu_pct", []))
+                        _alt_ben    = _safe_mean(_p2c_alt_m.get("cpu_pct", []))
+                        _alt_adelta = max(_alt_atk - _alt_base, 0.1)
+                        _alt_bdelta = max(_alt_ben - _alt_idle, 0.0)
+                        _p2c_alt_ratio = round(_alt_bdelta / _alt_adelta, 3)
+                        p2c_phase["benign_alt"] = {
+                            "benign_cpu_pct":  round(_alt_ben, 2),
+                            "idle_cpu_pct":    round(_alt_idle, 2),
+                            "attack_delta_pp": round(_alt_adelta, 2),
+                            "benign_delta_pp": round(_alt_bdelta, 2),
+                            "benign_ratio":    _p2c_alt_ratio,
+                        }
+                        benign_already_run = True
+                        print(f"[verifier:{_run_id}] Phase 2c-alt benign_ratio={_p2c_alt_ratio:.3f} "
+                              f"(attack+{_alt_adelta:.1f}pp  benign+{_alt_bdelta:.1f}pp  "
+                              f"idle={_alt_idle:.1f}%)")
+
+                    _pprof_app     = pprof_data.get("app_pct", 0.0) if pprof_data else 0.0
+                    _benign_attrs  = (_p2c_alt_ratio is not None
+                                      and _p2c_alt_ratio < _BENIGN_CONFIRM_RATIO)
+                    _benign_downgr = (_p2c_alt_ratio is not None
+                                      and _p2c_alt_ratio >= _BENIGN_DOWNGRADE_RATIO)
+                    _pprof_breaks  = pprof_data is not None and _pprof_app >= _PPROF_APP_ATTR_PCT
+
+                    if _benign_downgr:
+                        note = (f"Phase 2c ambiguous (ratio={diff_details['cpu_ratio']:.3f}). "
+                                f"Complete-request baseline: benign_ratio={_p2c_alt_ratio:.3f} "
+                                f"(≥{_BENIGN_DOWNGRADE_RATIO:.0%}): RESET_STREAM adds no "
+                                f"disproportionate overhead beyond normal stream completion.")
+                        print(f"[verifier:{_run_id}] DEFECT — {note}")
+                        phases.append(p2c_phase)
+                        return {
+                            "verdict": Verdict.DEFECT,
+                            "baseline": baseline, "attack": attack_metrics,
+                            "attack2": control_metrics,
+                            "triggered": triggered, "phases": phases,
+                            "thresholds_config": thresholds_config,
+                            "notes": note,
+                        }
+
+                    if _benign_attrs or _pprof_breaks:
+                        if _benign_attrs:
+                            diff_reason += (
+                                f"; complete-request baseline: benign_ratio={_p2c_alt_ratio:.3f} "
+                                f"(<{_BENIGN_CONFIRM_RATIO})"
+                            )
+                        if _pprof_breaks:
+                            diff_reason += (
+                                f"; pprof CPU profile: {_pprof_app:.1f}% application-layer "
+                                f"({pprof_data['transport_pct']:.1f}% transport)"
+                            )
+                            p2c_phase["pprof"] = pprof_data
+                        print(f"[verifier:{_run_id}] Secondary attribution confirmed "
+                              f"(benign_attrs={_benign_attrs}, pprof={_pprof_breaks}) "
+                              f"— proceeding to Phase 3")
+                        # fall through to Phase 3
+                    else:
+                        note = (f"Control test inconclusive (ratio in ambiguous zone 0.50–0.80): "
+                                f"{diff_reason}. Cannot attribute overhead to application logic.")
+                        if _p2c_alt_ratio is not None:
+                            note += (f" Complete-request baseline: benign_ratio={_p2c_alt_ratio:.3f} "
+                                    f"(≥{_BENIGN_CONFIRM_RATIO:.0%} — not disproportionate).")
+                        if pprof_data:
+                            note += (f" pprof: {_pprof_app:.1f}% application-layer, "
+                                    f"{pprof_data['transport_pct']:.1f}% transport "
+                                    f"(< {_PPROF_APP_ATTR_PCT:.0f}% app threshold).")
+                        print(f"[verifier:{_run_id}] INCONCLUSIVE — {note}")
+                        return {
+                            "verdict": Verdict.INCONCLUSIVE,
+                            "baseline": baseline, "attack": attack_metrics,
+                            "attack2": control_metrics,
+                            "triggered": triggered, "phases": phases,
+                            "thresholds_config": thresholds_config,
+                            "notes": note,
+                            "pprof": pprof_data,
+                        }
+                else:
+                    # Transport overhead confirmed (ratio >= 0.80): DEFECT or REJECTED.
+                    if has_code_findings:
+                        verdict = Verdict.DEFECT
+                        note = (f"Control test shows transport overhead (not application-level): "
+                                f"{diff_reason}. Source analysis found code issues (DEFECT).")
+                    else:
+                        verdict = Verdict.REJECTED
+                        note = (f"Control test rejects finding as transport overhead: {diff_reason}. "
+                                f"No source-level code issues found.")
+                    print(f"[verifier:{_run_id}] {verdict} — {note}")
                     return {
-                        "verdict": Verdict.INCONCLUSIVE,
+                        "verdict": verdict,
                         "baseline": baseline, "attack": attack_metrics,
                         "attack2": control_metrics,
                         "triggered": triggered, "phases": phases,
                         "thresholds_config": thresholds_config,
                         "notes": note,
                     }
-                # Transport overhead confirmed (ratio >= 0.80): DEFECT or REJECTED.
-                if has_code_findings:
-                    verdict = Verdict.DEFECT
-                    note = (f"Control test shows transport overhead (not application-level): "
-                            f"{diff_reason}. Source analysis found code issues (DEFECT).")
-                else:
-                    verdict = Verdict.REJECTED
-                    note = (f"Control test rejects finding as transport overhead: {diff_reason}. "
-                            f"No source-level code issues found.")
-                print(f"[verifier:{_run_id}] {verdict} — {note}")
-                return {
-                    "verdict": verdict,
-                    "baseline": baseline, "attack": attack_metrics,
-                    "attack2": control_metrics,
-                    "triggered": triggered, "phases": phases,
-                    "thresholds_config": thresholds_config,
-                    "notes": note,
-                }
 
         # ── Phase 2d: Benign equivalent test ─────────────────────────────────────
         # Answers the reviewer's key question: is the attack's CPU overhead
         # disproportionate compared to ordinary protocol work at the same intensity?
         # benign_ratio = benign_cpu_delta / attack_cpu_delta:
-        #   < 0.50 → attack is ≥2× more expensive than normal work → confirmed anomalous
-        #   ≥ 0.80 → attack costs ≈ normal work → overhead is from protocol machinery
-        #            alone, not from an exploitable amplification → downgrade verdict
-        _BENIGN_CONFIRM_RATIO   = 0.50   # below this: attack is disproportionate
-        _BENIGN_DOWNGRADE_RATIO = 0.80   # above this: not distinguishable from normal work
+        #   < _BENIGN_CONFIRM_RATIO   → attack ≥2× more expensive than normal work
+        #   ≥ _BENIGN_DOWNGRADE_RATIO → attack ≈ normal work → not exploitable
+        # Skipped if already executed in Phase 2c-alt (ambiguous zone path).
         p2d_phase: dict = {"phase": "benign"}
         benign_ratio: float | None = None
-        if benign_exploit_fn is not None:
+        if benign_exploit_fn is not None and not benign_already_run:
             print(f"[verifier:{_run_id}] Phase 2d — Benign equivalent test ({attack_duration_s}s) ...")
             p2d_start = _now_iso()
             benign_metrics = benign_exploit_fn(attack_metrics, new_cid, host, port, attack_duration_s)
