@@ -117,11 +117,19 @@ def _dockerfile_build(product: str, version: str, entry_point: str,
     return tag, {"config_path": config_path, "ports": ports}
 
 
-def _setup_developer(product: str, version: str, entry_point: str) -> dict:
+def _setup_developer(product: str, version: str, entry_point: str,
+                     server_config_hint: str = "") -> dict:
     """LLM call: generate server config, config_path, ports."""
     user = SETUP_DEVELOPER_USER_TEMPLATE.format(
         product=product, version=version, entry_point=entry_point
     )
+    if server_config_hint.strip():
+        user += (
+            "\n\nThe YAML hypothesis provides the following server configuration hint. "
+            "Use it as a base and extend it as needed (keep all directives present, "
+            "add cert paths and any required fields):\n\n"
+            f"```\n{server_config_hint.strip()}\n```"
+        )
     print(f"  [builder:{_run_id}] Setup Developer ...")
     raw = _llm.call_llm(
         SETUP_DEVELOPER_SYSTEM, user,
@@ -174,7 +182,7 @@ def _setup_critic(product: str, entry_point: str, setup: dict) -> bool:
 
 def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
           docker_image: str | None = None, protocol: str = "HTTP/2",
-          repo_url: str = "") -> dict:
+          repo_url: str = "", server_config_hint: str = "") -> dict:
     """
     Build and start a server container for the given product/version.
 
@@ -276,7 +284,8 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         effective_version = version
 
     # Generate server config via LLM
-    setup = _setup_developer(effective_product, effective_version, entry_point)
+    setup = _setup_developer(effective_product, effective_version, entry_point,
+                             server_config_hint=server_config_hint)
 
     # Critic validates cert paths
     critic_ok = _setup_critic(effective_product, entry_point, setup)

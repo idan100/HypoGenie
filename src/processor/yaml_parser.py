@@ -78,6 +78,7 @@ def parse(yaml_path: str) -> HypothesisContext:
     related_work = data.get("related_work", [])
 
     docker_image = tgt.get("docker_image", None)
+    server_config = tgt.get("server_config", "") or ""
 
     return HypothesisContext(
         description=description,
@@ -90,4 +91,5 @@ def parse(yaml_path: str) -> HypothesisContext:
         rfc_sections=rfc_sections,
         related_work=related_work,
         docker_image=docker_image,
+        server_config=server_config,
     )

@@ -390,6 +390,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             docker_image=ctx.docker_image,
             protocol=ctx.protocol,
             repo_url=ctx.repo_url,
+            server_config_hint=getattr(ctx, "server_config", ""),
         )
         container_id   = container_info["container_id"]
         port           = _port_from_entry_point(ctx.entry_point)

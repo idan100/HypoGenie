@@ -28,6 +28,7 @@ class HypothesisContext:
     rfc_sections: list[RFCSection] = field(default_factory=list)
     related_work: list[dict] = field(default_factory=list)
     docker_image: Optional[str] = None   # optional override; skips Hub pull + source build
+    server_config: str = ""              # optional server config hint for Setup Developer
 
     def __str__(self):
         lines = [
