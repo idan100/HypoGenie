@@ -190,8 +190,43 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         print(f"  [builder:{_run_id}] Using docker_image override: {image}")
         if _image_exists_locally(image):
             print(f"  [builder:{_run_id}] Image found in local store — skipping pull.")
+        elif _docker_pull(image):
+            print(f"  [builder:{_run_id}] Pull succeeded.")
         else:
-            _docker_pull(image)  # try registry; failure is tolerated only if already local
+            # Image not local and pull failed → source-build, then retag to the requested name
+            print(f"  [builder:{_run_id}] Pull failed and image not local — falling back to source build ...")
+            image, source_setup = _dockerfile_build(
+                product, version, entry_point, protocol, repo_url, run_dir
+            )
+            # Retag built image to the requested docker_image name so callers
+            # that use the name for restart find the same image.
+            subprocess.run(["docker", "tag", image, docker_image], capture_output=True)
+            image = docker_image
+            if not source_setup.get("config_path"):
+                port_args = []
+                for mapping in source_setup["ports"].split():
+                    port_args += ["-p", mapping]
+                cmd = [
+                    "docker", "run", "-d",
+                    "--name", f"hypogenie-{_run_id}",
+                    "--cpus", "1",
+                    "-v", f"{_CERTS_DIR}/server.crt:/certs/server.crt:ro",
+                    "-v", f"{_CERTS_DIR}/server.key:/certs/server.key:ro",
+                ] + port_args + [image]
+                print(f"  [builder:{_run_id}] Starting container: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode != 0:
+                    raise RuntimeError(f"docker run failed: {result.stderr.strip()[:400]}")
+                container_id = result.stdout.strip()
+                _running_containers.append(container_id)
+                print(f"  [builder:{_run_id}] Container started: {container_id[:12]}")
+                return {
+                    "container_id": container_id,
+                    "image": image,
+                    "config_path": "",
+                    "ports": source_setup["ports"],
+                    "run_dir": str(run_dir),
+                }
         # Derive product name from image (e.g. "caddy:2.7.6" → "caddy")
         effective_product = image.split(":")[0].split("/")[-1]
         effective_version = image.split(":")[-1] if ":" in image else version
