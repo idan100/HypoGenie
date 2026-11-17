@@ -1,0 +1,91 @@
+hypothesis:
+  description: |
+    Cloudflare quiche may prematurely collect a QUIC stream's sending
+    direction after it is reset locally or stopped by the peer, without
+    waiting for acknowledgment of the corresponding RESET_STREAM frame.
+    This can return stream concurrency credit to the peer while the
+    RESET_STREAM is still in flight. If the RESET_STREAM packet is lost,
+    quiche may subsequently queue it for retransmission even though the
+    original stream has already been collected. A peer that continues
+    opening streams using the returned credit may cause additional resets
+    to accumulate in retransmission state, potentially increasing memory
+    and CPU consumption.
+
+    This hypothesis concerns the server's outgoing RESET_STREAM lifecycle,
+    triggered by a local write-side reset or a peer STOP_SENDING frame. It
+    is distinct from a client sending RESET_STREAM to cancel an HTTP/3
+    request.
+
+    Assumptions:
+    - A1: The implementation collects a reset sending direction and returns
+          its stream concurrency credit before the corresponding
+          RESET_STREAM is acknowledged.
+    - A2: Lost RESET_STREAM frames can remain queued for retransmission
+          after their original stream state has been collected.
+    - A3: A peer can continue opening streams using the returned credit
+          while packet loss prevents RESET_STREAM retransmissions from
+          being acknowledged or drained quickly enough.
+    - A4: No effective bound or cleanup mechanism prevents retransmission
+          queue growth from consuming excessive resources.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/cloudflare/quiche
+  version: 89a58f2e89a0f83b2669427e69555314107210a3
+  protocol: QUIC
+  entry_point: "UDP port 443, QUIC transport; application protocol is not required to exercise the transport-level mechanism"
+  docker_image: "hypogenie/quiche-server:pre-fix"
+
+assumptions:
+  - id: A1
+    description: "A reset or peer-stopped sending direction can be collected and its stream credit returned before the corresponding RESET_STREAM is acknowledged."
+    necessity: required
+
+  - id: A2
+    description: "A lost RESET_STREAM can be queued for retransmission after the original stream state has been collected."
+    necessity: required
+
+  - id: A3
+    description: "The peer can open additional streams using replenished concurrency credit while previous RESET_STREAM frames remain unacknowledged."
+    necessity: required
+
+  - id: A4
+    description: "No effective retransmission-queue bound or cleanup mechanism prevents accumulated reset retransmissions from consuming excessive resources."
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Establish a QUIC connection and open streams within the server's advertised concurrency limit."
+
+  - step: 2
+    action: "Cause the server's sending direction on a stream to be reset locally or stopped by sending STOP_SENDING, resulting in a server-generated RESET_STREAM."
+
+  - step: 3
+    action: "Under controlled server-to-client packet loss, allow the RESET_STREAM to remain unacknowledged while the implementation collects the stream and returns its concurrency credit."
+
+  - step: 4
+    action: "Open additional streams using the returned credit and repeat the lifecycle, causing lost RESET_STREAM frames to accumulate in retransmission state."
+
+  - step: 5
+    action: "If retransmission state grows faster than it can be drained or reclaimed, server memory and/or CPU consumption may increase and potentially degrade service."
+
+rfc_sections:
+  - rfc: RFC 9000
+    section: "3.5"
+    dos_relevance: "Defines STOP_SENDING, which requests that the peer cease transmission on a stream and is a relevant trigger for the server-side reset lifecycle."
+
+  - rfc: RFC 9000
+    section: "4.6"
+    dos_relevance: "Defines stream concurrency limits and MAX_STREAMS credit. The hypothesis concerns returning this credit before the associated reset transmission has been acknowledged."
+
+  - rfc: RFC 9000
+    section: "19.4"
+    dos_relevance: "Defines RESET_STREAM and its retransmission behavior, making acknowledgment and retransmission lifecycle relevant to the hypothesis."
+
+related_work:
+  - type: writeup
+    url: https://github.com/cloudflare/quiche/pull/2828
+
+  - type: writeup
+    url: https://github.com/cloudflare/quiche/commit/e4966ce5f0720c01e9549e62eef8c01bae3218a0
