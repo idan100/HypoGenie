@@ -686,8 +686,25 @@ def run(
             "lab_tests": [],
             "thresholds_config": thresholds_config,
         }
-    # Give slow-starting runtimes a few extra seconds for CPU to settle.
-    time.sleep(5)
+    # Poll until container CPU settles below the baseline threshold.
+    # Erlang/OTP, JVM, and similar runtimes accept connections while still
+    # doing expensive init work; a fixed sleep is not sufficient.
+    _settle_deadline = time.time() + 90
+    _settle_target   = 15  # pp; just under _baseline_healthy's 20pp limit
+    print(f"[verifier:{_run_id}] Waiting for CPU to settle below {_settle_target}% ...")
+    while time.time() < _settle_deadline:
+        try:
+            r = subprocess.run(
+                ["docker", "stats", container_id, "--no-stream", "--no-trunc",
+                 "--format", "{{.CPUPerc}}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            cpu_s = r.stdout.strip().rstrip("%")
+            if cpu_s and float(cpu_s) < _settle_target:
+                break
+        except Exception:
+            pass
+        time.sleep(2)
     p1_start = _now_iso()
     print(f"[verifier:{_run_id}] Phase 1 — Baseline ({baseline_duration_s}s) ...")
     collector = MetricsCollector(container_id, host, port, probe_tls=tls)
