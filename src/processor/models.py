@@ -29,6 +29,10 @@ class HypothesisContext:
     related_work: list[dict] = field(default_factory=list)
     docker_image: Optional[str] = None   # optional override; skips Hub pull + source build
     server_config: str = ""              # optional server config hint for Setup Developer
+    # list[dict] from YAML suspected_mechanism block (step + action keys)
+    suspected_mechanism: list[dict] = field(default_factory=list)
+    # validation.resource_lifecycle.mode: "auto" | "enabled" | "disabled"
+    validation: dict = field(default_factory=dict)
 
     def __str__(self):
         lines = [

@@ -33,6 +33,9 @@ from verifier.verifier import run as verify_run, Verdict
 from exploiter.exploiter import make_control_fn as _make_control_fn
 from exploiter.exploiter import make_benign_fn as _make_benign_fn
 import llm_client as _llm
+from lifecycle.applicability import assess as _lc_assess, build_plan as _lc_build_plan
+from lifecycle.model import LifecycleMode, LifecycleResult
+from lifecycle.scenarios import LifecycleRunner
 
 _PROJECT_ROOT = Path(__file__).parent
 _OUTPUT_DIR   = _PROJECT_ROOT / "output"
@@ -176,8 +179,52 @@ def _serialize_finding(f) -> dict:
     return base
 
 
+def _serialize_lifecycle(r: "LifecycleResult | None") -> dict | None:
+    if r is None:
+        return None
+    def _sample(s):
+        return {
+            "batch": s.batch_num, "scenario": s.scenario,
+            "cleanup_pending": s.cleanup_pending,
+            "active": s.active_ops, "completed": s.completed_ops,
+            "cancelled": s.cancelled_ops,
+            "context_cancelled": s.context_cancelled,
+            "op_terminated": s.op_terminated,
+            "resource_released": s.resource_released,
+            "outstanding_cleanups": s.outstanding_cleanups,
+            "proxy_goroutines": s.proxy_goroutines,
+        }
+
+    def _recovery(s):
+        return {
+            "elapsed_s": s.elapsed_s,
+            "outstanding_cleanups": s.outstanding_cleanups,
+            "active_ops": s.active_ops,
+            "proxy_goroutines": s.proxy_goroutines,
+        }
+
+    return {
+        "outcome": r.outcome.value,
+        "backend_observable": r.backend_observable,
+        "proxy_observable": r.proxy_observable,
+        "transport_observable": r.transport_observable,
+        "observability_limitations": r.observability_limitations,
+        "cleanup_pending_trend": r.cleanup_pending_trend,
+        "proxy_goroutine_trend": r.proxy_goroutine_trend,
+        "recovery_observed": r.recovery_observed,
+        "recovery_wait_s": r.recovery_wait_s,
+        "peak_cleanup_pending": r.peak_cleanup_pending,
+        "peak_outstanding_cleanups": r.peak_outstanding_cleanups,
+        "notes": r.notes,
+        "batches": [_sample(s) for s in r.batches],
+        "control_batches": [_sample(s) for s in r.control_batches],
+        "recovery_samples": [_recovery(s) for s in r.recovery_samples],
+    }
+
+
 def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
-                   verdicts: list, findings: list) -> None:
+                   verdicts: list, findings: list,
+                   lifecycle_result: "LifecycleResult | None" = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Collect token usage from llm_client accumulator
@@ -296,6 +343,9 @@ def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
             "pivot_note":           plan.pivot_note if plan else None,
             "attack_steps":         plan_steps,
         } if plan else None,
+
+        # lifecycle validation
+        "lifecycle_validation": _serialize_lifecycle(lifecycle_result),
     }
     (out_dir / "verdict.json").write_text(json.dumps(_clean(verdict_data), indent=2))
 
@@ -335,6 +385,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
     container_info: dict = {}
     verdicts: list = []
     findings: list = []
+    lifecycle_result: "LifecycleResult | None" = None
 
     try:
         # ── 1. YAML Parser ─────────────────────────────────────────────────────
@@ -376,10 +427,44 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             _write_outputs(out_dir, ctx, None, result, verdicts, findings)
             return result
 
+        # ── 4b. Lifecycle applicability assessment ─────────────────────────────
+        # Runs after Gap Finder (findings are inputs) and before Exploit Planner
+        # (plan is not yet available; score may be supplemented in 7b).
+        lc_mode_str = (
+            ctx.validation.get("resource_lifecycle", {}).get("mode", "auto")
+        )
+        lc_mode = LifecycleMode(lc_mode_str)
+        lc_plan = None
+        if lc_mode is not LifecycleMode.DISABLED:
+            lc_applicability = _lc_assess(ctx, findings=findings, plan=None)
+            print(
+                f"  [lifecycle] applicability={lc_applicability.decision} "
+                f"score={lc_applicability.score:.1f}"
+            )
+            if (
+                lc_mode is LifecycleMode.ENABLED
+                or lc_applicability.decision in ("applicable", "uncertain")
+            ):
+                lc_plan = _lc_build_plan(ctx, lc_applicability)
+
         # ── 5. Exploit Planner ─────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [5/7] Exploit Planner ...")
         plan = plan_run(ctx, verdicts, findings)
         print(f"  severity={plan.severity} steps={len(plan.attack_sequence)}")
+
+        # Re-score lifecycle applicability with plan signals now available
+        if lc_mode is not LifecycleMode.DISABLED and lc_plan is None:
+            lc_applicability2 = _lc_assess(ctx, findings=findings, plan=plan)
+            print(
+                f"  [lifecycle] re-score with plan: "
+                f"applicability={lc_applicability2.decision} "
+                f"score={lc_applicability2.score:.1f}"
+            )
+            if (
+                lc_mode is LifecycleMode.ENABLED
+                or lc_applicability2.decision in ("applicable", "uncertain")
+            ):
+                lc_plan = _lc_build_plan(ctx, lc_applicability2)
 
         # ── 6. Builder ─────────────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [6/7] Builder ...")
@@ -431,7 +516,20 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         verdict = verify_result["verdict"]
         print(f"\n[hypogenie:{_id}] *** VERDICT: {verdict} ***\n")
 
-        _write_outputs(out_dir, ctx, plan, verify_result, verdicts, findings)
+        # ── 7b. Lifecycle Validation (runs after verifier, separate containers) ──
+        if lc_plan is not None:
+            print(f"[hypogenie:{_id}] [lifecycle] Running lifecycle validation ...")
+            workspace_dir = str(_WORKSPACE / _id)
+            runner = LifecycleRunner(
+                ctx=ctx,
+                plan=lc_plan,
+                certs_dir=str(_CERTS_DIR),
+                workspace=workspace_dir,
+            )
+            lifecycle_result = runner.run()
+
+        _write_outputs(out_dir, ctx, plan, verify_result, verdicts, findings,
+                       lifecycle_result=lifecycle_result)
         return verify_result
 
     except Exception as e:
@@ -443,7 +541,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
                   "notes": str(e)}
         try:
             _write_outputs(out_dir, ctx if 'ctx' in dir() else None,
-                           plan if 'plan' in dir() else None, result, verdicts, findings)
+                           plan if 'plan' in dir() else None, result, verdicts, findings,
+                           lifecycle_result=lifecycle_result)
         except Exception:
             pass
         return result

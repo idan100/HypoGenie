@@ -655,6 +655,7 @@ def run(
     benign_exploit_fn: Callable | None = None,
     has_code_findings: bool = False,
     protocol: str = "",
+    lifecycle_validation_plan=None,  # LifecycleValidationPlan | None — reserved for future use
 ) -> dict:
     """
     Three-phase DoS verification.

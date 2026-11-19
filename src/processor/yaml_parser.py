@@ -80,6 +80,23 @@ def parse(yaml_path: str) -> HypothesisContext:
     docker_image = tgt.get("docker_image", None)
     server_config = tgt.get("server_config", "") or ""
 
+    # ── suspected_mechanism ────────────────────────────────────────────────────
+    # list of {step: int, action: str} dicts; silently ignored if absent or malformed
+    suspected_mechanism = []
+    for raw in data.get("suspected_mechanism", []):
+        if isinstance(raw, dict):
+            suspected_mechanism.append(raw)
+
+    # ── validation ─────────────────────────────────────────────────────────────
+    # Optional block; only validation.resource_lifecycle.mode is consumed currently.
+    # Defaults to mode="auto" so existing YAMLs without the block are unaffected.
+    validation_raw = data.get("validation", {}) or {}
+    rl = validation_raw.get("resource_lifecycle", {}) or {}
+    mode = str(rl.get("mode", "auto")).strip()
+    if mode not in ("auto", "enabled", "disabled"):
+        mode = "auto"
+    validation = {"resource_lifecycle": {"mode": mode}}
+
     return HypothesisContext(
         description=description,
         dos_class=dos_class,
@@ -92,4 +109,6 @@ def parse(yaml_path: str) -> HypothesisContext:
         related_work=related_work,
         docker_image=docker_image,
         server_config=server_config,
+        suspected_mechanism=suspected_mechanism,
+        validation=validation,
     )

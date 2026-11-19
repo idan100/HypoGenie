@@ -1,0 +1,141 @@
+hypothesis:
+  description: |
+    RFC 9000 §4.6 controls peer-initiated stream concurrency through cumulative
+    stream limits advertised using initial_max_streams_bidi /
+    initial_max_streams_uni transport parameters and subsequently increased
+    through MAX_STREAMS frames. Closing a QUIC stream does not automatically
+    replenish the peer's stream credit; the receiving endpoint decides when
+    and how much additional credit to grant.
+
+    This implementation-policy flexibility may enable an HTTP/3 DoS condition
+    similar in principle to HTTP/2's Rapid-Reset (CVE-2023-44487)
+
+    Unlike HTTP/2, QUIC uses a cumulative stream limit that the receiver must
+    manually increase with a MAX_STREAMS frame, rather than a concurrency
+    counter that is locally replenished when a stream is closed. Therefore, the
+    attack depends on the implementation's MAX_STREAMS granting policy, and
+    whether application-level work is cancelled or retired promptly.
+
+    Additionally, HTTP/3 relies mainly on bi-directional QUIC streams that must
+    be closed in both directions for them to be considered fully closed. While
+    closure of the upstream direction is trivial for the client through the use
+    of the FIN bit flag in the request frame, the client must cause the closure
+    of the the downstream direction, probably with a server-sent RESET_STREAM
+    frame through the use of a STOP_SENDING frame that would lead to the
+    dispaching of RESET_STREAM by the server.
+
+    If the server grants MAX_STREAMS credit immediately after transport-level
+    stream closure, before the corresponding HTTP/3 request processing has
+    completed, an attacker may repeatedly initiate and cancel requests while
+    causing the server to process more work than it can retire. This can be
+    exacerbated if the client can predict the server's credit granting policy
+    and prematurely send requests on streams that exceed the current credit as
+    permitted by frames the client received if it believes the server would've
+    granted them with a MAX_STREAMS frame by the time they are received by it.
+    Similarly, a client may send premature ACK frames for the STREAM_RESET
+    frames it expects the server to send in response to its STOP_SENDING frames
+    to increase the attack's throughput.
+
+    The same exposure may exist when the server advertises an excessively large
+    initial stream limit. The suspected target is Caddy v2.11.4 using quic-go
+    v0.59.1.
+
+    Assumptions:
+    - A1: The implementation can be forced to grant MAX_STREAMS credit on
+          transport-level stream closure before application-level request
+          processing completes, or advertises an excessively large initial
+          stream limit.
+    - A2: Per-stream HTTP/3 request processing incurs non-trivial CPU work
+          that is not cancelled promptly when the client cancels the stream.
+    - A3: The client can predict the server's packet numbers used for carrying
+          its RESET_STREAM frames sent in response to STOP_SENDING frames, and
+          intelligently time the premature sending of ACK frames for them even
+          before they are received, in order to increase the attack's rate.
+    - A4: The client can predict the server's MAX_STREAMS frames that will
+          increase its stream credit, and intelligently time the premature
+          opening, and subsequent closing, of new streams using the credit it
+          expects to receive before it explicitly receives it, in order to
+          increase the attack's rate.
+    - A5: No application-layer stream-churn or reset-rate limit exists.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/quic-go/quic-go
+  version: v0.59.1
+  protocol: QUIC
+  entry_point: "UDP port 443, QUIC with ALPN h3"
+  docker_image: "caddy:2.11.4"
+
+assumptions:
+  - id: A1
+    description: "The implementation can be forced to grant MAX_STREAMS credit on transport-level stream closure before application-level request processing completes, or advertises an excessively large initial stream limit."
+    necessity: required
+
+  - id: A2
+    description: "Per-stream HTTP/3 request processing incurs non-trivial CPU work that is not cancelled promptly when the the stream is closed in the transport-level."
+    necessity: required
+
+  - id: A3
+    description: >
+      RFC 9000 §12.3 mandates that QUIC packet numbers are strictly monotonically
+      increasing within each packet number space. Once the client observes any packet
+      from the server, all subsequent packet numbers are predictable by increment.
+      This is a protocol guarantee, not an implementation detail: the client can
+      therefore predict the packet numbers of the server's RESET_STREAM frames
+      (sent in response to STOP_SENDING) and send premature ACK frames for them
+      before they are physically received, increasing attack throughput.
+    necessity: required
+
+  - id: A4
+    description: >
+      RFC 9000 §3.5 mandates that when a server receives STOP_SENDING on an open
+      stream it MUST respond with RESET_STREAM, completing full closure of that
+      stream. Full stream closure obligates the server to replenish MAX_STREAMS
+      credit (RFC 9000 §4.6). Because both the RESET_STREAM response and the
+      resulting credit grant are protocol-mandated and therefore deterministic,
+      the client can speculatively open new streams immediately after sending
+      STOP_SENDING — before receiving the explicit MAX_STREAMS frame — accelerating
+      the stream-churn rate beyond what reactive credit consumption would allow.
+    necessity: required
+
+  - id: A5
+    description: "No application-layer stream-churn or reset-rate limit exists."
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "The client repeatedly initiates short-lived bidirectional QUIC streams carrying HTTP/3 requests and cancels them."
+
+  - step: 2
+    action: "If the implementation replenishes MAX_STREAMS credit upon transport-level closure, or provides an excessively large initial stream limit, additional streams can be admitted before the corresponding application work has completed."
+
+  - step: 3
+    action: "Repeated stream initiation and cancellation causes the HTTP/3 layer to process requests faster than outstanding application work is cancelled or retired, accumulating CPU consumption."
+
+  - step: 4
+    action: "Under sustained stream churn, server-side request processing consumes excessive CPU resources and can degrade service availability."
+
+rfc_sections:
+  - rfc: RFC 9000
+    section: "4.6"
+    dos_relevance: "Defines stream concurrency control through MAX_STREAMS and leaves the timing and amount of additional stream credit to implementation policy. This flexibility may allow aggressive credit granting that enables repeated stream churn."
+
+  - rfc: RFC 9000
+    section: "3.5"
+    dos_relevance: "Describes solicited stream state transitions involving RESET_STREAM and STOP_SENDING. These transitions are relevant to the suspected relationship between transport-level stream closure and application-level request completion."
+
+  - rfc: RFC 9000
+    section: "19.11"
+    dos_relevance: "Defines the MAX_STREAMS frame used to increase the cumulative stream limit. The implementation's decision to issue this frame determines when the peer can initiate additional streams."
+
+  - rfc: RFC 9114
+    section: "4.1.1"
+    dos_relevance: "Describes HTTP/3 request cancellation. The interaction between request cancellation and QUIC stream-credit replenishment may determine whether cancelled requests continue consuming server-side resources."
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+
+  - type: paper
+    id: "MadeYouReset: Exploiting HTTP/2 Server-Side Resets for Large-Scale DoS"
