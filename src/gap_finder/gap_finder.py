@@ -190,6 +190,17 @@ def _parse_developer_output(raw: str, ctx, spec_reqs) -> tuple[list[AssumptionVe
             reasoning=v.get("reasoning", ""),
         ))
 
+    # Backfill any assumption that the developer skipped — required ones must not be silently dropped.
+    evaluated_ids = {v.assumption_id for v in verdicts}
+    for assumption in ctx.assumptions:
+        if assumption.id not in evaluated_ids:
+            verdicts.append(AssumptionVerdict(
+                assumption_id=assumption.id,
+                status="unclear",
+                code_evidence="",
+                reasoning="Not evaluated — developer did not produce a verdict for this assumption.",
+            ))
+
     findings: list[Finding] = []
     for f in data.get("findings", []):
         ftype = f.get("finding_type", "")
