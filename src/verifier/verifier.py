@@ -60,6 +60,21 @@ _PPROF_ADMIN_PORTS  = (2019, 6060)  # common Go pprof admin ports to probe
 _BENIGN_CONFIRM_RATIO   = 0.50   # below this: attack ≥2× more expensive than normal work
 _BENIGN_DOWNGRADE_RATIO = 0.80   # above this: attack ≈ normal work → not disproportionate
 
+# Work-unit type pairs that are considered comparable for rate normalization.
+# Same type is always compatible; this table covers cross-type compatible pairs.
+_COMPATIBLE_UNIT_PAIRS: frozenset = frozenset({
+    frozenset({"h2_stream", "h2_request"}),
+})
+
+
+def _work_units_compatible(type_a: str, type_b: str) -> bool:
+    """Return True when attack and benign work unit types are comparable."""
+    if not type_a or not type_b:
+        return False
+    if type_a == type_b:
+        return True
+    return frozenset({type_a, type_b}) in _COMPATIBLE_UNIT_PAIRS
+
 # TLS calibration: measures per-connection TLS CPU cost during Phase 1b
 _TLS_CAL_RATE     = 100   # TCP/TLS handshakes/s during calibration
 _TLS_CAL_DURATION = 15    # seconds
@@ -79,6 +94,12 @@ class Verdict:
     INVALID_TEST      = "INVALID_TEST"   # experiment setup was invalid; result not meaningful
     DEFECT            = "DEFECT"         # code issue confirmed but not exploitable as DoS
     REJECTED          = "REJECTED"       # false positive: control test shows transport overhead
+
+    # Hypothesis-level verdicts (computed after the verifier from measurement + assumption evidence)
+    DOS_CONFIRMED                  = "DOS_CONFIRMED"               # reproducible, causally attributed DoS
+    HYPOTHESIS_DISPROVEN           = "HYPOTHESIS_DISPROVEN"        # necessary assumptions falsified
+    HYPOTHESIS_PARTIALLY_DISPROVEN = "HYPOTHESIS_PARTIALLY_DISPROVEN"  # one path disproven; others untested
+    HYPOTHESIS_INCONCLUSIVE        = "HYPOTHESIS_INCONCLUSIVE"     # insufficient evidence either way
 
 
 def _safe_mean(lst):
@@ -1226,49 +1247,84 @@ def run(
             attack_delta = max(attack_cpu - idle_cpu, 0.1)   # avoid div/0
             benign_delta = max(benign_cpu - idle_cpu, 0.0)
 
-            # Detect accumulation: CPU still rising at end of attack window means
-            # overhead comes from accumulated state, not current send rate.
-            attack_series = attack_metrics.get("cpu_pct", [])
-            is_accumulating = False
-            if len(attack_series) >= 20:
-                early = _safe_mean(attack_series[:10])
-                late  = _safe_mean(attack_series[-10:])
-                is_accumulating = (late - early) > 15.0  # rising >15pp = accumulation
+            # Accumulation detection — CPU slope and memory slope independently.
+            # If either resource is still growing, overhead comes from accumulated
+            # state (goroutines, buffers) rather than current send rate, so rate
+            # normalization would over-correct and mask real DoS signals.
+            attack_cpu_series = attack_metrics.get("cpu_pct", [])
+            attack_mem_series = attack_metrics.get("mem_mb", [])
 
-            # Rate normalization: scale benign delta to attack throughput so the
-            # comparison is per unit of work, not per unit of time.
-            attack_rate = attack_metrics.get("_stream_rate", 0) or 0
-            benign_rate = benign_metrics.get("_stream_rate", 0) or 0
-            rate_ratio  = 1.0
-            rate_note   = ""
-            if (not is_accumulating
-                    and attack_rate > 0 and benign_rate > 0
-                    and attack_rate > benign_rate * 1.1):
+            cpu_accumulating = False
+            if len(attack_cpu_series) >= 20:
+                _early_cpu = _safe_mean(attack_cpu_series[:10])
+                _late_cpu  = _safe_mean(attack_cpu_series[-10:])
+                cpu_accumulating = (_late_cpu - _early_cpu) > 15.0
+
+            mem_accumulating = False
+            if len(attack_mem_series) >= 20:
+                _early_mem = _safe_mean(attack_mem_series[:10])
+                _late_mem  = _safe_mean(attack_mem_series[-10:])
+                mem_accumulating = (_late_mem - _early_mem) > max(5.0, 0.1 * _early_mem)
+
+            is_accumulating = cpu_accumulating or mem_accumulating
+
+            # Symmetric rate normalization: scale benign delta by the ratio of
+            # attack throughput to benign throughput so the comparison is per unit
+            # of work, not per unit of time.  Skipped when accumulation is detected
+            # or when work unit types are incompatible (apples-to-oranges).
+            attack_rate      = attack_metrics.get("work_rate", 0) or 0
+            benign_rate      = benign_metrics.get("work_rate", 0) or 0
+            attack_unit_type = attack_metrics.get("work_unit_type", "")
+            benign_unit_type = benign_metrics.get("work_unit_type", "")
+            units_compatible = _work_units_compatible(attack_unit_type, benign_unit_type)
+
+            rate_ratio       = 1.0
+            rate_note        = ""
+            skip_norm_reason = ""
+            if is_accumulating:
+                skip_norm_reason = "accumulating"
+            elif not units_compatible:
+                skip_norm_reason = "incompatible_units"
+            elif attack_rate <= 0 or benign_rate <= 0:
+                skip_norm_reason = "missing_rate"
+            else:
                 rate_ratio = attack_rate / benign_rate
-                benign_delta_norm = benign_delta * rate_ratio
+
+            benign_ratio_raw = round(benign_delta / attack_delta, 3)
+            benign_delta_norm = benign_delta * rate_ratio
+            benign_ratio_normalized = round(benign_delta_norm / attack_delta, 3)
+            throughput_impact = round(rate_ratio, 3)
+
+            if rate_ratio != 1.0:
                 rate_note = (f" [rate-normalized: attack={attack_rate}/s "
                              f"benign={benign_rate}/s x{rate_ratio:.2f}]")
-            else:
-                benign_delta_norm = benign_delta
-                if is_accumulating:
-                    rate_note = " [accumulating — rate normalization skipped]"
+            elif skip_norm_reason:
+                rate_note = f" [normalization skipped: {skip_norm_reason}]"
 
-            benign_ratio = round(benign_delta_norm / attack_delta, 3)
+            benign_ratio = benign_ratio_normalized  # decision uses normalized value
 
-            p2d_phase["idle_cpu_pct"]       = round(idle_cpu, 2)
-            p2d_phase["attack_cpu_pct"]     = round(attack_cpu, 2)
-            p2d_phase["benign_cpu_pct"]     = round(benign_cpu, 2)
-            p2d_phase["attack_delta_pp"]    = round(attack_delta, 2)
-            p2d_phase["benign_delta_pp"]    = round(benign_delta, 2)
-            p2d_phase["benign_delta_norm"]  = round(benign_delta_norm, 2)
-            p2d_phase["attack_rate"]        = attack_rate
-            p2d_phase["benign_rate"]        = benign_rate
-            p2d_phase["rate_ratio"]         = round(rate_ratio, 3)
-            p2d_phase["is_accumulating"]    = is_accumulating
-            p2d_phase["benign_ratio"]       = benign_ratio
+            p2d_phase["idle_cpu_pct"]            = round(idle_cpu, 2)
+            p2d_phase["attack_cpu_pct"]          = round(attack_cpu, 2)
+            p2d_phase["benign_cpu_pct"]          = round(benign_cpu, 2)
+            p2d_phase["attack_delta_pp"]         = round(attack_delta, 2)
+            p2d_phase["benign_delta_pp"]         = round(benign_delta, 2)
+            p2d_phase["benign_delta_norm"]       = round(benign_delta_norm, 2)
+            p2d_phase["attack_rate"]             = attack_rate
+            p2d_phase["benign_rate"]             = benign_rate
+            p2d_phase["rate_ratio"]              = round(rate_ratio, 3)
+            p2d_phase["attack_unit_type"]        = attack_unit_type
+            p2d_phase["benign_unit_type"]        = benign_unit_type
+            p2d_phase["units_compatible"]        = units_compatible
+            p2d_phase["cpu_accumulating"]        = cpu_accumulating
+            p2d_phase["mem_accumulating"]        = mem_accumulating
+            p2d_phase["is_accumulating"]         = is_accumulating
+            p2d_phase["benign_ratio_raw"]        = benign_ratio_raw
+            p2d_phase["benign_ratio_normalized"] = benign_ratio_normalized
+            p2d_phase["throughput_impact"]       = throughput_impact
+            p2d_phase["benign_ratio"]            = benign_ratio
             print(f"[verifier:{_run_id}] Phase 2d benign_ratio={benign_ratio:.3f} "
-                  f"(attack+{attack_delta:.1f}pp  benign+{benign_delta:.1f}pp"
-                  f"  idle={idle_cpu:.1f}%{rate_note})")
+                  f"(raw={benign_ratio_raw:.3f} attack+{attack_delta:.1f}pp "
+                  f"benign+{benign_delta:.1f}pp idle={idle_cpu:.1f}%{rate_note})")
 
             if benign_ratio >= _BENIGN_DOWNGRADE_RATIO:
                 # Attack overhead is not distinguishable from normal protocol work.
