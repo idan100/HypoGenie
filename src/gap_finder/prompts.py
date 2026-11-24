@@ -48,6 +48,31 @@ ANTI-PATTERNS — the critic will reject these, so fix them before outputting:
    Fix: code_location must name the function responsible for admission/rate-limiting, the upstream
    caller that could reject the frame before the handler is invoked.
 
+CWE CLASSIFICATION — for each finding, populate the `cwes` field with the applicable CWE
+identifiers that best describe the weakness. Use the following reference:
+
+- CWE-400 Uncontrolled Resource Consumption — no limit on connections, streams, or operations
+- CWE-401 Missing Release of Memory — memory allocated but never freed; grows without bound
+- CWE-407 Algorithmic Complexity / ReDoS — parsing cost grows super-linearly with attacker input
+- CWE-409 Decompression Bomb — compressed input expands to exhaust memory/CPU
+- CWE-410 Insufficient Resource Pool — thread/worker pool exhausted by concurrent requests
+- CWE-664 Improper Control of Resource Lifetime — resource lifecycle not managed correctly
+- CWE-674 Uncontrolled Recursion — recursive parsing with no depth bound
+- CWE-706 Incorrect Behavior Order — operations performed out of expected sequence
+- CWE-770 Allocation Without Limits — data structure grows without an upper bound
+- CWE-771 Missing Release of File Descriptor — FD or handle not released on teardown
+- CWE-772 Missing Release of Resource — socket/buffer/timer not freed after use
+- CWE-776 Improper Restriction of Recursive References — entity expansion without cap
+- CWE-779 Recording Sensitive Information in Log File — excessive disk writes
+- CWE-789 Memory Allocation with Excessive Size — single allocation too large
+- CWE-834 Excessive Iteration — loop runs far more times than the attacker's input warrants
+- CWE-835 Loop with Unreachable Exit Condition — infinite loop via crafted message
+- CWE-1050 Excessive Platform Resource Consumption — CPU burn from high-frequency work
+- CWE-1333 Inefficient Regular Expression Complexity — catastrophic backtracking
+
+Assign 1–3 CWEs per finding. Prefer the most specific applicable entry. For a finding that
+fits both CWE-400 and CWE-770, include both.
+
 Output JSON with this structure:
 {
   "assumption_verdicts": [
@@ -67,7 +92,8 @@ Output JSON with this structure:
       "invariant_description": "only for ImplementationInvariantViolation",
       "code_location": "file.go:142",
       "code_snippet": "verbatim code",
-      "relevant_to_assumption": "A1"
+      "relevant_to_assumption": "A1",
+      "cwes": ["CWE-400", "CWE-770"]
     }
   ]
 }"""

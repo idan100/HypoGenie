@@ -22,6 +22,14 @@ VALID_DOS_CLASSES = {
                              #   (high-rate) because a single message suffices
     "disk_exhaustion",       # CWE-779 — trigger excessive logging or file writes to fill the
                              #   server's disk, causing crashes or write failures
+    "resource_lifecycle",    # CWE-401, CWE-772 — resource not properly released on connection
+                             #   teardown or cancellation; accumulates across requests
+    "missing_throttling",    # CWE-770, CWE-307 — absent rate limit on a computationally
+                             #   expensive operation; attacker can invoke it without bound
+    "state_machine_abuse",   # CWE-706, CWE-394 — crafted message sequence drives the server
+                             #   state machine to unexpected states, consuming CPU or memory
+    "excessive_iteration",   # CWE-834, CWE-400 — attacker-controlled input causes the server
+                             #   to iterate N times proportional to input size with no cap
 }
 
 VALID_NECESSITY = {"required", "favorable"}

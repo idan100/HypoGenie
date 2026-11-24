@@ -19,6 +19,11 @@ class ComplianceGap:
     gap_description: str    # what spec requires vs what code does
     code_location: str      # file:line where enforcement is missing
     code_snippet: str       # surrounding code for context
+    cwes: list[str] = None  # applicable CWE identifiers, e.g. ["CWE-400", "CWE-770"]
+
+    def __post_init__(self):
+        if self.cwes is None:
+            self.cwes = []
 
 
 @dataclass
@@ -28,6 +33,11 @@ class SecurityDesignGap:
     gap_description: str    # what defensive measure is absent
     code_location: str      # file:line of the unguarded code path
     code_snippet: str
+    cwes: list[str] = None  # applicable CWE identifiers
+
+    def __post_init__(self):
+        if self.cwes is None:
+            self.cwes = []
 
 
 @dataclass
@@ -37,6 +47,11 @@ class ImplementationInvariantViolation:
     invariant_description: str   # property that must hold for safe operation
     code_location: str           # file:line where invariant is absent
     code_snippet: str
+    cwes: list[str] = None       # applicable CWE identifiers
+
+    def __post_init__(self):
+        if self.cwes is None:
+            self.cwes = []
 
 
 Finding = Union[ComplianceGap, SecurityDesignGap, ImplementationInvariantViolation]

@@ -224,6 +224,7 @@ def _parse_developer_output(raw: str, ctx, spec_reqs) -> tuple[list[AssumptionVe
 
         code_loc = f.get("code_location", "")
         code_snip = f.get("code_snippet", "")
+        cwes = [c for c in f.get("cwes", []) if isinstance(c, str) and c.startswith("CWE-")]
 
         if ftype == "ComplianceGap" and req:
             findings.append(ComplianceGap(
@@ -231,6 +232,7 @@ def _parse_developer_output(raw: str, ctx, spec_reqs) -> tuple[list[AssumptionVe
                 gap_description=f.get("gap_description", ""),
                 code_location=code_loc,
                 code_snippet=code_snip,
+                cwes=cwes,
             ))
         elif ftype == "SecurityDesignGap" and req:
             findings.append(SecurityDesignGap(
@@ -238,6 +240,7 @@ def _parse_developer_output(raw: str, ctx, spec_reqs) -> tuple[list[AssumptionVe
                 gap_description=f.get("gap_description", ""),
                 code_location=code_loc,
                 code_snippet=code_snip,
+                cwes=cwes,
             ))
         elif ftype == "ImplementationInvariantViolation" and req:
             findings.append(ImplementationInvariantViolation(
@@ -246,6 +249,7 @@ def _parse_developer_output(raw: str, ctx, spec_reqs) -> tuple[list[AssumptionVe
                                            f.get("gap_description", "")),
                 code_location=code_loc,
                 code_snippet=code_snip,
+                cwes=cwes,
             ))
 
     return verdicts, findings
