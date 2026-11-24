@@ -127,6 +127,40 @@ Given a target server product, version, and entry point (protocol + port), gener
      httpd_config.conf causes startup failure.
   2. Set config = "" and config_path = "" (no config file mount).
   3. ports = "443:443/tcp 443:443/udp" (OLS binds the same port for both HTTPS/HTTP2 and QUIC).
+- **envoy** / **envoyproxy/envoy** (envoyproxy/envoy:*): Official Envoy Proxy Docker image.
+  1. config_path = /etc/envoy/envoy.yaml
+  2. Use YAML format (Envoy bootstrap v3 API). DO NOT add `alpn_protocols` anywhere in the
+     TLS config — it is NOT a valid field in DownstreamTlsContext or CommonTlsContext in
+     Envoy v1.x; Envoy negotiates h2 automatically when codec_type is HTTP2.
+  3. For TLS + HTTP/2, use exactly this filter_chain structure:
+     ```
+     filter_chains:
+     - transport_socket:
+         name: envoy.transport_sockets.tls
+         typed_config:
+           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+           common_tls_context:
+             tls_certificates:
+             - certificate_chain: { filename: "/certs/server.crt" }
+               private_key: { filename: "/certs/server.key" }
+             alpn_protocols: ["h2"]
+       filters:
+       - name: envoy.filters.network.http_connection_manager
+         typed_config:
+           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+           codec_type: HTTP2
+           stat_prefix: ingress_http
+           route_config:
+             name: local_route
+             virtual_hosts:
+             - name: local_service
+               domains: ["*"]
+               routes:
+               - match: { prefix: "/" }
+                 direct_response: { status: 200, body: { inline_string: "ok" } }
+     ```
+  4. Always include an admin block: `admin: { address: { socket_address: { address: 0.0.0.0, port_value: 9901 } } }`
+  5. Set ports to whatever the entry_point states (e.g. "10000:10000/tcp").
 
 ## Output format (JSON only, no other text)
 {
