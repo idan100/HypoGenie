@@ -93,6 +93,312 @@ def _product_from_repo(repo_url: str) -> str:
     return repo_url.rstrip("/").split("/")[-1]
 
 
+def _fmt_phase_thresholds(phase_dict: dict) -> list:
+    td = phase_dict.get("threshold_details", {})
+    out = []
+    if "cpu" in td:
+        c = td["cpu"]
+        icon = "**TRIGGERED** ✓" if c.get("triggered") else "not triggered"
+        out.append(
+            f"- CPU: {c.get('baseline_mean_pct',0):.1f}% → {c.get('attack_mean_pct',0):.1f}% mean"
+            f" (Δ {c.get('delta_pp',0):.1f} pp) | threshold +{c.get('threshold_delta_pp',50)} pp → {icon}"
+        )
+    if "memory" in td:
+        m = td["memory"]
+        icon = "**TRIGGERED** ✓" if m.get("triggered") else "not triggered"
+        out.append(
+            f"- Memory: {m.get('baseline_mean_mb',0):.1f} MB → {m.get('attack_peak_mb',0):.1f} MB peak"
+            f" (Δ {m.get('delta_mb',0):.1f} MB) | threshold +{m.get('threshold_delta_mb',100)} MB → {icon}"
+        )
+    if "latency" in td:
+        l = td["latency"]
+        icon = "**TRIGGERED** ✓" if l.get("triggered") else "not triggered"
+        out.append(
+            f"- Latency: {l.get('baseline_mean_ms',0):.1f} ms → {l.get('attack_mean_ms',0):.1f} ms"
+            f" ({l.get('ratio',1):.1f}×) | threshold {l.get('threshold_ratio',5)}× → {icon}"
+        )
+    if "unreachable" in td:
+        u = td["unreachable"]
+        icon = "**TRIGGERED** ✓" if u.get("triggered") else "not triggered"
+        out.append(
+            f"- Unreachable: {u.get('max_consecutive_down_s',0)}s consecutive"
+            f" | threshold {u.get('threshold_s',3)}s → {icon}"
+        )
+    return out
+
+
+def _report_confirmed(lines, ctx, plan, verify_result, verdicts, findings, triggered, phases):
+    lines.append("## Weakness Found\n")
+
+    # Finding
+    if findings:
+        f = findings[0]
+        req = f.requirement if hasattr(f, 'requirement') else {}
+        lines.append("### Vulnerability")
+        lines.append(f"- **Type:** {type(f).__name__} — RFC {getattr(req, 'rfc', '?')} §{getattr(req, 'section', '?')} ({getattr(req, 'classification', '?')})")
+        lines.append(f"- **Location:** `{getattr(f, 'code_location', '?')}`")
+        desc = getattr(f, 'gap_description', None) or getattr(f, 'invariant_description', None) or getattr(req, 'dos_mechanism', '')
+        if desc:
+            lines.append(f"- **Description:** {desc}")
+        snippet = getattr(f, 'code_snippet', '')
+        if snippet:
+            lines.append(f"\n```\n{snippet.strip()}\n```")
+        lines.append("")
+
+    # Assumptions table
+    if verdicts:
+        # Build necessity lookup from ctx if available
+        necessity_map = {}
+        if ctx and hasattr(ctx, "assumptions"):
+            for a in ctx.assumptions:
+                necessity_map[a.id] = getattr(a, "necessity", "—")
+        lines.append("### Assumptions")
+        lines.append("")
+        lines.append("| ID | Necessity | Status | Evidence |")
+        lines.append("|----|-----------|--------|----------|")
+        for v in verdicts:
+            ev = (v.code_evidence or "").replace("|", "\\|")
+            nec = necessity_map.get(v.assumption_id, "—")
+            lines.append(f"| {v.assumption_id} | {nec} | {v.status} | {ev} |")
+        lines.append("")
+
+    # Find phases
+    baseline_ph = next((p for p in phases if p.get("phase") == "baseline"), {})
+    attack_ph   = next((p for p in phases if p.get("phase") == "attack"), {})
+    control_ph  = next((p for p in phases if p.get("phase") == "control"), {})
+    benign_ph   = next((p for p in phases if p.get("phase") == "benign"), {})
+    repeat_ph   = next((p for p in phases if p.get("phase") == "repeatability"), {})
+
+    # Exploit summary
+    exploit_summary = attack_ph.get("exploit_summary", "")
+    if exploit_summary:
+        lines.append("### Exploit")
+        summary_line = exploit_summary.split("\n")[0]
+        lines.append(f"{summary_line}")
+        lines.append("")
+
+    lines.append("### Attack Evidence")
+    lines.append("")
+    lines.append(f"**Phase 2 — Attack ({attack_ph.get('duration_s', 30)}s)**")
+    for tl in _fmt_phase_thresholds(attack_ph):
+        lines.append(tl)
+    lines.append("")
+
+    # Attribution
+    if control_ph:
+        diff = control_ph.get("differential", {})
+        attr = diff.get("attributed", False)
+        ratio = diff.get("cpu_ratio", None)
+        tls_pp = diff.get("expected_tls_cpu_pp", 0)
+        conn_rate = diff.get("attack_conn_rate", 0)
+        icon = "**attributed to application layer** ✓" if attr else "NOT attributed (transport overhead)"
+        lines.append("**Phase 2c — Differential Attribution**")
+        if ratio is not None:
+            lines.append(f"- Target CPU delta: +{diff.get('cpu_delta_target',0):.1f} pp | Control CPU delta: +{diff.get('cpu_delta_control',0):.1f} pp")
+            lines.append(f"- CPU ratio (control/target): {ratio:.2f} (< 0.50 reject threshold) → {icon}")
+        if tls_pp is not None:
+            lines.append(f"- TLS overhead: {tls_pp:.1f} pp at {conn_rate:.1f} conn/s — {'negligible' if tls_pp < 5 else 'significant'}")
+        lines.append("")
+
+    if benign_ph:
+        ratio = benign_ph.get("benign_ratio", None)
+        outcome = benign_ph.get("outcome", "")
+        if ratio is not None:
+            lines.append(f"**Phase 2d — Benign Traffic Comparison:** attack/benign ratio = {ratio:.2f} ({outcome})")
+            lines.append("")
+
+    lines.append(f"**Phase 3 — Repeatability**")
+    for tl in _fmt_phase_thresholds(repeat_ph):
+        lines.append(tl)
+    r_outcome = repeat_ph.get("outcome", "confirmed")
+    lines.append(f"→ **{r_outcome.upper()}**")
+    lines.append("")
+
+
+def _report_infeasible(lines, ctx, verdicts, findings, notes):
+    lines.append("## Why No Weakness\n")
+    lines.append("**Stopped at:** Stage 4 — Gap Finder\n")
+    lines.append(
+        "All required assumptions for the attack were refuted by code analysis. "
+        "Exploit execution was skipped.\n"
+    )
+
+    if verdicts:
+        necessity_map = {}
+        if ctx and hasattr(ctx, "assumptions"):
+            for a in ctx.assumptions:
+                necessity_map[a.id] = getattr(a, "necessity", "—")
+        lines.append("### Assumption Analysis")
+        lines.append("")
+        lines.append("| ID | Necessity | Status | Evidence |")
+        lines.append("|----|-----------|--------|----------|")
+        for v in verdicts:
+            ev = (v.code_evidence or "").replace("|", "\\|")
+            nec = necessity_map.get(v.assumption_id, "—")
+            lines.append(f"| {v.assumption_id} | {nec} | {v.status} | {ev} |")
+        lines.append("")
+
+    lines.append("### Deduction")
+    lines.append(
+        "The prerequisite conditions for the attack do not hold in this implementation. "
+        "The code enforces the invariant(s) the hypothesis assumed were absent. "
+        "This is a true negative: the implementation is not vulnerable to this specific attack vector."
+    )
+    lines.append("")
+
+
+def _report_no_dos(lines, ctx, plan, verdicts, findings, phases, notes):
+    lines.append("## Why No Weakness\n")
+
+    attack_ph = next((p for p in phases if p.get("phase") == "attack"), {})
+    escalated = attack_ph.get("escalated", False)
+
+    if attack_ph:
+        label = "Phase 2 — Attack (escalated)" if escalated else "Phase 2 — Attack"
+        dur = attack_ph.get("escalated_duration_s", attack_ph.get("duration_s", 30))
+        lines.append(f"**Stopped at:** {label} ({dur}s) — no thresholds crossed\n")
+        lines.append(f"**Exploit summary:** {attack_ph.get('exploit_summary', '').split(chr(10))[0]}\n")
+        lines.append(f"**Threshold results:**")
+        for tl in _fmt_phase_thresholds(attack_ph):
+            lines.append(tl)
+        lines.append("")
+    else:
+        lines.append(f"**Notes:** {notes}\n")
+
+    if findings:
+        f = findings[0]
+        req = f.requirement if hasattr(f, 'requirement') else {}
+        lines.append("### Code Gap")
+        lines.append(f"The gap at `{getattr(f, 'code_location', '?')}` exists in the implementation but did not produce measurable resource exhaustion.")
+        lines.append("")
+
+    lines.append("### Deduction")
+    lines.append(
+        "The attack executed successfully but the server absorbed the load without crossing any DoS threshold. "
+        "Possible reasons: the gap is mitigated by OS-level scheduling or connection limits; "
+        "the attack rate was insufficient; or the vulnerability requires higher concurrency than tested. "
+        "This does not prove the code is safe — it means this specific attack parameterization is insufficient."
+    )
+    lines.append("")
+
+
+def _report_inconclusive(lines, ctx, plan, verdicts, findings, phases, notes):
+    lines.append("## Why Result Is Ambiguous\n")
+
+    attack_ph  = next((p for p in phases if p.get("phase") == "attack"), {})
+    control_ph = next((p for p in phases if p.get("phase") == "control"), {})
+
+    if attack_ph:
+        lines.append("**Phase 2 — Attack triggered resource increase:**")
+        for tl in _fmt_phase_thresholds(attack_ph):
+            lines.append(tl)
+        lines.append("")
+
+    if control_ph:
+        diff = control_ph.get("differential", {})
+        ratio = diff.get("cpu_ratio", None)
+        transport = diff.get("transport_overhead_confirmed", False)
+        lines.append("**Phase 2c — Attribution was ambiguous:**")
+        if ratio is not None:
+            lines.append(f"- CPU ratio (control/target): {ratio:.2f}")
+            if ratio < 0.50:
+                lines.append("  → Below 0.50 reject threshold (should be attributed) — check phase notes")
+            elif ratio < 0.80:
+                lines.append("  → Between 0.50 (reject) and 0.80 (confirm) → **ambiguous zone**")
+            else:
+                lines.append("  → Above 0.80 confirm threshold → transport overhead confirmed, not the vulnerability")
+        if transport:
+            lines.append("- Transport overhead confirmed: CPU increase explained by I/O volume, not the specific mechanism")
+        lines.append("")
+
+    lines.append(f"**Notes:** {notes}\n")
+
+    lines.append("### Deduction")
+    lines.append(
+        "The attack causes measurable CPU increase, but the differential test cannot determine whether "
+        "it originates from the specific vulnerability mechanism or from generic transport overhead. "
+        "To resolve: (1) add a matched benign-load control at the same throughput; "
+        "(2) profile with pprof to isolate the hot path; "
+        "(3) reduce attack rate until transport overhead is negligible and check if effect persists."
+    )
+    lines.append("")
+
+
+def _report_env_error(lines, notes):
+    lines.append("## Pipeline Error\n")
+    lines.append(f"**Stopped at:** Environment setup\n")
+    lines.append(f"**Error:** {notes}\n")
+    lines.append("### Deduction")
+    lines.append(
+        "The pipeline did not complete due to an infrastructure error (Docker, network, cert, or build failure). "
+        "No conclusion about vulnerability presence can be drawn. Fix the environment issue and re-run."
+    )
+    lines.append("")
+
+
+def _write_run_report(
+    out_dir: Path,
+    ctx,
+    plan,
+    verify_result: dict,
+    verdicts: list,
+    findings: list,
+    pipeline_log: list,
+) -> None:
+    verdict  = verify_result.get("verdict", "UNKNOWN")
+    notes    = verify_result.get("notes", "")
+    phases   = verify_result.get("phases", [])
+    triggered = verify_result.get("triggered", [])
+
+    emoji = {
+        "CONFIRMED_DOS":    "✓",
+        "NO_DOS_EFFECT":    "✗",
+        "INCONCLUSIVE":     "⚠",
+        "INFEASIBLE":       "✗",
+        "ENVIRONMENT_ERROR":"✗",
+        "DEFECT":           "✗",
+        "REJECTED":         "✗",
+    }.get(verdict, "?")
+
+    lines = [
+        "# HypoGenie Run Report", "",
+        f"**Run ID:** {run_id}",
+        f"**Date:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        f"**Verdict:** {verdict} {emoji}",
+        "", "---", "",
+    ]
+
+    if ctx:
+        lines += [
+            "## Target", "",
+            f"- **Repo:** {ctx.repo_url} @ {ctx.version}",
+            f"- **Protocol:** {ctx.protocol}",
+            f"- **DoS class:** {ctx.dos_class}",
+            "", "---", "",
+        ]
+
+    # Pipeline table
+    lines += ["## Pipeline", "", "| Stage | Status | Detail |", "|-------|--------|--------|"]
+    for s in pipeline_log:
+        icon = {"ok": "✓", "warn": "⚠", "skipped": "—", "failed": "✗"}.get(s["status"], "?")
+        lines.append(f"| {s['stage']}. {s['name']} | {icon} {s['status'].upper()} | {s['detail']} |")
+    lines += ["", "---", ""]
+
+    if verdict == "CONFIRMED_DOS":
+        _report_confirmed(lines, ctx, plan, verify_result, verdicts, findings, triggered, phases)
+    elif verdict == "INFEASIBLE":
+        _report_infeasible(lines, ctx, verdicts, findings, notes)
+    elif verdict == "NO_DOS_EFFECT":
+        _report_no_dos(lines, ctx, plan, verdicts, findings, phases, notes)
+    elif verdict == "INCONCLUSIVE":
+        _report_inconclusive(lines, ctx, plan, verdicts, findings, phases, notes)
+    else:
+        _report_env_error(lines, notes)
+
+    (out_dir / "run_report.md").write_text("\n".join(lines))
+    print(f"  [hypogenie:{run_id}] Run report written.")
+
+
 def _write_disclosure_draft(out_dir: Path, ctx, plan, result: dict) -> None:
     triggered = result.get("triggered", [])
     attack = result.get("attack", {})
@@ -224,7 +530,8 @@ def _serialize_lifecycle(r: "LifecycleResult | None") -> dict | None:
 
 def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
                    verdicts: list, findings: list,
-                   lifecycle_result: "LifecycleResult | None" = None) -> None:
+                   lifecycle_result: "LifecycleResult | None" = None,
+                   pipeline_log: "list | None" = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Collect token usage from llm_client accumulator
@@ -363,6 +670,9 @@ def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
     if verify_result["verdict"] == Verdict.CONFIRMED_DOS:
         _write_disclosure_draft(out_dir, ctx, plan, verify_result)
 
+    _write_run_report(out_dir, ctx, plan, verify_result, verdicts, findings,
+                      pipeline_log=pipeline_log or [])
+
     print(f"  [hypogenie:{run_id}] Outputs in {out_dir}")
 
 
@@ -386,22 +696,29 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
     verdicts: list = []
     findings: list = []
     lifecycle_result: "LifecycleResult | None" = None
+    pipeline_log: list = []
 
     try:
         # ── 1. YAML Parser ─────────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [1/7] YAML Parser ...")
         ctx = parse(yaml_path)
         print(f"  target={ctx.repo_url}@{ctx.version}, protocol={ctx.protocol}")
+        pipeline_log.append({"stage": "1/7", "name": "YAML Parser", "status": "ok",
+                              "detail": f"{ctx.repo_url}@{ctx.version} | {ctx.protocol}"})
 
         # ── 2. Clone repo (for Gap Finder) ─────────────────────────────────────
         print(f"[hypogenie:{_id}] [2/7] Clone target repo ...")
         repo_dest = _WORKSPACE / _id / "target"
         repo_dir = _clone_repo(ctx.repo_url, ctx.version, repo_dest)
+        pipeline_log.append({"stage": "2/7", "name": "Clone Repo", "status": "ok",
+                              "detail": str(repo_dest)})
 
         # ── 3. Spec Processor ──────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [3/7] Spec Processor ...")
         spec_reqs = spec_run(ctx)
         print(f"  extracted {len(spec_reqs)} spec requirements")
+        pipeline_log.append({"stage": "3/7", "name": "Spec Processor", "status": "ok",
+                              "detail": f"{len(spec_reqs)} requirements extracted"})
 
         # ── 4. Gap Finder ──────────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [4/7] Gap Finder ...")
@@ -421,11 +738,22 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         all_required_refuted = bool(all_required) and set(required_refuted) == set(all_required)
         if all_required_refuted:
             print(f"[hypogenie:{_id}] All required assumptions refuted → INFEASIBLE")
+            pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "failed",
+                                  "detail": f"INFEASIBLE — required assumptions refuted: {required_refuted}"})
+            for name in ("5/7 Exploit Planner", "6/7 Builder", "7/7 DoS Verifier"):
+                n, lbl = name.split(" ", 1)
+                pipeline_log.append({"stage": n, "name": lbl, "status": "skipped",
+                                     "detail": "Skipped (INFEASIBLE)"})
             result = {"verdict": Verdict.INFEASIBLE, "baseline": {}, "attack": {},
                       "attack2": {}, "triggered": [], "phases": [], "thresholds_config": {},
                       "notes": f"Refuted: {required_refuted}"}
-            _write_outputs(out_dir, ctx, None, result, verdicts, findings)
+            _write_outputs(out_dir, ctx, None, result, verdicts, findings,
+                           pipeline_log=pipeline_log)
             return result
+
+        n_confirmed = sum(1 for v in verdicts if v.status == "confirmed")
+        pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "ok",
+                              "detail": f"{len(findings)} finding(s), {n_confirmed}/{len(verdicts)} assumptions confirmed"})
 
         # ── 4b. Lifecycle applicability assessment ─────────────────────────────
         # Runs after Gap Finder (findings are inputs) and before Exploit Planner
@@ -451,6 +779,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         print(f"[hypogenie:{_id}] [5/7] Exploit Planner ...")
         plan = plan_run(ctx, verdicts, findings)
         print(f"  severity={plan.severity} steps={len(plan.attack_sequence)}")
+        pipeline_log.append({"stage": "5/7", "name": "Exploit Planner", "status": "ok",
+                              "detail": f"severity={plan.severity}, {len(plan.attack_sequence)} steps"})
 
         # Re-score lifecycle applicability with plan signals now available
         if lc_mode is not LifecycleMode.DISABLED and lc_plan is None:
@@ -481,6 +811,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         port           = _port_from_entry_point(ctx.entry_point)
         host           = "localhost"
         print(f"  container={container_id[:12]} port={port}")
+        pipeline_log.append({"stage": "6/7", "name": "Builder", "status": "ok",
+                              "detail": f"container={container_id[:12]}, port={port}"})
 
         # wait for server to come up
         time.sleep(4)
@@ -515,6 +847,11 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
 
         verdict = verify_result["verdict"]
         print(f"\n[hypogenie:{_id}] *** VERDICT: {verdict} ***\n")
+        verifier_status = "ok" if verdict == Verdict.CONFIRMED_DOS else (
+            "warn" if verdict == Verdict.INCONCLUSIVE else "failed"
+        )
+        pipeline_log.append({"stage": "7/7", "name": "DoS Verifier", "status": verifier_status,
+                              "detail": verdict})
 
         # ── 7b. Lifecycle Validation (runs after verifier, separate containers) ──
         if lc_plan is not None:
@@ -529,20 +866,22 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             lifecycle_result = runner.run()
 
         _write_outputs(out_dir, ctx, plan, verify_result, verdicts, findings,
-                       lifecycle_result=lifecycle_result)
+                       lifecycle_result=lifecycle_result, pipeline_log=pipeline_log)
         return verify_result
 
     except Exception as e:
         import traceback
         print(f"[hypogenie:{_id}] ERROR: {e}")
         traceback.print_exc()
+        pipeline_log.append({"stage": "?", "name": "Error", "status": "failed",
+                             "detail": str(e)[:120]})
         result = {"verdict": Verdict.ENVIRONMENT_ERROR, "baseline": {}, "attack": {},
                   "attack2": {}, "triggered": [], "phases": [], "thresholds_config": {},
                   "notes": str(e)}
         try:
             _write_outputs(out_dir, ctx if 'ctx' in dir() else None,
                            plan if 'plan' in dir() else None, result, verdicts, findings,
-                           lifecycle_result=lifecycle_result)
+                           lifecycle_result=lifecycle_result, pipeline_log=pipeline_log)
         except Exception:
             pass
         return result

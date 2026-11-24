@@ -9,6 +9,8 @@ cvelist/
 share/
 shared/
 
+security_validation/
+
 *volumes/
 
 src/simulation_environments/*
