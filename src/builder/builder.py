@@ -313,8 +313,23 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
     print(f"  [builder:{_run_id}] Server config written to {conf_file}")
 
     # Build docker run command
+    # For QUIC/HTTP3 targets the server binds the same port number on both TCP
+    # and UDP (TCP for HTTPS fallback / ALPN, UDP for QUIC datagrams).  If only
+    # the UDP mapping was returned by the Setup Developer, add the matching TCP
+    # mapping so the container can accept connections on both transports.
+    raw_ports = setup["ports"]
+    if protocol.upper().startswith("QUIC"):
+        existing = set(raw_ports.split())
+        extras = []
+        for m in list(existing):
+            if m.endswith("/udp"):
+                tcp_equiv = m[:-4] + "/tcp"
+                if tcp_equiv not in existing:
+                    extras.append(tcp_equiv)
+        if extras:
+            raw_ports = raw_ports + " " + " ".join(extras)
     port_args = []
-    for mapping in setup["ports"].split():
+    for mapping in raw_ports.split():
         port_args += ["-p", mapping]
 
     certs_dir = str(_CERTS_DIR)
