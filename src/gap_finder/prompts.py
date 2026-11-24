@@ -8,79 +8,159 @@ You have access to three tools:
 - list_dir(path): list directory contents
 - search_code(query, file_pattern, path): grep for a pattern in source files
 
-For each SpecRequirement:
-- Trace the code path where the requirement SHOULD be enforced
-- Identify if enforcement exists or is absent
-- Classify the finding (ComplianceGap, SecurityDesignGap, ImplementationInvariantViolation)
+─────────────────────────────────────────────────────────────────────────────
+INVESTIGATION PRIORITY — ALL ASSUMPTIONS ARE EQUAL
+─────────────────────────────────────────────────────────────────────────────
+necessity=required, necessity=favorable, and necessity=optional are attack-
+path categories, NOT investigation priority.  Every assumption — required or
+favorable — must be investigated with identical effort and evidence standards.
+Skipping or deprioritizing a favorable assumption is a critical failure.
 
-For each Assumption:
-- Read the relevant code and determine: confirmed | refuted | unclear
-- Cite verbatim code snippets and file:line references
-- VERDICT SEMANTICS for absence/unbounded assumptions:
-  * If the assumption states something IS present (e.g., "recvBuffer is unbounded"):
-    "confirmed" = you found code proving it; "refuted" = code has a cap/limit
-  * If the assumption states something IS ABSENT (e.g., "no rate limit", "no cap"):
-    "confirmed" = you verified the absence (no such check exists); "refuted" = you found such a check
-  * Finding a comment or symbol name that says "unbounded" or "no limit" CONFIRMS an absence assumption
-    — it does NOT refute it
+For compound assumptions (assumptions that make multiple independent claims):
+  1. Identify each atomic claim.
+  2. Run separate targeted searches for each claim.
+  3. Assign SUPPORTED only when ALL atomic claims are confirmed by evidence.
+  4. If any claim has contradicting evidence, assign CONFLICTING_EVIDENCE with
+     reasoning identifying which sub-claim failed.
 
-CRITICAL EVIDENCE RULES:
-- A ComplianceGap requires the CALL SITE where enforcement should occur, not just the absence of a constant
-- A SecurityDesignGap requires the UNGUARDED code path, not just the existence of vulnerable behavior
-- An ImplementationInvariantViolation requires the ABSENCE of a bound/check — showing a present check is wrong
-- Constant definitions, function signatures in isolation, and comments are NOT evidence of behavior
+─────────────────────────────────────────────────────────────────────────────
+ASSUMPTION STATUS VOCABULARY
+─────────────────────────────────────────────────────────────────────────────
+Use exactly one of these values for each assumption:
+
+  SUPPORTED            — Direct source-code or documentation evidence confirms
+                         the claim.  supporting_evidence must contain at least
+                         one verbatim file:line snippet.
+
+  REFUTED              — Direct evidence contradicts the claim.
+                         contradicting_evidence must contain at least one
+                         verbatim file:line snippet.
+
+  CONFLICTING_EVIDENCE — You found both supporting and contradicting evidence.
+                         Both arrays must be non-empty.  reasoning must explain
+                         which evidence is stronger and why.
+
+  UNVERIFIED           — You attempted at least one targeted search but found
+                         no conclusive evidence.  searches_attempted must list
+                         every query you ran.  Do NOT output UNVERIFIED without
+                         populating searches_attempted.
+
+  INDETERMINATE        — The assumption cannot be resolved with available
+                         investigation means (e.g., the relevant code is
+                         generated at runtime, minified, or behind a network
+                         boundary).  suggested_validation must describe what
+                         investigation would settle the question.
+
+  AMBIGUOUS            — The assumption wording is too vague to verify or
+                         refute.  reasoning must explain the ambiguity.
+
+  NOT_APPLICABLE       — The assumption does not apply to this target/version
+                         (e.g., the feature it assumes is absent entirely).
+                         reasoning must explain why.
+
+  NOT_STATED           — Do NOT use this value.  It is a pipeline placeholder;
+                         every assumption you receive must receive one of the
+                         above statuses.
+
+ORDERING RULE: Attempt SUPPORTED or REFUTED first.  Escalate to
+CONFLICTING_EVIDENCE when you find genuine contradictory evidence.
+Escalate to UNVERIFIED only after at least two targeted searches fail.
+Escalate to INDETERMINATE only when further investigation is structurally
+impossible.  Never jump to UNVERIFIED or INDETERMINATE without trying.
+
+─────────────────────────────────────────────────────────────────────────────
+VERDICT SEMANTICS — absence vs. presence assumptions
+─────────────────────────────────────────────────────────────────────────────
+  * If assumption says something IS present (e.g. "recvBuffer is unbounded"):
+      SUPPORTED = you found code proving it
+      REFUTED   = code has a cap or limit
+  * If assumption says something IS ABSENT (e.g. "no rate limit"):
+      SUPPORTED = you verified the absence (no such check exists)
+      REFUTED   = you found the check
+  * A comment saying "unbounded" or "no limit" CONFIRMS an absence assumption —
+    it does not refute it.
+
+─────────────────────────────────────────────────────────────────────────────
+EVIDENCE RULES
+─────────────────────────────────────────────────────────────────────────────
 - Always cite file:line for every piece of evidence
+- Constant definitions, function signatures in isolation, and comments are
+  NOT evidence of behavior
+- A ComplianceGap requires the CALL SITE where enforcement should occur
+- A SecurityDesignGap requires the UNGUARDED code path
+- An ImplementationInvariantViolation requires the ABSENCE of a bound/check
+- Never fabricate evidence; never treat LLM confidence as proof
 
-ANTI-PATTERNS — the critic will reject these, so fix them before outputting:
+ALTERNATIVE EXPLANATIONS: For each SUPPORTED conclusion, state at least one
+alternative explanation you considered and explain why it does not apply.
+If you cannot rule out an alternative, use CONFLICTING_EVIDENCE instead.
 
-1. ComplianceGap INVERSION: code_snippet contains an if/check that already enforces the stated
-   requirement. If the check exists, that code_snippet proves COMPLIANCE, not a gap.
-   Fix: find the code path that processes the frame WITHOUT the check — that is the unguarded site.
+─────────────────────────────────────────────────────────────────────────────
+ANTI-PATTERNS — the critic will reject these
+─────────────────────────────────────────────────────────────────────────────
+1. ComplianceGap INVERSION: code_snippet contains an if/check that already
+   enforces the stated requirement.  Fix: find the upstream unguarded path.
 
-2. ImplementationInvariantViolation PRESENCE BUG: code_snippet includes a bounds check or rate-limit
-   check that would satisfy the invariant. That check contradicts the finding.
-   Fix: include ONLY the unbounded execution path; strip out any existing limit checks from the snippet.
+2. ImplementationInvariantViolation PRESENCE BUG: code_snippet includes a
+   bounds/limit check that would satisfy the invariant.  Fix: include ONLY
+   the unbounded execution path.
 
-3. SecurityDesignGap LOCATION BUG: code_location is the function that processes the attack (the
-   entry-point handler) rather than the function where the absent defensive measure should be inserted.
-   These are almost always different — the attack entry point is WHERE the vulnerability manifests,
-   not WHERE the fix goes.
-   Fix: code_location must name the function responsible for admission/rate-limiting, the upstream
-   caller that could reject the frame before the handler is invoked.
+3. SecurityDesignGap LOCATION BUG: code_location is the frame-handler
+   function rather than the dispatcher or admission function.
+   Fix: code_location must name the upstream function that SHOULD enforce
+   the admission check.
 
-CWE CLASSIFICATION — for each finding, populate the `cwes` field with the applicable CWE
-identifiers that best describe the weakness. Use the following reference:
+4. UNVERIFIED without searches: If you output UNVERIFIED for any assumption,
+   searches_attempted must list at least two search queries you ran.
 
-- CWE-400 Uncontrolled Resource Consumption — no limit on connections, streams, or operations
-- CWE-401 Missing Release of Memory — memory allocated but never freed; grows without bound
-- CWE-407 Algorithmic Complexity / ReDoS — parsing cost grows super-linearly with attacker input
-- CWE-409 Decompression Bomb — compressed input expands to exhaust memory/CPU
-- CWE-410 Insufficient Resource Pool — thread/worker pool exhausted by concurrent requests
-- CWE-664 Improper Control of Resource Lifetime — resource lifecycle not managed correctly
-- CWE-674 Uncontrolled Recursion — recursive parsing with no depth bound
-- CWE-706 Incorrect Behavior Order — operations performed out of expected sequence
-- CWE-770 Allocation Without Limits — data structure grows without an upper bound
-- CWE-771 Missing Release of File Descriptor — FD or handle not released on teardown
-- CWE-772 Missing Release of Resource — socket/buffer/timer not freed after use
-- CWE-776 Improper Restriction of Recursive References — entity expansion without cap
-- CWE-779 Recording Sensitive Information in Log File — excessive disk writes
-- CWE-789 Memory Allocation with Excessive Size — single allocation too large
-- CWE-834 Excessive Iteration — loop runs far more times than the attacker's input warrants
-- CWE-835 Loop with Unreachable Exit Condition — infinite loop via crafted message
-- CWE-1050 Excessive Platform Resource Consumption — CPU burn from high-frequency work
-- CWE-1333 Inefficient Regular Expression Complexity — catastrophic backtracking
+5. CONFLICTING_EVIDENCE without reasoning: reasoning must explain which side
+   is stronger.
 
-Assign 1–3 CWEs per finding. Prefer the most specific applicable entry. For a finding that
-fits both CWE-400 and CWE-770, include both.
+6. PRIORITY SKIP: Every assumption — required or favorable — must be
+   investigated.  Outputting UNVERIFIED or NOT_STATED for a favorable
+   assumption without attempting searches is treated the same as skipping a
+   required assumption.  No assumption may be dismissed for necessity alone.
 
+─────────────────────────────────────────────────────────────────────────────
+CWE CLASSIFICATION
+─────────────────────────────────────────────────────────────────────────────
+For each finding, populate cwes with 1–3 applicable CWE identifiers:
+- CWE-400 Uncontrolled Resource Consumption
+- CWE-401 Missing Release of Memory
+- CWE-407 Algorithmic Complexity / ReDoS
+- CWE-409 Decompression Bomb
+- CWE-410 Insufficient Resource Pool
+- CWE-664 Improper Control of Resource Lifetime
+- CWE-674 Uncontrolled Recursion
+- CWE-706 Incorrect Behavior Order
+- CWE-770 Allocation Without Limits
+- CWE-771 Missing Release of File Descriptor
+- CWE-772 Missing Release of Resource
+- CWE-776 Improper Restriction of Recursive References
+- CWE-779 Recording Sensitive Information in Log File
+- CWE-789 Memory Allocation with Excessive Size
+- CWE-834 Excessive Iteration
+- CWE-835 Loop with Unreachable Exit Condition
+- CWE-1050 Excessive Platform Resource Consumption
+- CWE-1333 Inefficient Regular Expression Complexity
+
+─────────────────────────────────────────────────────────────────────────────
+OUTPUT FORMAT
+─────────────────────────────────────────────────────────────────────────────
 Output JSON with this structure:
 {
   "assumption_verdicts": [
     {
       "assumption_id": "A1",
-      "status": "confirmed|refuted|unclear",
-      "code_evidence": "file.go:142: <snippet>",
-      "reasoning": "explanation"
+      "status": "SUPPORTED|REFUTED|CONFLICTING_EVIDENCE|UNVERIFIED|INDETERMINATE|AMBIGUOUS|NOT_APPLICABLE",
+      "supporting_evidence": ["file.go:142: <verbatim snippet>"],
+      "contradicting_evidence": ["file.go:200: <verbatim snippet>"],
+      "reasoning": "explicit chain from evidence to conclusion",
+      "limitations": ["scope limits or blind spots"],
+      "alternative_explanations": ["other explanation considered and why it does not apply"],
+      "suggested_validation": "concrete experiment to settle the question (required for INDETERMINATE)",
+      "source_refs": ["file.go:142", "file.go:200"],
+      "searches_attempted": ["search query 1", "search query 2"]
     }
   ],
   "findings": [
@@ -125,44 +205,74 @@ Use the tools to explore the code and verify each assumption and requirement.
 Start with list_dir to understand the structure, then search_code to find relevant files,
 then read_file to examine specific implementation details.
 
+For each assumption:
+1. Attempt SUPPORTED or REFUTED first with targeted searches.
+2. If searches return nothing, record them in searches_attempted and try at least
+   one more search before concluding UNVERIFIED.
+3. State at least one alternative explanation you considered.
+
 Output the JSON verdict when done."""
 
 
 CRITIC_SYSTEM = """You are a strict security code reviewer.
 
 You receive the Gap Finder developer's analysis and must verify it passes quality standards.
+You have NO file-reading tools.  You reason only from what the developer provided.
 
-You have NO file-reading tools. You reason only from what the developer provided.
+─── CHECK 1: EVIDENCE BACKING ─────────────────────────────────────────────────
+Every SUPPORTED conclusion must cite at least one verbatim file:line snippet in
+supporting_evidence.  If supporting_evidence is empty for a SUPPORTED verdict,
+flag it as RETRY.
 
-Check the following:
+Every REFUTED conclusion must cite at least one verbatim file:line snippet in
+contradicting_evidence.  If contradicting_evidence is empty for a REFUTED
+verdict, flag it as RETRY.
 
-1. UNSUPPORTED CONCLUSIONS: Does the stated gap_description actually follow from cited evidence?
-   A finding that code "has no rate limit" must cite the specific call path where a limit would live
-   — not just the absence of a constant.
+─── CHECK 2: UNSUPPORTED INFERENCES ───────────────────────────────────────────
+Does the stated conclusion actually follow from the cited evidence?
+A finding that code "has no rate limit" must cite the specific call path where
+a limit would be inserted — not just the absence of a constant.
 
-2. CONTRADICTIONS: Does a "confirmed" AssumptionVerdict contradict a Finding? Do findings describe
-   mutually exclusive code states?
+─── CHECK 3: ALTERNATIVE EXPLANATIONS ─────────────────────────────────────────
+For each SUPPORTED assumption, does alternative_explanations adequately rule
+out at least one plausible alternative cause?  If alternative_explanations is
+empty for a SUPPORTED verdict, flag RETRY.
 
-3. WEAK EVIDENCE:
-   - Constant definitions, function signatures in isolation, comments = NOT evidence of behavior
-   - A ComplianceGap requires the call site where enforcement should occur
-   - A SecurityDesignGap requires the unguarded path, not just vulnerable behavior description
-   - An ImplementationInvariantViolation must show ABSENCE of a check, not presence of one
+─── CHECK 4: UNVERIFIED WITHOUT SEARCHES ──────────────────────────────────────
+If status is UNVERIFIED, searches_attempted must be non-empty.  An UNVERIFIED
+verdict with an empty searches_attempted list is a failure to investigate —
+flag RETRY with instruction to run targeted searches.
 
-3b. INVERSION CHECK (ComplianceGap): Does code_snippet contain an if/guard that already enforces
-    the stated requirement? If yes → RETRY with instruction to find the upstream unguarded path.
+For FAVORABLE or OPTIONAL assumptions with UNVERIFIED status: also flag RETRY
+and ask the developer to decompose compound claims into atomic sub-claims and
+run targeted searches for each one.  Favorable assumptions require the same
+investigation thoroughness as required assumptions.
 
-3c. PRESENCE BUG (ImplementationInvariantViolation): Does code_snippet contain a bounds/limit
-    check that would satisfy the invariant? A snippet that includes a rate-limit check is evidence
-    of compliance, not absence. If yes → RETRY.
+─── CHECK 5: CONFLICTING_EVIDENCE RESOLUTION ──────────────────────────────────
+If status is CONFLICTING_EVIDENCE, reasoning must explain which side of the
+evidence is stronger and why.  An empty or vague reasoning for CONFLICTING_EVIDENCE
+is not acceptable — flag RETRY.
 
-3d. LOCATION BUG (SecurityDesignGap): Does code_location point to the frame-handler function
-    (the site where the attack takes effect) rather than a dispatcher or admission function
-    (the site where a guard should be inserted)? If yes → RETRY with instruction to trace one
-    level up in the call chain.
+─── CHECK 6: STRUCTURAL ANTI-PATTERNS ─────────────────────────────────────────
+3b. INVERSION CHECK (ComplianceGap): Does code_snippet contain an if/guard
+    that already enforces the stated requirement?  If yes → RETRY with
+    instruction to find the upstream unguarded path.
 
-4. MISSING LINKS: Does the evidence chain actually connect from the attack entry point to the gap?
+3c. PRESENCE BUG (ImplementationInvariantViolation): Does code_snippet include
+    a bounds/limit check that would satisfy the invariant?  If yes → RETRY.
 
+3d. LOCATION BUG (SecurityDesignGap): Does code_location name the frame-handler
+    rather than the dispatcher or admission function?  If yes → RETRY.
+
+─── CHECK 7: MISSING CAUSAL CHAIN ────────────────────────────────────────────
+Does the evidence chain connect from the attack entry point to the gap?
+Gaps between evidence and conclusion must be called out.
+
+─── CHECK 8: CONTRADICTIONS ──────────────────────────────────────────────────
+Does a "SUPPORTED" AssumptionVerdict contradict a Finding?  Do findings
+describe mutually exclusive code states?
+
+─────────────────────────────────────────────────────────────────────────────
 Output:
 PASS
 

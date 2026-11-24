@@ -27,6 +27,7 @@ from processor.yaml_parser import parse
 from spec_processor.spec_processor import run as spec_run
 from gap_finder.gap_finder import run as gap_run
 from exploit_planner.exploit_planner import run as plan_run
+from assumption_ledger.models import AssumptionLedger
 from builder.builder import build, teardown
 from exploiter.exploiter import run as exploit_run
 from verifier.verifier import run as verify_run, Verdict
@@ -164,6 +165,7 @@ def _compute_hypothesis_verdict(
     verdicts: list,
     plan,
     ctx,
+    ledger=None,
 ) -> str:
     """
     Derive a hypothesis-level verdict from measurement result + static analysis signals.
@@ -729,7 +731,8 @@ def _serialize_lifecycle(r: "LifecycleResult | None") -> dict | None:
 def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
                    verdicts: list, findings: list,
                    lifecycle_result: "LifecycleResult | None" = None,
-                   pipeline_log: "list | None" = None) -> None:
+                   pipeline_log: "list | None" = None,
+                   ledger: "AssumptionLedger | None" = None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Collect token usage from llm_client accumulator
@@ -841,18 +844,32 @@ def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
 
         # static analysis
         "assumption_verdicts": assumption_verdicts,
+        "assumption_ledger": ledger.to_dict_list() if ledger is not None else None,
         "gap_finder_findings": finding_list,
 
         # exploit plan
         "exploit_plan": {
-            "finding_type":         plan.finding_type if plan else None,
-            "finding_ref":          plan.finding_ref if plan else None,
-            "severity":             plan.severity if plan else None,
-            "expected_effect":      plan.expected_effect if plan else None,
-            "assumptions_relied_on": plan.assumptions_relied_on if plan else [],
-            "pivot_note":           plan.pivot_note if plan else None,
-            "pivot_candidates":     plan.pivot_candidates if plan else None,
-            "attack_steps":         plan_steps,
+            "finding_type":           plan.finding_type if plan else None,
+            "finding_ref":            plan.finding_ref if plan else None,
+            "severity":               plan.severity if plan else None,
+            "expected_effect":        plan.expected_effect if plan else None,
+            "assumptions_relied_on":  plan.assumptions_relied_on if plan else [],
+            "pivot_note":             plan.pivot_note if plan else None,
+            "pivot_candidates":       plan.pivot_candidates if plan else None,
+            "attack_steps":           plan_steps,
+            "base_attack_steps": [
+                {"n": s.n, "action": s.action, "quic_frame": s.quic_frame,
+                 "expected_server_response": s.expected_server_response,
+                 "rationale": s.rationale}
+                for s in plan.base_attack_sequence
+            ] if plan and plan.base_attack_sequence else None,
+            "amplified_attack_steps": [
+                {"n": s.n, "action": s.action, "quic_frame": s.quic_frame,
+                 "expected_server_response": s.expected_server_response,
+                 "rationale": s.rationale}
+                for s in plan.amplified_attack_sequence
+            ] if plan and plan.amplified_attack_sequence else None,
+            "favorable_assumptions_used": plan.favorable_assumptions_used if plan else [],
         } if plan else None,
 
         # lifecycle validation
@@ -926,21 +943,16 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
 
         # ── 4. Gap Finder ──────────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [4/7] Gap Finder ...")
-        verdicts, findings = gap_run(ctx, spec_reqs, repo_dir)
+        ledger, findings = gap_run(ctx, spec_reqs, repo_dir)
+        verdicts = ledger.to_verdicts()
         print(f"  verdicts={len(verdicts)} findings={len(findings)}")
 
         # Assumption gate: if ALL required assumptions are refuted → INFEASIBLE.
         # Findings are ignored here: if every precondition for the attack is proven
         # false, the attack mechanism cannot work regardless of incidental findings
         # the gap finder may have produced (which often contradict the refutation).
-        all_required = [a.id for a in ctx.assumptions if a.necessity == "required"]
-        required_refuted = [
-            a.id for a in ctx.assumptions
-            if a.necessity == "required"
-            and any(v.assumption_id == a.id and v.status == "refuted" for v in verdicts)
-        ]
-        all_required_refuted = bool(all_required) and set(required_refuted) == set(all_required)
-        if all_required_refuted:
+        if ledger.all_critical_refuted():
+            required_refuted = [r.assumption_id for r in ledger.critical_refuted()]
             print(f"[hypogenie:{_id}] All required assumptions refuted → INFEASIBLE")
             pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "failed",
                                   "detail": f"INFEASIBLE — required assumptions refuted: {required_refuted}"})
@@ -953,7 +965,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
                       "notes": f"Refuted: {required_refuted}",
                       "hypothesis_verdict": Verdict.HYPOTHESIS_DISPROVEN}
             _write_outputs(out_dir, ctx, None, result, verdicts, findings,
-                           pipeline_log=pipeline_log)
+                           ledger=ledger, pipeline_log=pipeline_log)
             return result
 
         n_confirmed = sum(1 for v in verdicts if v.status == "confirmed")
@@ -982,7 +994,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
 
         # ── 5. Exploit Planner ─────────────────────────────────────────────────
         print(f"[hypogenie:{_id}] [5/7] Exploit Planner ...")
-        plan = plan_run(ctx, verdicts, findings)
+        plan = plan_run(ctx, verdicts, findings, ledger=ledger)
         print(f"  severity={plan.severity} steps={len(plan.attack_sequence)}")
         pipeline_log.append({"stage": "5/7", "name": "Exploit Planner", "status": "ok",
                               "detail": f"severity={plan.severity}, {len(plan.attack_sequence)} steps"})
@@ -1051,7 +1063,9 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         )
 
         verdict = verify_result["verdict"]
-        hypothesis_verdict = _compute_hypothesis_verdict(verify_result, verdicts, plan, ctx)
+        hypothesis_verdict = _compute_hypothesis_verdict(
+            verify_result, verdicts, plan, ctx, ledger=ledger if 'ledger' in dir() else None
+        )
         verify_result["hypothesis_verdict"] = hypothesis_verdict
         print(f"\n[hypogenie:{_id}] *** VERDICT: {verdict} | HYPOTHESIS: {hypothesis_verdict} ***\n")
         verifier_status = "ok" if verdict == Verdict.CONFIRMED_DOS else (
@@ -1073,7 +1087,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             lifecycle_result = runner.run()
 
         _write_outputs(out_dir, ctx, plan, verify_result, verdicts, findings,
-                       lifecycle_result=lifecycle_result, pipeline_log=pipeline_log)
+                       lifecycle_result=lifecycle_result, pipeline_log=pipeline_log,
+                       ledger=ledger if 'ledger' in dir() else None)
         return verify_result
 
     except Exception as e:
@@ -1088,7 +1103,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         try:
             _write_outputs(out_dir, ctx if 'ctx' in dir() else None,
                            plan if 'plan' in dir() else None, result, verdicts, findings,
-                           lifecycle_result=lifecycle_result, pipeline_log=pipeline_log)
+                           lifecycle_result=lifecycle_result, pipeline_log=pipeline_log,
+                           ledger=ledger if 'ledger' in dir() else None)
         except Exception:
             pass
         return result

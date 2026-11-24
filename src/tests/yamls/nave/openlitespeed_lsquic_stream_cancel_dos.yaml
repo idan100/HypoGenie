@@ -1,0 +1,148 @@
+# HypoGenie hypothesis: QUIC stream cancellation may decouple transport
+# stream-credit replenishment from LSPHP application-work completion.
+#
+# Target profile:
+#   OpenLiteSpeed 1.9.4 + bundled LSQUIC + LSPHP 8.3
+#   Candidate condition: External Application Abort = No Abort, or a
+#   request-level `noabort` setting on the tested PHP route.
+#
+# Important: `No Abort` is an explicit, documented configuration choice.
+# Run the server's actual/default abort behavior as a negative-control profile
+# and the No Abort profile as the conditional hypothesis profile. A result
+# observed only with No Abort must be reported as configuration-dependent.
+# Record the exact LSQUIC revision bundled in the tested image before analysis.
+
+hypothesis:
+  description: |
+    RFC 9000 §4.6 controls peer-initiated stream concurrency through cumulative
+    stream limits advertised using initial_max_streams_bidi /
+    initial_max_streams_uni transport parameters and subsequently increased
+    through MAX_STREAMS frames. Closing a QUIC stream does not automatically
+    replenish the peer's stream credit; the receiver controls when additional
+    credit is advertised.
+
+    This hypothesis investigates whether OpenLiteSpeed, using its bundled
+    LSQUIC QUIC/HTTP/3 implementation, can release QUIC stream capacity when
+    an HTTP/3 request stream is closed at the transport layer while the
+    corresponding LSPHP external-application process is still executing.
+
+    The key configuration-dependent condition is LiteSpeed's documented
+    External Application Abort = No Abort setting, or the request-level
+    `noabort` setting for the PHP route. LiteSpeed documents that these
+    settings allow a PHP script to continue after the client connection is
+    closed, whereas its normal abort behavior is intended to stop the external
+    application and avoid wasting resources. The hypothesis is that, if an
+    HTTP/3 cancellation is treated as a completed transport stream while the
+    PHP process continues, the QUIC stream limit may stop bounding the number
+    of outstanding application jobs.
+
+    An HTTP/3 client may repeatedly initiate short-lived requests to a
+    controlled LSPHP endpoint and cancel the request streams. If LSQUIC
+    replenishes stream credit after transport-level closure, and the associated
+    PHP jobs continue under the No Abort configuration, later requests may be
+    admitted while earlier PHP jobs are still consuming CPU, memory, or LSPHP
+    worker capacity. This could allow outstanding application work to grow
+    beyond the configured concurrent QUIC stream window and degrade service
+    availability.
+
+    The hypothesis is conditional, not an assertion that the product is
+    vulnerable. The default/normal external-application abort behavior must be
+    measured as a negative control. The No Abort configuration must be tested
+    separately and identified in any finding. A DoS verdict requires evidence
+    that cancelled-request traffic produces more outstanding application work
+    or greater resource consumption than a matched benign workload at the
+    same offered request rate and request cost. Ordinary per-request processing
+    cost, by itself, is not sufficient evidence of a vulnerability.
+
+    Assumptions:
+    - A1: LSQUIC releases or replenishes peer stream capacity after transport-
+          level stream closure without waiting for the corresponding LSPHP
+          process to finish, or the configured initial stream limit is high
+          enough to admit additional requests while earlier application work
+          remains outstanding.
+    - A2: The tested LSPHP request continues consuming non-trivial resources
+          after the HTTP/3 request stream is cancelled, specifically when
+          External Application Abort = No Abort or the route-level `noabort`
+          setting applies.
+    - A3: Predictable server packet-number behavior may allow a client to
+          improve cancellation timing through ACK behavior. This is a favorable
+          amplification assumption only and must be independently validated;
+          it is not required to test the basic hypothesis.
+    - A4: Predictable MAX_STREAMS scheduling may allow a client to use newly
+          granted stream credit with less idle time. LSQUIC's actual credit
+          replenishment policy must be established rather than assuming a
+          one-credit-per-closed-stream policy. This is favorable only.
+    - A5: No effective HTTP/3 request-churn control or external-application
+          admission limit prevents the number of outstanding LSPHP jobs from
+          growing beyond the transport stream window. This is favorable only
+          and must be checked against the actual server and PHP worker limits.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/litespeedtech/openlitespeed
+  version: "1.9.4"
+  protocol: QUIC / HTTP/3
+  entry_point: "UDP port 443, QUIC with ALPN h3; HTTP/3 request routed to an LSPHP-backed PHP endpoint"
+  docker_image: "litespeedtech/openlitespeed:1.9.4-lsphp83"
+
+assumptions:
+  - id: A1
+    description: "LSQUIC releases or replenishes peer stream capacity after transport-level HTTP/3 stream closure without waiting for the associated LSPHP process to finish, or the initial stream limit permits additional requests while previous application work remains outstanding."
+    necessity: required
+
+  - id: A2
+    description: "An LSPHP request continues consuming non-trivial CPU, memory, or worker capacity after its HTTP/3 stream is cancelled when External Application Abort is configured as No Abort, or when the tested route has the request-level noabort setting."
+    necessity: required
+
+  - id: A3
+    description: "Predictable server packet-number behavior may permit more efficient cancellation timing through ACK behavior. Treat this as an unverified favorable assumption, not a prerequisite; test only in the isolated lab."
+    necessity: favorable
+
+  - id: A4
+    description: "The client may be able to anticipate LSQUIC MAX_STREAMS updates and reduce idle time between requests. Validate LSQUIC's actual credit-window and replenishment policy; do not assume one MAX_STREAMS increment per completed stream."
+    necessity: favorable
+
+  - id: A5
+    description: "No effective HTTP/3 stream-churn control, request-rate control, or LSPHP admission limit prevents outstanding application jobs from accumulating beyond the QUIC stream window."
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "A client sends short-lived HTTP/3 requests to a controlled LSPHP endpoint and cancels the request streams before the PHP work has completed."
+
+  - step: 2
+    action: "If LSQUIC considers the QUIC stream transport-complete and replenishes peer stream credit independently of LSPHP process completion, the client can obtain capacity for subsequent requests while earlier application work may still be running."
+
+  - step: 3
+    action: "When External Application Abort = No Abort, or the route-level noabort setting applies, the corresponding PHP processes may continue after the HTTP/3 client has cancelled the request. Each cancelled stream can therefore leave application work outstanding after its QUIC stream capacity has been returned."
+
+  - step: 4
+    action: "Repeated request admission and cancellation may cause the number of concurrently executing or queued LSPHP jobs to exceed the number of currently open QUIC request streams, potentially exhausting CPU, memory, or external-application worker capacity."
+
+  - step: 5
+    action: "The hypothesis is supported only if a bounded, isolated test demonstrates sustained growth or materially higher peak resource use from cancelled requests than from matched benign requests at the same offered request rate and request cost, together with measurable degradation for legitimate requests."
+
+rfc_sections:
+  - rfc: RFC 9000
+    section: "4.6"
+    dos_relevance: "Defines cumulative stream limits and the receiver's control over when additional stream credit is advertised. Relevant to whether transport-level stream completion allows new requests while application work remains outstanding."
+
+  - rfc: RFC 9000
+    section: "3.5"
+    dos_relevance: "Describes stream state transitions involving RESET_STREAM and STOP_SENDING. These transitions are relevant to the point at which LSQUIC considers a cancelled request stream transport-complete."
+
+  - rfc: RFC 9000
+    section: "19.11"
+    dos_relevance: "Defines MAX_STREAMS frames. LSQUIC's policy for generating these frames determines when the peer receives additional stream capacity."
+
+  - rfc: RFC 9114
+    section: "4.1.1"
+    dos_relevance: "Defines HTTP/3 request cancellation and recommends abruptly terminating the still-open stream directions. The question is whether this transport-level cancellation also stops the associated LSPHP work under the tested configuration."
+
+related_work:
+  - type: cve
+    id: CVE-2023-44487
+
+  - type: paper
+    id: "MadeYouReset: Exploiting HTTP/2 Server-Side Resets for Large-Scale DoS"
