@@ -120,6 +120,13 @@ Given a target server product, version, and entry point (protocol + port), gener
   1. No password needed by default. Set env_vars = {} unless overriding config.
   2. Use config_path = "" (EMQX uses environment variable overrides for config).
   3. ports = "1883:1883/tcp" for MQTT; "8883:8883/tcp" for MQTT/TLS.
+- **openlitespeed** (litespeedtech/openlitespeed:*): Official OpenLiteSpeed Docker image.
+  1. The image ships with a complete, working httpd_config.conf that already enables QUIC/HTTP3
+     on port 443 (TCP + UDP) and LSPHP. DO NOT mount a custom config — the image's startup
+     script writes required sections at runtime (errorlog, tuning, etc.) and replacing
+     httpd_config.conf causes startup failure.
+  2. Set config = "" and config_path = "" (no config file mount).
+  3. ports = "443:443/tcp 443:443/udp" (OLS binds the same port for both HTTPS/HTTP2 and QUIC).
 
 ## Output format (JSON only, no other text)
 {
