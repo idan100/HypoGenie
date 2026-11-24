@@ -42,6 +42,7 @@ _CPU_SUSTAIN_S    = 5      # sustained for >= 5 consecutive samples
 _MEM_DELTA_MB     = 100    # peak - baseline_mean >= 100 MB
 _LAT_RATIO        = 5      # attack_mean >= 5× baseline_mean
 _UNREACHABLE_S    = 3      # alive=False for >= 3 consecutive samples
+_DISK_DELTA_MB    = 500    # disk used: peak - baseline_mean >= 500 MB (disk_exhaustion class)
 
 # Differential attribution thresholds
 # control_delta / target_delta < CONFIRM → target >> control → real application overhead
@@ -271,6 +272,22 @@ def _check_thresholds(baseline: dict, attack: dict) -> tuple[list[str], dict]:
         "max_consecutive_down_s": max_consec_unreach,
         "threshold_s":            _UNREACHABLE_S,
         "triggered": "unreachable" in triggered,
+    }
+
+    # Disk: peak used - baseline_mean >= 500 MB (disk_exhaustion dos_class)
+    # Skipped when disk_mb was not collected (all zeros → returns 0.0 mean).
+    baseline_disk = _safe_mean(baseline.get("disk_mb", []))
+    attack_disk_vals = attack.get("disk_mb", [])
+    attack_disk_peak = max(attack_disk_vals) if attack_disk_vals else 0.0
+    disk_delta = attack_disk_peak - baseline_disk
+    if baseline_disk > 0 and disk_delta >= _DISK_DELTA_MB:
+        triggered.append("disk")
+    details["disk"] = {
+        "baseline_mean_mb": round(baseline_disk, 1),
+        "attack_peak_mb":   round(attack_disk_peak, 1),
+        "delta_mb":         round(disk_delta, 1),
+        "threshold_delta_mb": _DISK_DELTA_MB,
+        "triggered": "disk" in triggered,
     }
 
     return triggered, details
@@ -696,6 +713,7 @@ def run(
         "mem_delta_mb":    _MEM_DELTA_MB,
         "latency_ratio":   _LAT_RATIO,
         "unreachable_s":   _UNREACHABLE_S,
+        "disk_delta_mb":   _DISK_DELTA_MB,
     }
 
     # ── Phase 1: Baseline ──────────────────────────────────────────────────────

@@ -4,12 +4,24 @@ from pathlib import Path
 from .models import HypothesisContext, Assumption, RFCSection
 
 VALID_DOS_CLASSES = {
-    "resource_exhaustion",
-    "recursion",
-    "regex",
-    "memory",
-    "cpu",
-    "resource_starvation",
+    "resource_exhaustion",   # CWE-400, CWE-770, CWE-774 — connection/fd/thread pool limits
+    "recursion",             # CWE-674, CWE-776 — recursive parsing, entity expansion
+    "regex",                 # CWE-407, CWE-1333 — ReDoS specifically
+    "memory",                # CWE-401, CWE-771, CWE-789 — memory leaks, excessive allocation
+    "cpu",                   # CWE-834, CWE-1050 — CPU spin, high-rate computation
+    "resource_starvation",   # CWE-410, CWE-664 — thread/lock starvation
+    # ── additions ────────────────────────────────────────────────────────────
+    "connection",            # CWE-400 (Slowloris/slow-drain subtype) — hold connections open
+                             #   to exhaust server worker pool without completing requests
+    "algorithmic_complexity",# CWE-407 (broader than regex) — hash collision, parser quadratic
+                             #   blowup, JWT algorithm confusion; exploits asymmetric processing
+    "decompression_bomb",    # CWE-409 — send highly compressed payloads (gzip/zlib/brotli)
+                             #   that expand 100–1000× on the server, exhausting memory/CPU
+    "infinite_loop",         # CWE-835 — crafted protocol messages that trap the server in a
+                             #   loop with no reachable exit condition; different from cpu
+                             #   (high-rate) because a single message suffices
+    "disk_exhaustion",       # CWE-779 — trigger excessive logging or file writes to fill the
+                             #   server's disk, causing crashes or write failures
 }
 
 VALID_NECESSITY = {"required", "favorable"}
