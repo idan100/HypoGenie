@@ -1194,8 +1194,20 @@ def run(
         # ── Phase 2d: Benign equivalent test ─────────────────────────────────────
         # Answers the reviewer's key question: is the attack's CPU overhead
         # disproportionate compared to ordinary protocol work at the same intensity?
-        # benign_ratio = benign_cpu_delta / attack_cpu_delta:
-        #   < _BENIGN_CONFIRM_RATIO   → attack ≥2× more expensive than normal work
+        #
+        # Rate normalization: when the attack achieves a higher throughput than the
+        # benign (e.g. RESET_STREAM cancels faster than FIN+response), a raw CPU
+        # comparison is unfair — the benign runs at half the rate, so its absolute
+        # CPU is halved even if each unit of work is more expensive.  We scale the
+        # benign delta up to what it would cost at the attack's throughput rate.
+        #
+        # Accumulation attacks are excluded from normalization: if attack CPU is
+        # still rising at the end of the measurement window, the CPU overhead comes
+        # from accumulated server state (goroutines, buffers), not from the current
+        # sending rate.  Scaling by rate would over-correct and mask real DoS.
+        #
+        # benign_ratio (rate-normalized when applicable):
+        #   < _BENIGN_CONFIRM_RATIO   → attack ≥2× more expensive per unit → confirmed
         #   ≥ _BENIGN_DOWNGRADE_RATIO → attack ≈ normal work → not exploitable
         # Skipped if already executed in Phase 2c-alt (ambiguous zone path).
         p2d_phase: dict = {"phase": "benign"}
@@ -1213,16 +1225,50 @@ def run(
             benign_cpu  = _safe_mean(benign_metrics.get("cpu_pct", []))
             attack_delta = max(attack_cpu - idle_cpu, 0.1)   # avoid div/0
             benign_delta = max(benign_cpu - idle_cpu, 0.0)
-            benign_ratio = round(benign_delta / attack_delta, 3)
 
-            p2d_phase["idle_cpu_pct"]    = round(idle_cpu, 2)
-            p2d_phase["attack_cpu_pct"]  = round(attack_cpu, 2)
-            p2d_phase["benign_cpu_pct"]  = round(benign_cpu, 2)
-            p2d_phase["attack_delta_pp"] = round(attack_delta, 2)
-            p2d_phase["benign_delta_pp"] = round(benign_delta, 2)
-            p2d_phase["benign_ratio"]    = benign_ratio
+            # Detect accumulation: CPU still rising at end of attack window means
+            # overhead comes from accumulated state, not current send rate.
+            attack_series = attack_metrics.get("cpu_pct", [])
+            is_accumulating = False
+            if len(attack_series) >= 20:
+                early = _safe_mean(attack_series[:10])
+                late  = _safe_mean(attack_series[-10:])
+                is_accumulating = (late - early) > 15.0  # rising >15pp = accumulation
+
+            # Rate normalization: scale benign delta to attack throughput so the
+            # comparison is per unit of work, not per unit of time.
+            attack_rate = attack_metrics.get("_stream_rate", 0) or 0
+            benign_rate = benign_metrics.get("_stream_rate", 0) or 0
+            rate_ratio  = 1.0
+            rate_note   = ""
+            if (not is_accumulating
+                    and attack_rate > 0 and benign_rate > 0
+                    and attack_rate > benign_rate * 1.1):
+                rate_ratio = attack_rate / benign_rate
+                benign_delta_norm = benign_delta * rate_ratio
+                rate_note = (f" [rate-normalized: attack={attack_rate}/s "
+                             f"benign={benign_rate}/s x{rate_ratio:.2f}]")
+            else:
+                benign_delta_norm = benign_delta
+                if is_accumulating:
+                    rate_note = " [accumulating — rate normalization skipped]"
+
+            benign_ratio = round(benign_delta_norm / attack_delta, 3)
+
+            p2d_phase["idle_cpu_pct"]       = round(idle_cpu, 2)
+            p2d_phase["attack_cpu_pct"]     = round(attack_cpu, 2)
+            p2d_phase["benign_cpu_pct"]     = round(benign_cpu, 2)
+            p2d_phase["attack_delta_pp"]    = round(attack_delta, 2)
+            p2d_phase["benign_delta_pp"]    = round(benign_delta, 2)
+            p2d_phase["benign_delta_norm"]  = round(benign_delta_norm, 2)
+            p2d_phase["attack_rate"]        = attack_rate
+            p2d_phase["benign_rate"]        = benign_rate
+            p2d_phase["rate_ratio"]         = round(rate_ratio, 3)
+            p2d_phase["is_accumulating"]    = is_accumulating
+            p2d_phase["benign_ratio"]       = benign_ratio
             print(f"[verifier:{_run_id}] Phase 2d benign_ratio={benign_ratio:.3f} "
-                  f"(attack+{attack_delta:.1f}pp  benign+{benign_delta:.1f}pp  idle={idle_cpu:.1f}%)")
+                  f"(attack+{attack_delta:.1f}pp  benign+{benign_delta:.1f}pp"
+                  f"  idle={idle_cpu:.1f}%{rate_note})")
 
             if benign_ratio >= _BENIGN_DOWNGRADE_RATIO:
                 # Attack overhead is not distinguishable from normal protocol work.
@@ -1230,7 +1276,8 @@ def run(
                 phases.append(p2d_phase)
                 note = (f"Phase 2d: benign equivalent costs {benign_ratio:.0%} of attack CPU "
                         f"(≥{_BENIGN_DOWNGRADE_RATIO:.0%} threshold). "
-                        f"Attack overhead is not disproportionate to ordinary protocol work.")
+                        f"Attack overhead is not disproportionate to ordinary protocol work."
+                        + rate_note)
                 print(f"[verifier:{_run_id}] DEFECT — {note}")
                 return {
                     "verdict": Verdict.DEFECT,
