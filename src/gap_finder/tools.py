@@ -70,15 +70,21 @@ def list_dir(path: str = ".") -> str:
     return "\n".join(entries) if entries else "(empty directory)"
 
 
-def search_code(query: str, file_pattern: str = "*.go", path: str = ".") -> str:
+def search_code(query: str, file_pattern: str = "*", path: str = ".") -> str:
     """
     Search for a text pattern in files matching file_pattern under path.
     Uses grep; returns matching lines with file:line references.
+    Defaults to all files (*) so non-Go targets (C, Erlang, Rust, Java …) are
+    searched without the caller having to supply an explicit pattern.
     """
     base = _resolve(path)
     try:
+        cmd = ["grep", "-rn"]
+        if file_pattern and file_pattern != "*":
+            cmd += ["--include", file_pattern]
+        cmd += ["-m", "30", query, str(base)]
         result = subprocess.run(
-            ["grep", "-rn", "--include", file_pattern, "-m", "30", query, str(base)],
+            cmd,
             capture_output=True,
             text=True,
             timeout=30,

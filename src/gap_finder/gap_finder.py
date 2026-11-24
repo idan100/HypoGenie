@@ -215,7 +215,12 @@ def _parse_developer_output(raw: str, ctx, spec_reqs) -> tuple[list[AssumptionVe
                     req = r
                     break
         if req is None and spec_reqs:
-            req = spec_reqs[0]  # fallback
+            # Don't silently attach to spec_reqs[0] — that contaminates an
+            # unrelated requirement with a finding that cites a different section.
+            # Skip this finding; the developer cited a section not in the spec list.
+            print(f"  [gap_finder] WARNING: finding cites {rfc!r} §{sec!r} which is not "
+                  f"in spec_reqs — skipping (would have polluted spec_reqs[0])")
+            continue
 
         code_loc = f.get("code_location", "")
         code_snip = f.get("code_snippet", "")
@@ -355,8 +360,12 @@ def run(ctx, spec_reqs, repo_root: str) -> tuple[list[AssumptionVerdict], list[F
     if verdicts2:
         return verdicts2, findings2
 
-    # If retry also empty, downgrade originals to unclear
+    # Both passes produced empty verdicts — downgrade any "confirmed" to "unclear"
+    # AND clear all findings: the critic rejected them and the retry produced nothing,
+    # so passing the original findings forward would let the exploit planner build an
+    # attack on evidence the critic already rejected.
+    print("  [gap_finder] Both developer passes empty after critic rejection — clearing findings")
     for v in verdicts:
         if v.status == "confirmed":
             v.status = "unclear"
-    return verdicts, findings
+    return verdicts, []

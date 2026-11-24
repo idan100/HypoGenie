@@ -1,3 +1,4 @@
+import warnings
 import yaml
 from pathlib import Path
 from .models import HypothesisContext, Assumption, RFCSection
@@ -12,6 +13,35 @@ VALID_DOS_CLASSES = {
 }
 
 VALID_NECESSITY = {"required", "favorable"}
+
+# Canonical protocol identifiers used throughout the pipeline for skeleton
+# injection, control-test selection, and validator rules.
+_KNOWN_PROTOCOLS = {
+    "HTTP/2", "gRPC", "QUIC", "DNS-over-TLS", "DNS/TLS", "MQTT", "TCP",
+}
+
+# Lowercase alias → canonical.  Applied before the unknown-protocol warning so
+# common case-variations and abbreviations normalise silently.
+_PROTOCOL_ALIASES: dict[str, str] = {
+    "http/2":     "HTTP/2",
+    "http2":      "HTTP/2",
+    "h2":         "HTTP/2",
+    "grpc":       "gRPC",
+    "grpc/http2": "gRPC",
+    "grpc/h2":    "gRPC",
+    "quic":       "QUIC",
+    "quic/http3": "QUIC",
+    "http/3":     "QUIC",
+    "h3":         "QUIC",
+    "dns-over-tls": "DNS-over-TLS",
+    "dot":        "DNS-over-TLS",
+    "dns/tls":    "DNS/TLS",
+    "mqtt":       "MQTT",
+    "amqp":       "TCP",
+    "amqp 1.0":   "TCP",
+    "amqp1.0":    "TCP",
+    "tcp":        "TCP",
+}
 
 
 def parse(yaml_path: str) -> HypothesisContext:
@@ -43,9 +73,17 @@ def parse(yaml_path: str) -> HypothesisContext:
     version = str(tgt.get("version", "")).strip()
     if not version:
         raise ValueError("target.version is required")
-    protocol = tgt.get("protocol", "").strip()
-    if not protocol:
+    protocol_raw = tgt.get("protocol", "").strip()
+    if not protocol_raw:
         raise ValueError("target.protocol is required")
+    protocol = _PROTOCOL_ALIASES.get(protocol_raw.lower(), protocol_raw)
+    if protocol not in _KNOWN_PROTOCOLS:
+        warnings.warn(
+            f"target.protocol {protocol_raw!r} is not a known protocol; "
+            f"skeleton injection, control tests, and validator rules will not apply. "
+            f"Known protocols: {sorted(_KNOWN_PROTOCOLS)}",
+            stacklevel=2,
+        )
     entry_point = tgt.get("entry_point", "").strip()
     if not entry_point:
         raise ValueError("target.entry_point is required")

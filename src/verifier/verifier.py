@@ -469,10 +469,27 @@ _PPROF_TRANSPORT_TOKENS = (
     "runtime/pprof",
 )
 _PPROF_APP_TOKENS = (
+    # Caddy
     "caddyhttp/", "reverseproxy/", "caddytls/",
+    # net/http server-side handlers — any Go HTTP server
     "net/http.(*Server).Serve", "net/http.(*serverConn",
     "net/http.(*response).", "net/http.(*conn).serve",
-    "net/http.(*ServeMux", "bufio.",
+    "net/http.(*ServeMux", "net/http.HandlerFunc",
+    "net/http.(*ServeMux).ServeHTTP", "bufio.",
+    # CoreDNS
+    "github.com/coredns/", "coredns/",
+    # quic-go HTTP/3 application layer (excludes transport internals)
+    "github.com/quic-go/quic-go/http3",
+    # gRPC-Go application layer
+    "google.golang.org/grpc/",
+    # Generic Go HTTP handler patterns
+    "ServeHTTP", ".HandleFunc(",
+    # RabbitMQ / AMQP Go client
+    "github.com/rabbitmq/",
+    # NATS
+    "github.com/nats-io/",
+    # Envoy / MOSN / generic proxy Go
+    "github.com/envoyproxy/", "mosn.io/",
 )
 
 
