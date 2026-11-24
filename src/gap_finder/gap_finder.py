@@ -12,7 +12,10 @@ list[AssumptionVerdict] API can call ledger.to_verdicts().
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+from collections import Counter
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,6 +78,127 @@ Output the SAME JSON structure as the main developer:
   ],
   "findings": []
 }"""
+
+# ---------------------------------------------------------------------------
+# Pre-search scout — keyword→files map built before the LLM agent loop.
+# ---------------------------------------------------------------------------
+
+_STOPWORDS = frozenset({
+    "about", "after", "all", "alloc", "also", "and", "another", "any",
+    "are", "been", "before", "being", "bool", "byte", "bytes", "call",
+    "check", "class", "close", "code", "could", "count", "data", "does",
+    "during", "each", "every", "false", "field", "for", "frame", "free",
+    "from", "func", "function", "have", "headers", "header", "here",
+    "http", "init", "into", "just", "limit", "method", "more", "must",
+    "none", "not", "null", "object", "open", "other", "over", "packets",
+    "packet", "per", "rate", "read", "recv", "request", "response",
+    "send", "should", "size", "some", "string", "struct", "table",
+    "than", "that", "them", "then", "their", "there", "these", "they",
+    "this", "those", "time", "true", "type", "under", "value", "values",
+    "what", "when", "where", "which", "while", "will", "with", "would",
+    "write",
+})
+
+
+def _detect_extensions(repo_root: str) -> list[str]:
+    """Return glob patterns for the dominant source language in the repo."""
+    try:
+        r = subprocess.run(
+            ["git", "ls-files"],
+            cwd=repo_root, capture_output=True, text=True, timeout=10,
+        )
+        files = r.stdout.splitlines()
+    except Exception:
+        return ["*.cc", "*.h", "*.go", "*.py", "*.rs"]
+
+    _src_exts = {"cc", "cpp", "cxx", "h", "hpp", "go", "py", "rs", "java", "js", "ts"}
+    ext_counts: Counter = Counter()
+    for f in files:
+        if "." in f:
+            ext = f.rsplit(".", 1)[1].lower()
+            if ext in _src_exts:
+                ext_counts[ext] += 1
+
+    top = [f"*.{e}" for e, _ in ext_counts.most_common(4)]
+    return top or ["*.cc", "*.h", "*.go", "*.py"]
+
+
+def _grep_files(repo_root: str, keyword: str, exts: list[str], use_rg: bool) -> list[str]:
+    """Return repo-relative paths of files containing keyword (case-insensitive)."""
+    root = repo_root.rstrip("/")
+    try:
+        if use_rg:
+            glob_flags: list[str] = []
+            for ext in exts:
+                glob_flags += ["-g", ext]
+            result = subprocess.run(
+                ["rg", "-l", "--max-filesize=512K", "-i"] + glob_flags + ["--", keyword, root],
+                capture_output=True, text=True, timeout=10,
+            )
+        else:
+            inc_flags: list[str] = []
+            for ext in exts:
+                inc_flags += ["--include", ext]
+            result = subprocess.run(
+                ["grep", "-rl", "-i"] + inc_flags + ["--", keyword, root],
+                capture_output=True, text=True, timeout=10,
+            )
+    except Exception:
+        return []
+
+    paths = []
+    for line in result.stdout.splitlines():
+        p = line.strip()
+        if not p:
+            continue
+        if p.startswith(root + "/"):
+            p = p[len(root) + 1:]
+        paths.append(p)
+    return paths
+
+
+def _pre_search(repo_root: str, ctx) -> str:
+    """
+    Run targeted keyword searches against the cloned repo before the LLM
+    agent loop starts.  Returns a formatted file-index block to inject into
+    the developer prompt so the agent can open relevant files on iteration 1
+    instead of spending the budget on directory traversal.
+    """
+    corpus = " ".join([
+        ctx.description,
+        ctx.protocol,
+        " ".join(a.description for a in ctx.assumptions),
+    ])
+    tokens = re.findall(r'[a-zA-Z][a-zA-Z0-9_]{3,}', corpus.lower())
+    freq = Counter(tokens)
+    keywords = [w for w, _ in freq.most_common(30) if w not in _STOPWORDS][:8]
+
+    if not keywords:
+        return ""
+
+    exts = _detect_extensions(repo_root)
+    use_rg = shutil.which("rg") is not None
+
+    hits: dict[str, list[str]] = {}
+    for kw in keywords:
+        files = _grep_files(repo_root, kw, exts, use_rg)
+        if files:
+            hits[kw] = files[:8]
+
+    if not hits:
+        return ""
+
+    lines = [
+        "## Pre-indexed file map",
+        "These files were located by keyword search before the tool-call budget starts.",
+        "Open them directly — do NOT use list_dir to navigate to them.",
+        "",
+    ]
+    for kw, files in hits.items():
+        lines.append(f"- **{kw}**: {', '.join(files)}")
+    lines.append("")
+    return "\n".join(lines)
+
 
 from assumption_ledger.models import (
     AssumptionStatus,
@@ -376,6 +500,7 @@ def _parse_developer_output(
 def _reinvestigate_unclear(
     ledger: AssumptionLedger,
     repo_root: str,
+    scout_text: str = "",
 ) -> AssumptionLedger:
     """
     Targeted re-investigation pass for UNVERIFIED and AMBIGUOUS assumptions.
@@ -404,6 +529,9 @@ def _reinvestigate_unclear(
         f"atomic sub-claims and verify each independently.  "
         f"Output only the verdicts for these assumptions."
     )
+
+    if scout_text:
+        user = user + "\n\n" + scout_text
 
     print(f"  [gap_finder:{_run_id}] Re-investigating {len(unclear)} unclear assumption(s): "
           f"{[r.assumption_id for r in unclear]}")
@@ -521,6 +649,15 @@ def run(
         repo_root=repo_root,
     )
 
+    # ── 1b. Pre-search scout ──────────────────────────────────────────────────
+    scout = _pre_search(repo_root, ctx)
+    if scout:
+        user = user + "\n\n" + scout
+        kw_count = scout.count("\n- **")
+        print(f"  [gap_finder:{_run_id}] Pre-search: {kw_count} keyword(s) indexed")
+    else:
+        print(f"  [gap_finder:{_run_id}] Pre-search: no hits")
+
     print(f"  [gap_finder:{_run_id}] Running developer agent...")
     raw = _llm_with_tools(DEVELOPER_SYSTEM, user, repo_root)
     ledger, findings = _parse_developer_output(raw, ctx, spec_reqs, ledger)
@@ -532,7 +669,7 @@ def run(
         return ledger, []
 
     # ── 1b. Re-investigate any UNVERIFIED / AMBIGUOUS assumptions ─────────────
-    _reinvestigate_unclear(ledger, repo_root)
+    _reinvestigate_unclear(ledger, repo_root, scout_text=scout)
     n_resolved_after = sum(1 for r in ledger.all() if r.is_resolved)
     if n_resolved_after > n_resolved:
         print(f"  [gap_finder] Re-investigation resolved "
