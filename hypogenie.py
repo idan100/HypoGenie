@@ -44,6 +44,77 @@ _WORKSPACE    = _PROJECT_ROOT / "workspace" / "runs"
 _VENV_PYTHON  = _PROJECT_ROOT / ".venv" / "bin" / "python"
 
 
+# ── evidence tiers ────────────────────────────────────────────────────────────
+
+class EvidenceTier:
+    """Four ordered levels of confidence — not equivalent; each requires the ones below it."""
+    SOURCE_CODE_WEAKNESS          = "source_code_weakness"
+    THEORETICALLY_EXPLOITABLE     = "theoretically_exploitable"
+    REPRODUCED_RESOURCE_EXHAUSTION = "reproduced_resource_exhaustion"
+    AVAILABILITY_IMPACT           = "externally_observable_availability_impact"
+
+    _ORDER = [
+        SOURCE_CODE_WEAKNESS,
+        THEORETICALLY_EXPLOITABLE,
+        REPRODUCED_RESOURCE_EXHAUSTION,
+        AVAILABILITY_IMPACT,
+    ]
+
+
+def _derive_evidence_tier(
+    findings: list,
+    plan,
+    verify_result: dict,
+    verdicts: list,
+) -> dict:
+    """
+    Returns {"highest": <tier>, "tiers_present": [<tier>, ...]} where tiers_present
+    lists every tier the evidence supports, in ascending order.
+
+    Tiers are cumulative: reaching REPRODUCED_RESOURCE_EXHAUSTION implies the two below.
+    """
+    tiers: list[str] = []
+
+    # Tier 1 — a gap was identified in source code
+    if findings:
+        tiers.append(EvidenceTier.SOURCE_CODE_WEAKNESS)
+
+    # Tier 2 — the gap is theoretically exploitable (plan + no blocking refuted required assumption)
+    if findings and plan and plan.attack_sequence:
+        required_refuted = set()
+        if verdicts:
+            # Need ctx.assumptions, but we only have verdicts here.
+            # Use the plan's assumptions_relied_on as a proxy: if any relied-on assumption
+            # is "refuted" in the verdicts, the plan rests on a refuted assumption.
+            status_map = {v.assumption_id: v.status for v in verdicts}
+            required_refuted = {
+                a for a in (plan.assumptions_relied_on or [])
+                if status_map.get(a) == "refuted"
+            }
+        if not required_refuted and plan.severity in ("critical", "high", "medium"):
+            tiers.append(EvidenceTier.THEORETICALLY_EXPLOITABLE)
+
+    verdict = verify_result.get("verdict", "")
+
+    # Tier 3 — resource exhaustion was measured in a controlled lab run
+    if verdict == "CONFIRMED_DOS":
+        tiers.append(EvidenceTier.REPRODUCED_RESOURCE_EXHAUSTION)
+
+    # Tier 4 — the service became externally unavailable (latency spike or unreachable threshold)
+    if verdict == "CONFIRMED_DOS":
+        triggered = verify_result.get("triggered", [])
+        phases = verify_result.get("phases", [])
+        attack_ph = next((p for p in phases if p.get("phase") == "attack"), {})
+        td = attack_ph.get("threshold_details", {})
+        latency_triggered = td.get("latency", {}).get("triggered", False)
+        unreachable_triggered = td.get("unreachable", {}).get("triggered", False)
+        if "unreachable" in triggered or unreachable_triggered or latency_triggered:
+            tiers.append(EvidenceTier.AVAILABILITY_IMPACT)
+
+    highest = tiers[-1] if tiers else None
+    return {"highest": highest, "tiers_present": tiers}
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _release_stale_containers() -> None:
@@ -86,6 +157,66 @@ def _port_from_entry_point(entry_point: str) -> int:
     import re
     m = re.search(r"\b(\d{2,5})\b", entry_point)
     return int(m.group(1)) if m else 443
+
+
+def _compute_hypothesis_verdict(
+    verify_result: dict,
+    verdicts: list,
+    plan,
+    ctx,
+) -> str:
+    """
+    Derive a hypothesis-level verdict from measurement result + static analysis signals.
+
+    Decision table:
+      DOS_CONFIRMED                  — measurement confirmed a reproducible, causally attributed DoS
+      HYPOTHESIS_DISPROVEN           — necessary assumptions falsified (all required refuted +
+                                       runtime confirmed no effect, or early INFEASIBLE exit)
+      HYPOTHESIS_PARTIALLY_DISPROVEN — one attack path disproven but alternatives remain
+                                       (pivot happened, or some required assumptions refuted)
+      HYPOTHESIS_INCONCLUSIVE        — insufficient evidence to establish or reject
+    """
+    meas = verify_result.get("verdict", "UNKNOWN")
+
+    if meas == Verdict.CONFIRMED_DOS:
+        return Verdict.DOS_CONFIRMED
+
+    # Operational failures stay as-is — not a hypothesis conclusion
+    if meas in (Verdict.ENVIRONMENT_ERROR, Verdict.INVALID_TEST):
+        return meas
+
+    # Assess assumption refutation from Gap Finder
+    assumptions = getattr(ctx, "assumptions", []) if ctx else []
+    all_required = [a.id for a in assumptions if a.necessity == "required"]
+    required_refuted = [
+        a.id for a in assumptions
+        if a.necessity == "required"
+        and any(v.assumption_id == a.id and v.status == "refuted" for v in (verdicts or []))
+    ]
+    all_required_refuted = bool(all_required) and set(required_refuted) == set(all_required)
+    some_required_refuted = bool(required_refuted) and not all_required_refuted
+
+    # Pivot: original path was disproven; planner tried alternatives
+    has_pivot = plan is not None and plan.pivot_note is not None
+
+    # HYPOTHESIS_DISPROVEN: all required assumptions statically falsified
+    if meas == Verdict.INFEASIBLE:
+        return Verdict.HYPOTHESIS_DISPROVEN
+
+    # HYPOTHESIS_DISPROVEN: static refutation + runtime confirms no effect
+    if all_required_refuted and meas in (Verdict.NO_DOS_EFFECT, Verdict.REJECTED):
+        return Verdict.HYPOTHESIS_DISPROVEN
+
+    # HYPOTHESIS_PARTIALLY_DISPROVEN: pivot path tried and failed — alternatives remain untested
+    if has_pivot:
+        return Verdict.HYPOTHESIS_PARTIALLY_DISPROVEN
+
+    # HYPOTHESIS_PARTIALLY_DISPROVEN: some (not all) required assumptions refuted
+    if some_required_refuted and meas in (Verdict.NO_DOS_EFFECT, Verdict.REJECTED, Verdict.INCONCLUSIVE):
+        return Verdict.HYPOTHESIS_PARTIALLY_DISPROVEN
+
+    # HYPOTHESIS_INCONCLUSIVE: insufficient evidence to establish or reject
+    return Verdict.HYPOTHESIS_INCONCLUSIVE
 
 
 def _product_from_repo(repo_url: str) -> str:
@@ -387,7 +518,9 @@ def _write_run_report(
     phases   = verify_result.get("phases", [])
     triggered = verify_result.get("triggered", [])
 
-    emoji = {
+    hypothesis_verdict = verify_result.get("hypothesis_verdict")
+
+    _meas_emoji = {
         "CONFIRMED_DOS":    "✓",
         "NO_DOS_EFFECT":    "✗",
         "INCONCLUSIVE":     "⚠",
@@ -395,13 +528,38 @@ def _write_run_report(
         "ENVIRONMENT_ERROR":"✗",
         "DEFECT":           "✗",
         "REJECTED":         "✗",
-    }.get(verdict, "?")
+    }
+    _hyp_emoji = {
+        Verdict.DOS_CONFIRMED:                  "✓",
+        Verdict.HYPOTHESIS_DISPROVEN:           "✗",
+        Verdict.HYPOTHESIS_PARTIALLY_DISPROVEN: "⚠",
+        Verdict.HYPOTHESIS_INCONCLUSIVE:        "⚠",
+    }
+    emoji = _meas_emoji.get(verdict, "?")
+    hyp_emoji = _hyp_emoji.get(hypothesis_verdict, "?") if hypothesis_verdict else ""
 
+    et = _derive_evidence_tier(findings, plan, verify_result, verdicts)
+    tier_label = {
+        EvidenceTier.SOURCE_CODE_WEAKNESS:           "Source-code weakness identified",
+        EvidenceTier.THEORETICALLY_EXPLOITABLE:      "Theoretically exploitable",
+        EvidenceTier.REPRODUCED_RESOURCE_EXHAUSTION: "Reproduced resource exhaustion",
+        EvidenceTier.AVAILABILITY_IMPACT:            "Externally observable availability impact",
+    }.get(et["highest"], "No weakness found")
+
+    hyp_line = (
+        f"**Hypothesis verdict:** {hypothesis_verdict} {hyp_emoji}"
+        if hypothesis_verdict else ""
+    )
     lines = [
         "# HypoGenie Run Report", "",
         f"**Run ID:** {run_id}",
         f"**Date:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"**Verdict:** {verdict} {emoji}",
+        f"**Measurement verdict:** {verdict} {emoji}",
+    ]
+    if hyp_line:
+        lines.append(hyp_line)
+    lines += [
+        f"**Evidence tier:** {tier_label}",
         "", "---", "",
     ]
 
@@ -521,6 +679,7 @@ def _serialize_finding(f) -> dict:
         base["gap_description"] = f.gap_description
     if hasattr(f, "invariant_description"):
         base["invariant_description"] = f.invariant_description
+    base["cwes"] = getattr(f, "cwes", []) or []
     return base
 
 
@@ -647,11 +806,15 @@ def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
             )
     conclusion_text = "; ".join(reasoning_parts) + f". Final notes: {notes}"
 
+    evidence_tier = _derive_evidence_tier(findings, plan, verify_result, verdicts)
+
     verdict_data = {
-        "run_id":    run_id,
-        "verdict":   verify_result["verdict"],
-        "triggered": triggered,
-        "notes":     notes,
+        "run_id":             run_id,
+        "verdict":            verify_result["verdict"],
+        "hypothesis_verdict": verify_result.get("hypothesis_verdict"),
+        "triggered":          triggered,
+        "notes":              notes,
+        "evidence_tier":      evidence_tier,
 
         # target
         "target":    f"{ctx.repo_url}@{ctx.version}" if ctx else "unknown",
@@ -666,9 +829,10 @@ def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
 
         # conclusion
         "conclusion": {
-            "verdict":   verify_result["verdict"],
-            "reasoning": conclusion_text,
-            "phases_run": [ph.get("phase") for ph in phases],
+            "verdict":            verify_result["verdict"],
+            "hypothesis_verdict": verify_result.get("hypothesis_verdict"),
+            "reasoning":          conclusion_text,
+            "phases_run":         [ph.get("phase") for ph in phases],
         },
 
         # lab tests
@@ -687,6 +851,7 @@ def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
             "expected_effect":      plan.expected_effect if plan else None,
             "assumptions_relied_on": plan.assumptions_relied_on if plan else [],
             "pivot_note":           plan.pivot_note if plan else None,
+            "pivot_candidates":     plan.pivot_candidates if plan else None,
             "attack_steps":         plan_steps,
         } if plan else None,
 
@@ -785,7 +950,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
                                      "detail": "Skipped (INFEASIBLE)"})
             result = {"verdict": Verdict.INFEASIBLE, "baseline": {}, "attack": {},
                       "attack2": {}, "triggered": [], "phases": [], "thresholds_config": {},
-                      "notes": f"Refuted: {required_refuted}"}
+                      "notes": f"Refuted: {required_refuted}",
+                      "hypothesis_verdict": Verdict.HYPOTHESIS_DISPROVEN}
             _write_outputs(out_dir, ctx, None, result, verdicts, findings,
                            pipeline_log=pipeline_log)
             return result
@@ -885,12 +1051,14 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         )
 
         verdict = verify_result["verdict"]
-        print(f"\n[hypogenie:{_id}] *** VERDICT: {verdict} ***\n")
+        hypothesis_verdict = _compute_hypothesis_verdict(verify_result, verdicts, plan, ctx)
+        verify_result["hypothesis_verdict"] = hypothesis_verdict
+        print(f"\n[hypogenie:{_id}] *** VERDICT: {verdict} | HYPOTHESIS: {hypothesis_verdict} ***\n")
         verifier_status = "ok" if verdict == Verdict.CONFIRMED_DOS else (
             "warn" if verdict == Verdict.INCONCLUSIVE else "failed"
         )
         pipeline_log.append({"stage": "7/7", "name": "DoS Verifier", "status": verifier_status,
-                              "detail": verdict})
+                              "detail": f"{verdict} → {hypothesis_verdict}"})
 
         # ── 7b. Lifecycle Validation (runs after verifier, separate containers) ──
         if lc_plan is not None:
