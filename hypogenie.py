@@ -324,6 +324,43 @@ def _report_inconclusive(lines, ctx, plan, verdicts, findings, phases, notes):
     lines.append("")
 
 
+def _report_defect(lines, ctx, plan, verdicts, findings, phases, notes):
+    lines.append("## Why No Weakness (Attack Not Disproportionate)\n")
+
+    attack_ph  = next((p for p in phases if p.get("phase") == "attack"), {})
+    benign_ph  = next((p for p in phases if p.get("phase") == "benign"), {})
+
+    if attack_ph:
+        lines.append("**Phase 2 — Attack triggered resource increase:**")
+        for tl in _fmt_phase_thresholds(attack_ph):
+            lines.append(tl)
+        lines.append("")
+
+    if benign_ph:
+        a_delta = benign_ph.get("attack_delta_pp", 0)
+        b_delta = benign_ph.get("benign_delta_pp", 0)
+        ratio   = benign_ph.get("benign_ratio", 0)
+        lines.append("**Phase 2d — Benign Comparison (decisive):**")
+        lines.append(f"- Attack CPU delta: +{a_delta:.1f} pp")
+        lines.append(f"- Benign traffic CPU delta: +{b_delta:.1f} pp")
+        lines.append(f"- Benign/attack ratio: {ratio:.2f} (threshold: ≥ 0.80 → not disproportionate)")
+        lines.append("")
+
+    lines.append(f"**Notes:** {notes}\n")
+
+    lines.append("### Deduction")
+    lines.append(
+        "The CPU overhead attributed in Phase 2 is not specific to the attack mechanism — "
+        "ordinary well-formed traffic at the same stream rate produces equivalent or greater CPU. "
+        "This is a defect in the hypothesis: the QUIC implementation processes resets at similar cost "
+        "to normal stream completions, so the stream-cancellation pattern cannot be used as a DoS lever. "
+        "Consider: (1) testing at higher concurrency than benign baseline; "
+        "(2) targeting state that persists across streams (not per-stream CPU); "
+        "(3) revising the hypothesis to focus on memory accumulation rather than CPU."
+    )
+    lines.append("")
+
+
 def _report_env_error(lines, notes):
     lines.append("## Pipeline Error\n")
     lines.append(f"**Stopped at:** Environment setup\n")
@@ -392,6 +429,8 @@ def _write_run_report(
         _report_no_dos(lines, ctx, plan, verdicts, findings, phases, notes)
     elif verdict == "INCONCLUSIVE":
         _report_inconclusive(lines, ctx, plan, verdicts, findings, phases, notes)
+    elif verdict in ("DEFECT", "REJECTED"):
+        _report_defect(lines, ctx, plan, verdicts, findings, phases, notes)
     else:
         _report_env_error(lines, notes)
 
