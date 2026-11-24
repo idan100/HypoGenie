@@ -756,7 +756,7 @@ def run(
     # TCP/TLS: TCP+TLS handshakes at 100/s.  QUIC: QUIC handshakes at 20/s.
     # Skipped for plain TCP (no TLS) and for QUIC without protocol tag.
     tls_cpu_per_conn_s = 0.0
-    is_quic = protocol == "QUIC"
+    is_quic = protocol.upper().startswith("QUIC")
     if tls:
         if is_quic:
             print(f"[verifier:{_run_id}] Phase 1b — QUIC calibration "
