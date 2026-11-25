@@ -439,8 +439,19 @@ def _parse_developer_output(
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"  [gap_finder] JSON parse error: {e}")
-        return ledger, []
+        # LLM sometimes appends prose after the closing brace.
+        # Try extracting the first complete JSON object from the response.
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                print(f"  [gap_finder] JSON recovered after parse error: {e}")
+            except json.JSONDecodeError:
+                print(f"  [gap_finder] JSON parse error (unrecoverable): {e}")
+                return ledger, []
+        else:
+            print(f"  [gap_finder] JSON parse error: {e}")
+            return ledger, []
 
     # Build requirement lookup for findings.
     req_lookup = {(r.rfc, r.section): r for r in spec_reqs}
@@ -580,8 +591,17 @@ def _reinvestigate_unclear(
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"  [gap_finder] Re-investigation JSON parse error: {e}")
-        return ledger
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                print(f"  [gap_finder] Re-investigation JSON recovered: {e}")
+            except json.JSONDecodeError:
+                print(f"  [gap_finder] Re-investigation JSON parse error (unrecoverable): {e}")
+                return ledger
+        else:
+            print(f"  [gap_finder] Re-investigation JSON parse error: {e}")
+            return ledger
 
     unclear_ids = {r.assumption_id for r in unclear}
     for v in data.get("assumption_verdicts", []):
