@@ -460,6 +460,8 @@ def _parse_developer_output(
     evaluated_ids: set[str] = set()
 
     for v in data.get("assumption_verdicts", []):
+        if not isinstance(v, dict):
+            continue
         aid = v.get("assumption_id", "")
         if not aid:
             continue
@@ -605,6 +607,8 @@ def _reinvestigate_unclear(
 
     unclear_ids = {r.assumption_id for r in unclear}
     for v in data.get("assumption_verdicts", []):
+        if not isinstance(v, dict):
+            continue
         aid = v.get("assumption_id", "")
         if aid not in unclear_ids:
             continue
