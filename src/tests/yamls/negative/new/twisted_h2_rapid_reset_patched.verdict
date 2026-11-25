@@ -1,0 +1,21 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: Twisted 26.10.0 adds a rapid-reset rate limiter — assumption A1 is refuted
+
+TARGET_IMAGE: python:3.12-slim (custom Twisted HTTP/2 server, twisted==26.10.0)
+TARGET_PORT: 8443/tcp
+CLIENT_TOOL: h2
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Sent HEADERS(END_STREAM)+RST_STREAM cycles at maximum rate on a single connection
+  against a Twisted 26.10.0 HTTP/2 server. The server throttled the connection after
+  the per-connection reset budget was exhausted. CPU stayed below 8% throughout.
+  Memory delta < 2 MB. Probe requests on other connections responded normally. The
+  global reset budget (across all connections) also blocked the many-connection pivot.
+  Fix: commit 4989394, PR #12749, Twisted 26.10.0 (October 2026). Advisory:
+  GHSA-vpp8-g58w-m8mp.
+DISPROOF_NOTES: Assumption A1 ("no reset rate limit") is refuted. Twisted 26.10.0
+                introduces a reset-rate limiter in H2Connection.dataReceived that
+                applies both per-connection and globally, closing the many-connection
+                pivot.

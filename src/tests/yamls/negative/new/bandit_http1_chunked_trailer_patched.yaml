@@ -1,0 +1,83 @@
+hypothesis:
+  description: |
+    CVE-2026-39806: In Bandit (the Elixir HTTP/1.1 server), the function
+    do_read_chunked_data!/5 in lib/bandit/http1/socket.ex (around lines 242-274)
+    processes the terminal last-chunk marker. Its terminator clause only matches
+    when the last-chunk line "0\r\n" is immediately followed by the empty line
+    "\r\n", i.e., the pattern ["0", "\r\n" <> rest]. RFC 9112 §7.1.2 explicitly
+    permits trailer fields between the last-chunk and the empty line.
+
+    When a client sends a valid chunked body that terminates with a trailer field
+    (e.g., 0\r\nX-Trailer: value\r\n\r\n), no clause in do_read_chunked_data! matches.
+    The fallback arm computes to_read = 0 - byte_size(rest), which is negative.
+    It calls read_available!/2, which returns <<>> after the socket timeout expires.
+    The function then recurses with the identical buffer, making no progress.
+    One worker process per such connection is pinned indefinitely. Bandit's listener
+    pool is bounded, so a small number of connections (fewer than the pool size)
+    is sufficient to exhaust all workers and block legitimate requests.
+
+    Bandit 1.11.1 (released May 2026, commit ae3520d) fixes the loop: trailer fields
+    are explicitly consumed and discarded after the last-chunk marker, and each
+    recursive arm is guaranteed to make progress (read_available! returning <<>>
+    raises a request_error! :request_timeout instead of recursing).
+
+    This hypothesis tests the attack against a Bandit 1.11.1 server. Assumption A1
+    is expected to be refuted because the trailer-consuming fix is present.
+
+    Pivot note: If valid RFC 9112 trailers are handled, an attacker might send a
+    malformed chunk whose declared size disagrees with the actual data. The advisory
+    notes this same infinite-loop path is reachable via size-mismatch. This pivot is
+    also fixed in 1.11.1: the size-mismatch arm now raises request_error! :bad_request
+    instead of recursing.
+
+    Assumptions:
+    - A1: Bandit 1.11.1's do_read_chunked_data! has no clause that consumes RFC 9112
+          trailer fields — a valid chunked terminator with a trailer causes an
+          infinite recursive loop.
+    - A2: Each connection stuck in the loop permanently pins one worker process for
+          the connection's lifetime.
+    - A3: Sending chunked requests with trailers on N concurrent connections, where
+          N equals the Bandit listener pool size, exhausts all workers and blocks
+          all legitimate HTTP requests.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/mtrudel/bandit
+  version: "1.11.1"
+  protocol: HTTP/1.1
+  entry_point: "TCP port 4000 (Bandit HTTP/1.1 server via Plug)"
+  docker_image: "elixir:1.17-otp-27-debian-slim (custom Bandit server: mix deps.get with bandit ~> 1.11.1)"
+
+assumptions:
+  - id: A1
+    description: "Bandit 1.11.1's do_read_chunked_data! does not consume RFC 9112 trailer fields and enters an infinite loop on valid chunked terminators with trailers"
+    necessity: required
+  - id: A2
+    description: "Each stuck connection permanently pins one Bandit worker process for the connection's lifetime"
+    necessity: required
+  - id: A3
+    description: "Exhausting the listener pool with trailer-terminated chunked requests blocks all legitimate requests"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open N TCP connections to the Bandit 1.11.1 server (N = listener pool size)"
+  - step: 2
+    action: "On each connection, send a chunked POST request whose body ends with a valid RFC 9112 trailer: 0\\r\\nX-Trailer: value\\r\\n\\r\\n"
+  - step: 3
+    action: "Bandit 1.11.1 trailer-consuming fix activates — trailers are discarded, loop terminates, worker is freed"
+  - step: 4
+    action: "No worker pinning; listener pool remains available; legitimate requests are served normally"
+
+rfc_sections:
+  - rfc: RFC 9112
+    section: "7.1.2"
+    dos_relevance: "Trailer fields are valid after the last-chunk marker — parsers that ignore them loop without progress"
+  - rfc: RFC 9112
+    section: "6.3"
+    dos_relevance: "Chunked transfer coding termination sequence — zero-size chunk followed by optional trailers"
+
+related_work:
+  - type: cve
+    id: CVE-2026-39806

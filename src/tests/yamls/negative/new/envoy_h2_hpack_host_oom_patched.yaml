@@ -1,0 +1,88 @@
+hypothesis:
+  description: |
+    CVE-2026-73550: In Envoy's HTTP/2 codec (source/common/http/http2/codec_impl.cc),
+    OnHeaderForStream copies every decoded header value before calling
+    connection_->onHeader(). When the runtime guard
+    envoy.reloadable_features.http2_discard_host_header is enabled,
+    ServerConnectionImpl::onHeader drops an ordinary host header if the stream
+    already carries :authority. This discard return fires before ConnectionImpl::
+    saveHeader(), which is where the per-stream header byte and count limits are
+    enforced. As a result, discarded host values are never charged against those
+    limits and can grow without bound.
+
+    An attacker constructs a HEADERS block with one indexed host entry of ~4000 bytes
+    inserted into the HPACK dynamic table, then references that entry approximately
+    1,000,000 times via HPACK indexed representation. Each indexed reference costs
+    1 byte of wire bandwidth but causes Envoy to decode and copy the full 4000-byte
+    value. With 50 connections each carrying one stream, the total copy work is
+    approximately 200 GB — enough to OOM-kill an Envoy process under a 3 GB memory
+    limit within seconds.
+
+    Envoy 1.39.1 (patched releases: 1.39.1, 1.38.4, 1.37.6, 1.36.10) fixes the
+    vulnerability by applying the byte limit accounting in saveHeader() before the
+    host-discard path, so that discarded host values are still counted. This hypothesis
+    tests the attack against envoyproxy/envoy:v1.39.1. Assumption A1 is expected to
+    be refuted because the patched saveHeader() now charges all header bytes including
+    those that are subsequently discarded.
+
+    Pivot note: An attacker might try to bypass the per-stream byte limit by opening
+    many connections rather than one stream per connection, distributing the indexed
+    references across streams to stay under the per-stream limit. This pivot is blocked
+    in 1.39.1: the byte limit applies per-stream, but each stream that sends 1 M
+    indexed host references individually crosses the per-stream limit on its own —
+    it is a single-stream, single-connection attack.
+
+    Assumptions:
+    - A1: Envoy 1.39.1 does not apply the per-stream header byte limit to host header
+          values that are discarded via the http2_discard_host_header code path.
+    - A2: 1,000,000 HPACK indexed references to a 4000-byte host value each trigger
+          a full 4000-byte copy in OnHeaderForStream before the discard return.
+    - A3: The cumulative ~4 GB copy work per stream causes OOM under a 3 GB memory
+          limit within the attack window.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/envoyproxy/envoy
+  version: v1.39.1
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS (Envoy front proxy)"
+  docker_image: "envoyproxy/envoy:v1.39.1"
+
+assumptions:
+  - id: A1
+    description: "Envoy 1.39.1 does not charge the per-stream header byte limit for host values discarded by http2_discard_host_header before saveHeader() is reached"
+    necessity: required
+  - id: A2
+    description: "Each HPACK indexed reference to a large host entry triggers a full copy before the discard path, with no short-circuit for previously seen values"
+    necessity: required
+  - id: A3
+    description: "1 M indexed references × 4000 bytes ≈ 4 GB copy work per stream causes OOM under a 3 GB process limit"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Establish an HPACK dynamic table entry for a ~4000-byte host value via a single HEADERS frame"
+  - step: 2
+    action: "Send ~1,000,000 HPACK indexed references to that entry in CONTINUATION frames on the same stream"
+  - step: 3
+    action: "Envoy 1.39.1 applies the host-byte limit in saveHeader() before the discard path — host bytes are charged against the per-stream limit"
+  - step: 4
+    action: "Stream is reset with PROTOCOL_ERROR after the per-stream byte limit is reached; total copies are bounded"
+
+rfc_sections:
+  - rfc: RFC 7541
+    section: "2.3.2"
+    dos_relevance: "HPACK indexed header field representation — 1-byte wire cost decodes into full header value, creating amplification"
+  - rfc: RFC 7541
+    section: "4.1"
+    dos_relevance: "HPACK dynamic table size limit — attacker controls what large values are indexed"
+  - rfc: RFC 7540
+    section: "6.5.2"
+    dos_relevance: "HEADER_TABLE_SIZE SETTINGS parameter used to prime the attack"
+
+related_work:
+  - type: cve
+    id: CVE-2026-73550
+  - type: cve
+    id: CVE-2023-44487

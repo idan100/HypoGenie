@@ -1,0 +1,20 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: Bandit 1.11.1 consumes trailer fields and raises on no-progress conditions — assumption A1 is refuted
+
+TARGET_IMAGE: elixir:1.17-otp-27-debian-slim (custom Bandit server, bandit ~> 1.11.1)
+TARGET_PORT: 4000/tcp
+CLIENT_TOOL: custom HTTP/1.1 client (raw socket, chunked encoding)
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Sent chunked POST requests ending with 0\r\nX-Trailer: value\r\n\r\n against a
+  Bandit 1.11.1 server. Workers completed normally: trailer fields were consumed
+  and discarded, the loop exited, and workers were freed promptly. Listener pool
+  remained fully available throughout. The malformed-size pivot (declared chunk size
+  != actual data) also raised :bad_request and freed the worker immediately.
+  Fix: commit ae3520d, Bandit 1.11.1 (May 2026, CVE-2026-39806).
+DISPROOF_NOTES: Assumption A1 ("trailer fields cause infinite loop") is refuted.
+                Bandit 1.11.1 adds a trailer-consuming clause in do_read_chunked_data!
+                and ensures read_available! returning <<>> raises :request_timeout
+                instead of recursing. Both the trailer and size-mismatch paths are fixed.

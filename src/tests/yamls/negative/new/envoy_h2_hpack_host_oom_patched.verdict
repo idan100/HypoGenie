@@ -1,0 +1,23 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: Envoy 1.39.1 charges host header bytes against the per-stream limit before the discard path — assumption A1 is refuted
+
+TARGET_IMAGE: envoyproxy/envoy:v1.39.1
+TARGET_PORT: 443/tcp
+CLIENT_TOOL: h2
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Sent a HEADERS frame establishing a ~4000-byte host entry in the HPACK dynamic table,
+  then sent CONTINUATION frames carrying ~1,000,000 indexed references against
+  envoyproxy/envoy:v1.39.1. The stream was reset with PROTOCOL_ERROR once the per-stream
+  header byte limit was reached; total copies were bounded well below 4 GB. Envoy process
+  memory stayed within normal operating range. Static analysis of codec_impl.cc in
+  v1.39.1 confirms that saveHeader() now charges all host bytes, including discarded
+  ones, before the http2_discard_host_header return path. Fix introduced August 2026
+  (CVE-2026-73550, patched in 1.39.1, 1.38.4, 1.37.6, 1.36.10).
+DISPROOF_NOTES: Assumption A1 ("discarded host bytes not charged against limit") is
+                refuted. The fix moves the per-stream byte accounting ahead of the
+                discard branch in ServerConnectionImpl::onHeader(). The many-connection
+                pivot is irrelevant: the attack is single-stream and each stream hits
+                the per-stream byte limit independently.

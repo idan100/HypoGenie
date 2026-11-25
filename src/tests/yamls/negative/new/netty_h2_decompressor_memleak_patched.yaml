@@ -1,0 +1,83 @@
+hypothesis:
+  description: |
+    CVE-2026-56819: In Netty's DelegatingDecompressorFrameListener, the
+    Http2Decompressor.decompress() method calls decompressor.writeInbound(data.retain())
+    around line 433 of codec-http2/src/main/java/io/netty/handler/codec/http2/
+    DelegatingDecompressorFrameListener.java. The retain() call increments the ByteBuf
+    reference count before writeInbound() runs. When a stream is removed,
+    Http2Connection.onStreamRemoved triggers Http2Decompressor.cleanup(), which calls
+    EmbeddedChannel.finishAndReleaseAll(). If a DATA frame arrives after this cleanup,
+    writeInbound throws ClosedChannelException at ensureOpen() before the buffer
+    enters the pipeline. The catch block (around line 451) does not call data.release(),
+    so the extra reference from retain() is never decremented. Each such DATA frame
+    leaks one Netty direct ByteBuf until the JVM heap runs out of direct memory and
+    an OutOfMemoryError is thrown.
+
+    Netty 4.1.136.Final (released July 2026) fixes the leak: a writeSucceeded boolean
+    flag is introduced that is set to true only when writeInbound returns normally.
+    In the catch block, if writeSucceeded is false, data.release() is called, ensuring
+    the extra reference is always freed.
+
+    This hypothesis tests the leak against a Netty server built with 4.1.136.Final.
+    The assumption that 4.1.136.Final's decompressor still fails to release the ByteBuf
+    on ClosedChannelException should be refuted because the fix is present.
+
+    Pivot note: If single-stream post-cleanup leaks are fixed, an attacker might try
+    to trigger decompressor cleanup concurrently by rapid stream resets on other
+    connections while flooding DATA frames. This concurrency pivot is also blocked in
+    4.1.136.Final: the writeSucceeded guard is applied unconditionally per writeInbound
+    call and is not sensitive to race timing — the flag is local to each call frame.
+
+    Assumptions:
+    - A1: Netty 4.1.136.Final's DelegatingDecompressorFrameListener fails to release
+          the retained ByteBuf when writeInbound throws ClosedChannelException after
+          stream decompressor cleanup.
+    - A2: Sending DATA frames for a stream whose decompressor has been cleaned up
+          produces one leaked direct ByteBuf reference per frame, accumulating until
+          JVM direct-memory OOM.
+    - A3: Sustaining this pattern across a long-lived connection produces enough
+          leaked references to exhaust the JVM's direct memory within the attack window.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/netty/netty
+  version: 4.1.136.Final
+  protocol: HTTP/2
+  entry_point: "TCP port 8443, HTTP/2 over TLS (Netty SslContext ALPN h2, decompression enabled)"
+  docker_image: "eclipse-temurin:21-jre-jammy (custom Netty HTTP/2 server built with netty-codec-http2:4.1.136.Final)"
+
+assumptions:
+  - id: A1
+    description: "Netty 4.1.136.Final's DelegatingDecompressorFrameListener does not release the ByteBuf retained before a failed writeInbound call"
+    necessity: required
+  - id: A2
+    description: "Post-cleanup DATA frames each leak one direct ByteBuf reference, accumulating until OOM"
+    necessity: required
+  - id: A3
+    description: "Sustained post-cleanup DATA frames exhaust JVM direct memory within the attack window"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open HTTP/2 connection with ALPN h2 and content-encoding: gzip to trigger decompressor allocation"
+  - step: 2
+    action: "Send a stream to completion (END_STREAM) to trigger Http2Decompressor.cleanup() and EmbeddedChannel.finishAndReleaseAll()"
+  - step: 3
+    action: "Send DATA frames for the same now-cleaned-up stream — writeInbound throws ClosedChannelException"
+  - step: 4
+    action: "Netty 4.1.136.Final catch block calls data.release() (writeSucceeded == false) — no ByteBuf leak"
+  - step: 5
+    action: "Direct memory stays stable; no OOM observed"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "5.1"
+    dos_relevance: "Stream lifecycle — DATA frames for half-closed streams are invalid but parseable; server must handle gracefully"
+  - rfc: RFC 7540
+    section: "6.1"
+    dos_relevance: "DATA frame processing — receiver must not retain resources for closed streams"
+
+related_work:
+  - type: cve
+    id: CVE-2026-56819

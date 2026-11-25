@@ -1,0 +1,93 @@
+hypothesis:
+  description: |
+    gRPC defines an unofficial HTTP/2 extension frame type 0x4D (METADATA) for
+    carrying end-to-end metadata outside the HEADERS/DATA flow. Envoy Proxy
+    implements this extension as part of its gRPC filter chain: each received
+    METADATA frame on a stream is decoded into a MetadataMap (a
+    std::multimap<std::string, std::string>) stored in the stream's
+    Http2Frame::StreamInfo. The MetadataMap has no size cap and no eviction
+    policy: every unique key-value pair received on the stream is inserted
+    unconditionally.
+
+    RFC 7540 §4.1 requires that unknown or extension frame types be ignored if
+    not understood, but Envoy explicitly understands METADATA frames and stores
+    them. No RFC section nor the gRPC wire-format spec imposes an upper bound on
+    the number of METADATA frames per stream. Envoy 1.32.0 does not add any
+    per-stream metadata byte budget.
+
+    An attacker opens 200 concurrent HTTP/2 connections with a small number of
+    streams each. On every stream, the attacker sends METADATA frames in a tight
+    loop: each frame carries one key-value pair with a 1 KB value (within the
+    default MAX_FRAME_SIZE of 16 KB). Because Envoy issues a WINDOW_UPDATE per
+    consumed DATA byte but METADATA frames do not consume flow-control credit,
+    there is no throttle on the METADATA flood rate. Each MetadataMap entry
+    allocates ~1 KB of string data plus ~200 bytes of std::multimap node overhead.
+    With 200 connections × 50 streams × 10,000 METADATA frames = 100 M entries,
+    RSS exhausts within 60s.
+
+    Assumptions:
+    - A1: Envoy 1.32.0 stores every received METADATA frame entry in an
+          unbounded per-stream MetadataMap with no byte or entry count cap.
+    - A2: METADATA frames do not consume HTTP/2 flow-control credit — there is
+          no connection-level throttle on the number of METADATA frames the
+          attacker can send.
+    - A3: MetadataMap entries are not GC-eligible until stream close — allocations
+          accumulate for the full stream lifetime.
+
+    Suspected mechanism:
+    1. Attacker opens 200 HTTP/2 connections to Envoy's gRPC listener (port 9080).
+    2. Each connection: open 50 gRPC streams (HEADERS with grpc-encoding metadata).
+    3. Each stream: loop — send METADATA frame with one 1 KB key-value pair;
+       Envoy inserts into MetadataMap; no WINDOW_UPDATE consumed.
+    4. MetadataMap entries accumulate per stream — no eviction until stream close.
+    5. 200 × 50 × 10,000 entries × ~1.2 KB = ~120 GB theoretical; OOM kill in
+       practice at the container's memory limit within 60s.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/envoyproxy/envoy
+  version: v1.32.0
+  protocol: gRPC
+  entry_point: "TCP port 9080, gRPC over HTTP/2 (plaintext)"
+  docker_image: "envoyproxy/envoy:v1.32.0"
+
+assumptions:
+  - id: A1
+    description: "Envoy MetadataMap is unbounded — no per-stream metadata byte budget or entry count cap in Http2Frame::StreamInfo"
+    necessity: required
+  - id: A2
+    description: "METADATA frames (type 0x4D) do not consume HTTP/2 flow-control credit — attacker can flood without WINDOW_UPDATE throttling"
+    necessity: required
+  - id: A3
+    description: "MetadataMap entries are not evicted during stream lifetime — all allocations accumulate until stream close"
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Open 200 HTTP/2 connections to Envoy gRPC listener (port 9080)"
+  - step: 2
+    action: "Each connection: open 50 gRPC streams with HEADERS (grpc-status: 200, content-type: application/grpc)"
+  - step: 3
+    action: "Each stream: loop — send METADATA frame (type 0x4D) with one 1 KB key-value pair; no END_STREAM"
+  - step: 4
+    action: "Envoy inserts each pair into the stream's MetadataMap; no throttle (METADATA bypasses flow control)"
+  - step: 5
+    action: "Entries accumulate → RSS exhaustion; container OOM-killed within 60s"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "4.1"
+    dos_relevance: "Unknown/extension frames must be ignored if unsupported; no bound on extension frame rate is defined"
+  - rfc: RFC 7540
+    section: "6.9"
+    dos_relevance: "Flow-control credit governs DATA frames only — extension frames bypass the flow-control budget"
+  - rfc: RFC 7540
+    section: "10.5"
+    dos_relevance: "Resource exhaustion via stream amplification — implementations must protect against unlimited resource accumulation"
+
+related_work:
+  - type: cve
+    id: CVE-2026-39147
+  - type: cve
+    id: CVE-2023-44487

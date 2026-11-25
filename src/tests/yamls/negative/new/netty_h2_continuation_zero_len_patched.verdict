@@ -1,0 +1,21 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: Netty 4.1.132.Final adds a per-stream CONTINUATION frame count limit that zero-length frames are charged against — assumption A1 is refuted
+
+TARGET_IMAGE: eclipse-temurin:21-jre-jammy (custom Netty HTTP/2 server, netty-codec-http2:4.1.132.Final)
+TARGET_PORT: 8443/tcp
+CLIENT_TOOL: h2
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Sent HEADERS with END_HEADERS=0 followed by zero-length CONTINUATION frames at
+  maximum socket rate against a Netty 4.1.132.Final HTTP/2 server. The stream was
+  reset with PROTOCOL_ERROR once the per-stream CONTINUATION frame count limit was
+  reached. CPU stayed below 5% throughout. Memory delta negligible. The 1-byte
+  payload pivot was also blocked by the same count-based limit. Static analysis of
+  DefaultHttp2FrameReader in 4.1.132.Final confirms the count limit is independent
+  of the byte check. Fix introduced in Netty 4.1.132.Final (CVE-2026-33871, March 2026).
+DISPROOF_NOTES: Assumption A1 ("no count limit") is refuted. Netty 4.1.132.Final
+                adds a CONTINUATION frame count limit that fires regardless of frame
+                payload size, closing the zero-byte bypass of the byte-only check
+                present in earlier versions.

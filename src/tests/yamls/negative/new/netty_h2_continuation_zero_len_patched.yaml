@@ -1,0 +1,81 @@
+hypothesis:
+  description: |
+    CVE-2026-33871: Netty's DefaultHttp2FrameReader has no limit on the number of
+    CONTINUATION frames that may follow a HEADERS frame that lacks END_HEADERS.
+    The existing maxHeaderListSize guard in HeadersBlockBuilder.addFragment() fires
+    only when the accumulated byte count exceeds the threshold. For zero-length
+    CONTINUATION frames the byte count never increments, so the check never fires:
+    the condition (maxGoAway - len < readableBytes) evaluates as (10240 < 1) → false
+    when len == 0. An attacker can sustain an infinite stream of zero-byte CONTINUATION
+    frames at negligible bandwidth cost while the server spends CPU processing each
+    frame header, dispatching it, and updating per-stream state.
+
+    Netty 4.1.132.Final (released March 2026) adds a separate CONTINUATION frame
+    count limit independent of the byte threshold, so that zero-length frames are
+    counted against the limit and the stream is reset with PROTOCOL_ERROR once
+    the count is exceeded. This hypothesis tests the attack against a Netty HTTP/2
+    server built with the patched 4.1.132.Final codec library. Assumption A1 (no
+    count limit) is expected to be refuted by Gap Finder via static analysis of the
+    patched DefaultHttp2FrameReader.
+
+    Pivot note: If the byte-based limit is unreachable with zero-length frames, an
+    attacker might pivot to sending very small but nonzero CONTINUATION frames
+    (1-byte payload) to advance the byte counter slowly while still staying cheap.
+    This pivot is also blocked in 4.1.132.Final: the count-based limit applies
+    regardless of frame size, so even 1-byte frames are counted and trigger the
+    same PROTOCOL_ERROR cutoff.
+
+    Assumptions:
+    - A1: Netty 4.1.132.Final's DefaultHttp2FrameReader applies no per-stream
+          CONTINUATION frame count limit — only a byte-based maxHeaderListSize
+          check that zero-length frames bypass.
+    - A2: Sending an unbounded stream of zero-length CONTINUATION frames causes
+          Netty to consume CPU proportional to the frame arrival rate.
+    - A3: Flooding a single-core Netty HTTP/2 server with zero-length CONTINUATION
+          frames at socket rate saturates the CPU above the 50% threshold.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/netty/netty
+  version: 4.1.132.Final
+  protocol: HTTP/2
+  entry_point: "TCP port 8443, HTTP/2 over TLS (Netty SslContext ALPN h2)"
+  docker_image: "eclipse-temurin:21-jre-jammy (custom Netty HTTP/2 server built with netty-codec-http2:4.1.132.Final)"
+
+assumptions:
+  - id: A1
+    description: "Netty 4.1.132.Final's DefaultHttp2FrameReader applies no per-stream CONTINUATION frame count limit"
+    necessity: required
+  - id: A2
+    description: "Zero-length CONTINUATION frames consume CPU proportional to frame arrival rate"
+    necessity: required
+  - id: A3
+    description: "Zero-length CONTINUATION flood at socket rate saturates a single-core server CPU above 50%"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open HTTP/2 connection with ALPN h2 to the Netty server"
+  - step: 2
+    action: "Send HEADERS frame with END_HEADERS=0 to open the attack stream"
+  - step: 3
+    action: "Send zero-length CONTINUATION frames at maximum socket rate without setting END_HEADERS"
+  - step: 4
+    action: "Netty 4.1.132.Final CONTINUATION count limit triggers — stream reset with PROTOCOL_ERROR"
+  - step: 5
+    action: "CPU stays bounded; server continues handling other connections normally"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "6.10"
+    dos_relevance: "CONTINUATION chain has no RFC-level frame count cap — only a byte cap which zero-length frames bypass"
+  - rfc: RFC 7540
+    section: "4.3"
+    dos_relevance: "Header block accumulation — per-frame dispatch cost is paid even for zero-payload frames"
+
+related_work:
+  - type: cve
+    id: CVE-2026-33871
+  - type: cve
+    id: CVE-2023-45288

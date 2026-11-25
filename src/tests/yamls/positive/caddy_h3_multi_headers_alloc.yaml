@@ -1,0 +1,90 @@
+hypothesis:
+  description: |
+    RFC 9114 §4.1 defines the structure of an HTTP/3 message: exactly one HEADERS
+    frame carrying the request (or response) header section, followed by zero or
+    more DATA frames, then optionally one HEADERS frame carrying the trailer
+    section. The spec is explicit: "An intermediary that receives a request with
+    multiple non-trailer HEADERS frames MUST treat this as a stream error of
+    type H3_MESSAGE_ERROR." A conformant server must enforce this invariant and
+    reset the stream on the second non-trailer HEADERS frame.
+
+    caddy 2.9.1 uses golang.org/x/net/http3 (released alongside quic-go v0.49.0)
+    as its HTTP/3 transport. The stream reader in http3/server.go readRequest()
+    delegates header parsing to qpackDecoder.DecodeFull() on each received
+    HEADERS frame. It does not track whether a non-trailer HEADERS frame has
+    already been received for the stream: each call allocates a fresh
+    []qpack.HeaderField slice and copies decoded field strings into heap. The
+    second (and subsequent) HEADERS frames are silently processed — no
+    H3_MESSAGE_ERROR stream reset is issued.
+
+    An attacker opens 500 concurrent HTTP/3 streams and on each stream sends a
+    tight cycle: HEADERS (non-terminal, no END_STREAM) → DATA (1 byte) → HEADERS
+    (non-terminal, no END_STREAM) → DATA (1 byte) → … for the full stream
+    lifetime. Each HEADERS frame forces a []qpack.HeaderField allocation (~512 B
+    base slice + string copies for each field). With a 30-field request header,
+    each cycle produces ~8 KB of heap allocation that the GC cannot reclaim until
+    stream close. With 500 streams × 1,000 cycles, ~4 GB of header allocations
+    accumulate before caddy's stream timeout fires.
+
+    Assumptions:
+    - A1: caddy/http3 does not enforce the RFC 9114 §4.1 one-non-trailer-HEADERS
+          invariant; subsequent HEADERS frames on a stream are decoded instead of
+          triggering H3_MESSAGE_ERROR.
+    - A2: Each HEADERS frame allocates a fresh []qpack.HeaderField slice and
+          copies decoded field strings — the prior allocation is not reused.
+    - A3: Allocated header slices are not GC-eligible until stream close; they
+          accumulate for the full stream lifetime.
+
+    Suspected mechanism:
+    1. Attacker opens 500 HTTP/3 streams to caddy.
+    2. Each stream: send HEADERS (non-terminal) + DATA (1 byte) in a tight loop
+       without END_STREAM — caddy decodes each HEADERS frame, allocating ~8 KB.
+    3. Allocations accumulate per stream: 1,000 cycles × 8 KB = 8 MB per stream.
+    4. 500 streams × 8 MB = 4 GB heap before stream timeouts fire → OOM kill.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/caddyserver/caddy
+  version: v2.9.1
+  protocol: HTTP/3
+  entry_point: "UDP port 443, HTTP/3 over QUIC"
+  docker_image: "caddy:2.9.1"
+
+assumptions:
+  - id: A1
+    description: "caddy/http3 does not reject multiple non-trailer HEADERS frames per stream — no H3_MESSAGE_ERROR reset issued on second HEADERS"
+    necessity: required
+  - id: A2
+    description: "Each HEADERS frame allocates a new []qpack.HeaderField slice; prior allocation is not freed until stream close"
+    necessity: required
+  - id: A3
+    description: "No per-stream allocation cap or header-bytes budget prevents accumulation across multiple HEADERS frames on the same stream"
+    necessity: required
+
+suspected_mechanism:
+  - step: 1
+    action: "Open 500 concurrent HTTP/3 streams to caddy on UDP port 443"
+  - step: 2
+    action: "Each stream: loop — send HEADERS (30 fields, non-terminal, no END_STREAM) + DATA (1 byte); no stream close"
+  - step: 3
+    action: "caddy decodes each HEADERS frame, allocating ~8 KB of []qpack.HeaderField per cycle"
+  - step: 4
+    action: "Allocations accumulate for stream lifetime (no GC until close); 500 streams × 1,000 cycles × 8 KB → heap exhaustion"
+
+rfc_sections:
+  - rfc: RFC 9114
+    section: "4.1"
+    dos_relevance: "HTTP/3 message framing — only one non-trailer HEADERS frame permitted per stream; server MUST reset stream with H3_MESSAGE_ERROR on violation"
+  - rfc: RFC 9114
+    section: "4.2.2"
+    dos_relevance: "MUST NOT allow peer to cause excessive memory allocation for field sections"
+  - rfc: RFC 9204
+    section: "7"
+    dos_relevance: "QPACK Security — decoder MUST limit memory for decoded field sections"
+
+related_work:
+  - type: cve
+    id: CVE-2026-58823
+  - type: cve
+    id: CVE-2023-44487

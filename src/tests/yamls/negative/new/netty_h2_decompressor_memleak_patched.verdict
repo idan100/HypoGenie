@@ -1,0 +1,22 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: Netty 4.1.136.Final adds writeSucceeded guard that releases ByteBuf in catch block — assumption A1 is refuted
+
+TARGET_IMAGE: eclipse-temurin:21-jre-jammy (custom Netty HTTP/2 server, netty-codec-http2:4.1.136.Final)
+TARGET_PORT: 8443/tcp
+CLIENT_TOOL: h2
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Opened an HTTP/2 connection with gzip content-encoding, completed a stream to trigger
+  decompressor cleanup, then sent DATA frames for the cleaned-up stream against Netty
+  4.1.136.Final. Each writeInbound ClosedChannelException was caught with writeSucceeded
+  == false, so data.release() was called correctly. JVM direct memory stayed flat
+  throughout a 60s sustained attack. No OutOfMemoryError observed. Static analysis of
+  DelegatingDecompressorFrameListener in 4.1.136.Final confirms the writeSucceeded flag
+  and the release call in the catch block. Fix introduced July 2026 (CVE-2026-56819).
+DISPROOF_NOTES: Assumption A1 ("ByteBuf not released on ClosedChannelException") is
+                refuted. Netty 4.1.136.Final introduced the writeSucceeded flag in
+                Http2Decompressor.decompress(). The concurrency-pivot attack (racing
+                stream resets with DATA frames) is also blocked: the guard is per-call,
+                not per-connection.

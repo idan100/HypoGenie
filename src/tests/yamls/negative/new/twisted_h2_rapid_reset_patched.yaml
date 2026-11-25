@@ -1,0 +1,79 @@
+hypothesis:
+  description: |
+    GHSA-vpp8-g58w-m8mp (no CVE assigned; related to CVE-2023-44487): Twisted's
+    H2Connection.dataReceived in src/twisted/web/_http2.py processes hyper-h2 events
+    sequentially. A HEADERS frame with END_STREAM set followed by RST_STREAM on the
+    same stream produces three events in order: RequestReceived, StreamEnded, then
+    StreamReset. StreamEnded dispatches and fully renders the request synchronously
+    before StreamReset is processed. When RST_STREAM is finally handled, the stream
+    is freed immediately, so it never counts against the 100-stream concurrent-stream
+    limit. No reset-rate limiter of any kind is applied. The pattern therefore
+    repeats at line rate on a single connection: each cycle costs the attacker one
+    round trip (HEADERS + RST_STREAM), but Twisted processes a full request render
+    for each cycle. CPU is consumed proportionally to the cycle rate.
+
+    The existing outbound control-frame buffering fix from GHSA-32gv covers only
+    outbound data, not this inbound dispatch path. Twisted 26.10.0rc1 (commit
+    4989394, PR #12749, October 2026) adds a reset-rate limiter for this pattern.
+
+    This hypothesis tests the attack against Twisted 26.10.0 (the patched release).
+    Assumption A1 is expected to be refuted because the reset-rate limiter is present
+    in 26.10.0.
+
+    Pivot note: If a per-connection reset rate limit is enforced, an attacker might
+    pivot to opening many concurrent connections and running the pattern on each at
+    a rate below the per-connection limit. This pivot is also blocked: Twisted 26.10.0
+    applies a global reset budget across all connections on the same server, so the
+    total reset rate is capped regardless of connection count.
+
+    Assumptions:
+    - A1: Twisted 26.10.0 applies no rate limit to the HEADERS(END_STREAM)+RST_STREAM
+          rapid-reset pattern and dispatches a full request render for each cycle.
+    - A2: Each HEADERS+RST_STREAM cycle completes a full request render synchronously
+          before the RST_STREAM is handled, consuming CPU proportional to cycle rate.
+    - A3: Sustaining maximum cycle rate on a single connection causes CPU exhaustion
+          within the 30s attack window.
+
+  dos_class: cpu
+
+target:
+  repo: https://github.com/twisted/twisted
+  version: "26.10.0"
+  protocol: HTTP/2
+  entry_point: "TCP port 8443, HTTP/2 over TLS (Twisted treq/web HTTP/2 server)"
+  docker_image: "python:3.12-slim (custom Twisted HTTP/2 server: pip install twisted==26.10.0)"
+
+assumptions:
+  - id: A1
+    description: "Twisted 26.10.0 applies no rate limit to the HEADERS(END_STREAM)+RST_STREAM rapid-reset cycle"
+    necessity: required
+  - id: A2
+    description: "Each cycle dispatches a full request render before RST_STREAM is handled, consuming CPU proportionally"
+    necessity: required
+  - id: A3
+    description: "Maximum cycle rate on a single connection causes CPU exhaustion within 30s"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open HTTP/2 connection to the Twisted 26.10.0 server"
+  - step: 2
+    action: "Send HEADERS frame with END_STREAM=1 on a new stream, immediately followed by RST_STREAM on the same stream"
+  - step: 3
+    action: "Twisted 26.10.0 reset-rate limiter triggers — connection throttled or closed after threshold"
+  - step: 4
+    action: "CPU stays bounded; no sustained exhaustion; probe requests respond normally"
+
+rfc_sections:
+  - rfc: RFC 7540
+    section: "8.1"
+    dos_relevance: "HEADERS with END_STREAM initiates and immediately closes a request stream — RST_STREAM can follow"
+  - rfc: RFC 7540
+    section: "6.4"
+    dos_relevance: "RST_STREAM frees the stream from the concurrent-stream count — attacker can recycle stream IDs at line rate"
+
+related_work:
+  - type: advisory
+    id: "GHSA-vpp8-g58w-m8mp"
+  - type: cve
+    id: CVE-2023-44487

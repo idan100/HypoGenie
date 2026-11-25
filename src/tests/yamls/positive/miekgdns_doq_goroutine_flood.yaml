@@ -1,0 +1,85 @@
+hypothesis:
+  description: |
+    RFC 9250 §4.3.1 states: "A DNS-over-QUIC server SHOULD limit the number of
+    open streams per QUIC connection." miekg/dns introduced a DNS-over-QUIC (DoQ)
+    listener in v1.1.58, backed by quic-go. The listener loop calls
+    quicListener.AcceptStream() and dispatches each accepted stream to a new
+    goroutine. The quic-go QUIC config is constructed with default parameters:
+    MaxIncomingStreams is never capped via quic.Config.MaxIncomingUniStreams or
+    MaxIncomingBiStreams, so quic-go advertises its default MAX_STREAMS ceiling
+    (~100 for the initial window, but re-advertised upward as streams close).
+
+    An attacker opens one QUIC connection and immediately opens the maximum
+    advertised number of bidirectional streams without sending any payload.
+    Each accepted stream triggers a goroutine allocation (~8 KB initial stack)
+    plus a dns.Msg read buffer (512 B–64 KB). Because the attacker never closes
+    streams, goroutines block indefinitely on stream.Read() holding their
+    allocated stacks. As the server re-advertises MAX_STREAMS to refill the
+    attacker's quota, the attacker opens more streams. The cycle repeats:
+    goroutine count and heap grow without bound until RSS exhaustion or OOM kill.
+
+    Assumptions:
+    - A1: miekg/dns DoQ listener calls AcceptStream() with no per-connection
+          stream count cap; each accepted stream spawns an unbounded goroutine.
+    - A2: quic-go server config does not set MaxIncomingStreams, so the server
+          re-advertises MAX_STREAMS as open streams nominally close (they never
+          do because the attacker holds all streams open).
+    - A3: No connection-level idle timeout terminates the QUIC connection before
+          goroutine count accumulates past the memory threshold.
+
+    Suspected mechanism:
+    1. Attacker opens one QUIC connection to the DoQ server (port 853/udp).
+    2. Attacker opens MAX_STREAMS bidirectional streams without sending any DNS
+       query bytes — streams remain open and block on the server's Read().
+    3. Server spawns one goroutine per stream; each holds its stack (~8 KB) and
+       a read buffer.
+    4. Server re-advertises MAX_STREAMS as its bookkeeping permits; attacker
+       opens more streams immediately.
+    5. Goroutine count and heap grow → RSS exhaustion in ~30s.
+
+  dos_class: memory
+
+target:
+  repo: https://github.com/miekg/dns
+  version: v1.1.63
+  protocol: DNS-over-QUIC
+  entry_point: "UDP port 853, DNS-over-QUIC (RFC 9250)"
+  docker_image: "hypogenie/miekgdns-doq:v1.1.63"
+
+assumptions:
+  - id: A1
+    description: "miekg/dns DoQ listener accepts QUIC bidirectional streams with no per-connection cap — MaxIncomingStreams never set in quic.Config"
+    necessity: required
+  - id: A2
+    description: "Each accepted stream spawns one goroutine blocking on stream.Read(); goroutine holds stack (~8 KB) + read buffer for stream lifetime"
+    necessity: required
+  - id: A3
+    description: "No connection-level idle timeout or goroutine limit terminates the connection before heap exhaustion"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open one QUIC connection to UDP port 853 (DoQ listener)"
+  - step: 2
+    action: "Flood open bidirectional streams without sending any payload — server blocks each goroutine on stream.Read()"
+  - step: 3
+    action: "Server re-advertises MAX_STREAMS credit; attacker opens more streams immediately"
+  - step: 4
+    action: "Repeat — goroutine count accumulates with no bound → heap exhaustion"
+
+rfc_sections:
+  - rfc: RFC 9250
+    section: "4.3.1"
+    dos_relevance: "DoQ servers SHOULD limit concurrent open streams per connection"
+  - rfc: RFC 9000
+    section: "19.11"
+    dos_relevance: "MAX_STREAMS transport parameter controls stream concurrency; servers must cap it"
+  - rfc: RFC 9250
+    section: "5.5.2"
+    dos_relevance: "DoQ servers MUST enforce timeouts on idle streams and connections"
+
+related_work:
+  - type: cve
+    id: CVE-2026-71249
+  - type: cve
+    id: CVE-2023-44487

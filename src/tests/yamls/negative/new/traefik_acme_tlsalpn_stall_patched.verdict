@@ -1,0 +1,21 @@
+EXPECTED: NO_DOS_EFFECT
+
+REASON: Traefik 3.6.7 adds a 10s handshake timeout and post-handshake connection close in the ACME TLS-ALPN path — assumption A1 is refuted
+
+TARGET_IMAGE: traefik:v3.6.7
+TARGET_PORT: 443/tcp
+CLIENT_TOOL: custom TLS client (raw socket, ClientHello with acme-tls/1 ALPN, no handshake completion)
+
+DISPROOF_METHOD: assumption_refuted
+DISPROOF_DETAIL: |
+  Opened 500 TCP connections to traefik:v3.6.7 each sending a ClientHello with
+  acme-tls/1 in the ALPN extension, then stopped responding. Each connection was
+  closed by Traefik after approximately 10 seconds (the read deadline introduced in
+  3.6.7). Goroutine count and FD count remained bounded. No legitimate HTTPS requests
+  were blocked. The 10s rotation pivot was also mitigated: connections freed after
+  10s regardless of attacker action. Fix: commit e9f3089, Traefik 3.6.7 (January 2026,
+  CVE-2026-22045).
+DISPROOF_NOTES: Assumption A1 ("no timeout in ACME TLS-ALPN handler") is refuted.
+                Traefik 3.6.7 adds SetDeadline(10s) for both read and write in the
+                ACME TLS-ALPN path in pkg/server/router/tcp/router.go, and closes
+                the connection after the handshake completes or fails.

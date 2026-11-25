@@ -1,0 +1,86 @@
+hypothesis:
+  description: |
+    CVE-2026-22045: In Traefik's TCP router (pkg/server/router/tcp/router.go), the
+    ACME TLS-ALPN challenge handling path clears the connection's deadline before
+    handing off to acmeTLSALPNHandler().ServeTCP(). Specifically, SetDeadline(time.Time{})
+    is called just before the branch that calls tls.Server(conn, ...).Handshake().
+    This removes the read and write deadlines that the entrypoint normally enforces
+    for HTTPS connections. The TLS handshake then runs with no timeout and the
+    connection is not closed after the handshake completes or fails.
+
+    An attacker that sends a ClientHello containing the acme-tls/1 ALPN protocol
+    extension and then stops responding causes Traefik to hold one goroutine and
+    one file descriptor open indefinitely per such connection. Normal HTTPS traffic
+    flows through http.Server which enforces read and write timeouts; this ACME path
+    silently bypasses those timeouts. The conditions are: the ACME TLS-ALPN challenge
+    provider is active and allowACMEByPass is false (the default). This is a standard
+    configuration for any Traefik instance that manages its own TLS certificates via
+    Let's Encrypt.
+
+    Traefik 3.6.7 (and 2.11.35 for the v2 branch, released January 2026, commit
+    e9f3089) fixes the stall by setting 10-second read and write deadlines on the
+    connection before the handshake and closing the connection after the handshake
+    regardless of outcome.
+
+    This hypothesis tests the stall against traefik:v3.6.7. Assumption A1 is expected
+    to be refuted because the deadlines and post-handshake close are present in 3.6.7.
+
+    Pivot note: If the per-connection 10s timeout is enforced, an attacker might
+    rotate through new connections at just under 10s to maintain a constant goroutine
+    load. This pivot is also mitigated: the post-handshake connection close in 3.6.7
+    ensures the goroutine is freed promptly, so the attacker cannot hold a goroutine
+    for more than 10 seconds per connection regardless of rotation rate.
+
+    Assumptions:
+    - A1: Traefik 3.6.7 does not set a timeout on the TLS handshake in the ACME
+          TLS-ALPN path and does not close the connection after the handshake,
+          allowing a stalling attacker to hold a goroutine and file descriptor
+          indefinitely.
+    - A2: Each stalling connection permanently consumes one goroutine and one file
+          descriptor for the duration of the stall.
+    - A3: Opening enough stalling connections exhausts Traefik's goroutine pool
+          or OS file descriptor limit, blocking legitimate HTTPS traffic.
+
+  dos_class: resource_exhaustion
+
+target:
+  repo: https://github.com/traefik/traefik
+  version: v3.6.7
+  protocol: TLS
+  entry_point: "TCP port 443 (Traefik entrypoint with ACME TLS-ALPN challenge enabled)"
+  docker_image: "traefik:v3.6.7"
+
+assumptions:
+  - id: A1
+    description: "Traefik 3.6.7 applies no timeout and no post-handshake close in the ACME TLS-ALPN handler, allowing indefinite goroutine stalls"
+    necessity: required
+  - id: A2
+    description: "Each stalling connection permanently consumes one goroutine and one file descriptor"
+    necessity: required
+  - id: A3
+    description: "Enough stalling connections exhaust Traefik's goroutine pool or OS FD limit"
+    necessity: favorable
+
+suspected_mechanism:
+  - step: 1
+    action: "Open TCP connections to Traefik 3.6.7 on port 443"
+  - step: 2
+    action: "In each ClientHello, include acme-tls/1 in the ALPN extension list to route to the ACME handler"
+  - step: 3
+    action: "Stop sending after the ClientHello — do not complete the TLS handshake"
+  - step: 4
+    action: "Traefik 3.6.7 applies a 10s read deadline — connection times out and goroutine is freed"
+  - step: 5
+    action: "Listener remains responsive; FD and goroutine counts stay bounded"
+
+rfc_sections:
+  - rfc: RFC 8737
+    section: "3"
+    dos_relevance: "ACME TLS-ALPN challenge protocol — acme-tls/1 ALPN value routes to dedicated handler"
+  - rfc: RFC 8446
+    section: "4.1.2"
+    dos_relevance: "TLS ClientHello ALPN extension — attacker controls protocol selection without TLS authentication"
+
+related_work:
+  - type: cve
+    id: CVE-2026-22045
