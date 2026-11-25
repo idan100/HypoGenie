@@ -14,6 +14,7 @@ Also builds the LifecycleValidationPlan when decision != "not_applicable".
 """
 
 import re
+import socket
 from typing import Optional
 
 from lifecycle.model import (
@@ -160,12 +161,20 @@ def assess(ctx, findings: list = None, plan=None) -> LifecycleApplicability:
     )
 
 
+def _find_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
 def build_plan(
     ctx,
     applicability: LifecycleApplicability,
     lifecycle_port: int = 9444,
-    sidecar_port: int = 18080,
+    sidecar_port: Optional[int] = None,
 ) -> LifecycleValidationPlan:
+    if sidecar_port is None:
+        sidecar_port = _find_free_port()
     """
     Build a LifecycleValidationPlan for a hypothesis that passed the applicability gate.
 

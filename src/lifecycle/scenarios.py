@@ -276,7 +276,7 @@ class LifecycleRunner:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        deadline = time.time() + 4.0
+        deadline = time.time() + 8.0
         while time.time() < deadline:
             try:
                 self._read_metrics()
@@ -286,7 +286,7 @@ class LifecycleRunner:
             except Exception:
                 time.sleep(0.1)
         raise RuntimeError(
-            f"Lifecycle sidecar did not start on port {self.plan.sidecar_port} within 4s."
+            f"Lifecycle sidecar did not start on port {self.plan.sidecar_port} within 8s."
         )
 
     # ── container ─────────────────────────────────────────────────────────────
