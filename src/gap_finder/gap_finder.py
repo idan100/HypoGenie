@@ -123,8 +123,14 @@ def _detect_extensions(repo_root: str) -> list[str]:
     return top or ["*.cc", "*.h", "*.go", "*.py"]
 
 
-def _grep_files(repo_root: str, keyword: str, exts: list[str], use_rg: bool) -> list[str]:
-    """Return repo-relative paths of files containing keyword (case-insensitive)."""
+def _grep_lines(repo_root: str, keyword: str, exts: list[str], use_rg: bool) -> list[str]:
+    """
+    Return repo-relative 'file:line' strings for each match of keyword.
+    Returns at most 10 hits (first occurrence per file, up to 10 files).
+
+    Uses rg when available (fastest), falls back to git grep (respects
+    .gitignore, so won't scan .venv / node_modules), then grep -r.
+    """
     root = repo_root.rstrip("/")
     try:
         if use_rg:
@@ -132,29 +138,55 @@ def _grep_files(repo_root: str, keyword: str, exts: list[str], use_rg: bool) -> 
             for ext in exts:
                 glob_flags += ["-g", ext]
             result = subprocess.run(
-                ["rg", "-l", "--max-filesize=512K", "-i"] + glob_flags + ["--", keyword, root],
-                capture_output=True, text=True, timeout=10,
+                ["rg", "--max-filesize=512K", "-i", "-n", "--max-count=1"]
+                + glob_flags + ["--", keyword, root],
+                capture_output=True, text=True, timeout=15,
             )
-        else:
-            inc_flags: list[str] = []
-            for ext in exts:
-                inc_flags += ["--include", ext]
-            result = subprocess.run(
-                ["grep", "-rl", "-i"] + inc_flags + ["--", keyword, root],
-                capture_output=True, text=True, timeout=10,
-            )
+            # rg output: /abs/path/file.cc:42:content
+            raw_lines = result.stdout.splitlines()
+            hits, seen = [], set()
+            for line in raw_lines:
+                parts = line.split(":", 2)
+                if len(parts) < 2:
+                    continue
+                abs_path, lineno = parts[0].strip(), parts[1].strip()
+                if not lineno.isdigit():
+                    continue
+                rel = abs_path[len(root) + 1:] if abs_path.startswith(root + "/") else abs_path
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                hits.append(f"{rel}:{lineno}")
+                if len(hits) >= 10:
+                    break
+            return hits
+
+        # git grep: searches only tracked files — fast and .gitignore-aware.
+        # Output format: file.cc:42:content
+        # Path specs come after "--": git grep <opts> keyword -- *.cc *.h ...
+        path_specs = ["--"] + exts if exts else []
+        result = subprocess.run(
+            ["git", "grep", "-i", "-n", "--max-count=1", keyword] + path_specs,
+            cwd=root, capture_output=True, text=True, timeout=15,
+        )
+        hits, seen = [], set()
+        for line in result.stdout.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) < 2:
+                continue
+            rel_path, lineno = parts[0].strip(), parts[1].strip()
+            if not lineno.isdigit():
+                continue
+            if rel_path in seen:
+                continue
+            seen.add(rel_path)
+            hits.append(f"{rel_path}:{lineno}")
+            if len(hits) >= 10:
+                break
+        return hits
+
     except Exception:
         return []
-
-    paths = []
-    for line in result.stdout.splitlines():
-        p = line.strip()
-        if not p:
-            continue
-        if p.startswith(root + "/"):
-            p = p[len(root) + 1:]
-        paths.append(p)
-    return paths
 
 
 def _pre_search(repo_root: str, ctx) -> str:
@@ -181,21 +213,22 @@ def _pre_search(repo_root: str, ctx) -> str:
 
     hits: dict[str, list[str]] = {}
     for kw in keywords:
-        files = _grep_files(repo_root, kw, exts, use_rg)
-        if files:
-            hits[kw] = files[:8]
+        file_lines = _grep_lines(repo_root, kw, exts, use_rg)
+        if file_lines:
+            hits[kw] = file_lines
 
     if not hits:
         return ""
 
     lines = [
-        "## Pre-indexed file map",
-        "These files were located by keyword search before the tool-call budget starts.",
-        "Open them directly — do NOT use list_dir to navigate to them.",
+        "## Pre-indexed file map (keyword → file:line of first match)",
+        "These locations were found by keyword search before the tool-call budget starts.",
+        "Use read_file(path, start_line=N-10, end_line=N+60) on these line numbers directly.",
+        "Do NOT use list_dir — open these files immediately.",
         "",
     ]
-    for kw, files in hits.items():
-        lines.append(f"- **{kw}**: {', '.join(files)}")
+    for kw, file_lines in hits.items():
+        lines.append(f"- **{kw}**: {', '.join(file_lines)}")
     lines.append("")
     return "\n".join(lines)
 
