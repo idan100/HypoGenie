@@ -6,9 +6,9 @@ active_profile: cheap   # cheap | medium | strong
 # openai  → SPEC_PROCESSOR, GAP_FINDER, GAP_FINDER_CRITIC, EXPLOIT_PLANNER
 # anthropic → BUILDER, EXPLOITER
 profiles:
-  cheap:   { openai: "gpt-4o-mini",   anthropic: "claude-haiku-4-5"  }
-  medium:  { openai: "gpt-4o",        anthropic: "claude-haiku-4-5"  }  # isolates planner quality
-  strong:  { openai: "gpt-4o",        anthropic: "claude-sonnet-4-5" }
+  cheap:   { openai: "gpt-4.1-mini",   anthropic: "claude-haiku-4-5"  }
+  medium:  { openai: "gpt-4.1",        anthropic: "claude-haiku-4-5"  }  # isolates planner quality
+  strong:  { openai: "gpt-4.1",        anthropic: "claude-sonnet-4-5" }
 
 # ── Optional per-role overrides ───────────────────────────────────────────────
 # Takes precedence over the active profile.  Format: "provider:model"
