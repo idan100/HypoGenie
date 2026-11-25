@@ -37,7 +37,7 @@ VALID_NECESSITY = {"required", "favorable"}
 # Canonical protocol identifiers used throughout the pipeline for skeleton
 # injection, control-test selection, and validator rules.
 _KNOWN_PROTOCOLS = {
-    "HTTP/2", "gRPC", "QUIC", "DNS-over-TLS", "DNS/TLS", "MQTT", "TCP",
+    "HTTP/2", "gRPC", "QUIC", "DNS-over-TLS", "DNS/TLS", "DNS-over-QUIC", "MQTT", "TCP",
 }
 
 # Lowercase alias → canonical.  Applied before the unknown-protocol warning so
@@ -55,12 +55,22 @@ _PROTOCOL_ALIASES: dict[str, str] = {
     "h3":         "QUIC",
     "dns-over-tls": "DNS-over-TLS",
     "dot":        "DNS-over-TLS",
+    "dns-over-quic": "DNS-over-QUIC",
+    "doq":        "DNS-over-QUIC",
     "dns/tls":    "DNS/TLS",
     "mqtt":       "MQTT",
     "amqp":       "TCP",
     "amqp 1.0":   "TCP",
     "amqp1.0":    "TCP",
     "tcp":        "TCP",
+    # HTTP/1.x and raw TLS map to TCP — no h2/QUIC skeleton injection applies
+    "http/1.1":   "TCP",
+    "http/1":     "TCP",
+    "http1":      "TCP",
+    "http1.1":    "TCP",
+    "tls":        "TCP",
+    "ssl":        "TCP",
+    "tls/tcp":    "TCP",
 }
 
 

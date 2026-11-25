@@ -322,12 +322,25 @@ def _llm_with_tools(system: str, user: str, repo_root: str) -> str:
     ]
 
     max_iterations = 30
+    _BUDGET_WARN_AT = max_iterations - 5   # inject warning at iteration 25
+    _FORCE_CONCLUDE_AT = max_iterations - 1  # force no tool calls on last iteration
     for iteration in range(max_iterations):
+        # Inject budget warning so LLM prepares its JSON conclusion in time
+        if iteration == _BUDGET_WARN_AT:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"BUDGET WARNING: You have {max_iterations - iteration} tool-call "
+                    "iterations remaining. Stop searching and output your JSON conclusion "
+                    "on the NEXT iteration (do NOT make more tool calls after this)."
+                ),
+            })
+        tool_choice = "none" if iteration >= _FORCE_CONCLUDE_AT else "auto"
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
             tools=tools_schema,
-            tool_choice="auto",
+            tool_choice=tool_choice,
             response_format={"type": "json_object"},
             max_tokens=8192,
         )
@@ -436,15 +449,19 @@ def _parse_developer_output(
         raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "", raw.strip())
 
+    if not raw or not any(c in raw for c in '{['):
+        print(f"  [gap_finder] JSON parse error: empty or non-JSON response from LLM")
+        return ledger, []
+
     try:
-        data = json.loads(raw)
+        # raw_decode stops after the first complete JSON value, tolerating trailing prose.
+        data, _ = json.JSONDecoder().raw_decode(raw)
     except json.JSONDecodeError as e:
-        # LLM sometimes appends prose after the closing brace.
-        # Try extracting the first complete JSON object from the response.
+        # Fallback: extract the first {...} block if raw_decode fails.
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             try:
-                data = json.loads(m.group(0))
+                data, _ = json.JSONDecoder().raw_decode(m.group(0))
                 print(f"  [gap_finder] JSON recovered after parse error: {e}")
             except json.JSONDecodeError:
                 print(f"  [gap_finder] JSON parse error (unrecoverable): {e}")
@@ -452,6 +469,10 @@ def _parse_developer_output(
         else:
             print(f"  [gap_finder] JSON parse error: {e}")
             return ledger, []
+
+    if not isinstance(data, dict):
+        print(f"  [gap_finder] JSON parse error: LLM returned {type(data).__name__} instead of object")
+        return ledger, []
 
     # Build requirement lookup for findings.
     req_lookup = {(r.rfc, r.section): r for r in spec_reqs}
@@ -590,13 +611,17 @@ def _reinvestigate_unclear(
         raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "", raw.strip())
 
+    if not raw or not any(c in raw for c in '{['):
+        print(f"  [gap_finder] Re-investigation JSON parse error: empty or non-JSON response from LLM")
+        return ledger
+
     try:
-        data = json.loads(raw)
+        data, _ = json.JSONDecoder().raw_decode(raw)
     except json.JSONDecodeError as e:
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             try:
-                data = json.loads(m.group(0))
+                data, _ = json.JSONDecoder().raw_decode(m.group(0))
                 print(f"  [gap_finder] Re-investigation JSON recovered: {e}")
             except json.JSONDecodeError:
                 print(f"  [gap_finder] Re-investigation JSON parse error (unrecoverable): {e}")
@@ -604,6 +629,10 @@ def _reinvestigate_unclear(
         else:
             print(f"  [gap_finder] Re-investigation JSON parse error: {e}")
             return ledger
+
+    if not isinstance(data, dict):
+        print(f"  [gap_finder] Re-investigation JSON parse error: LLM returned {type(data).__name__} instead of object")
+        return ledger
 
     unclear_ids = {r.assumption_id for r in unclear}
     for v in data.get("assumption_verdicts", []):
