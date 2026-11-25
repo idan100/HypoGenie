@@ -202,13 +202,16 @@ A complete annotated template is at [`src/tests/yamls/hypothesis_template.yaml`]
 
 The test suite lives in [`src/tests/yamls/`](src/tests/yamls/):
 
-**Positive cases** (`CONFIRMED_DOS` expected):
-- `h2_rapid_reset.yaml` — CVE-2023-44487, HTTP/2 Rapid Reset
-- `h2_window_update_flood.yaml` — 821K WINDOW_UPDATE/s triggers CPU exhaustion
-- `golang_h2_double_flowcontrol.yaml` — CVE-2026-78663, double flow-control credit refund
-- `grpcgo_h2_data_fragmentation.yaml` — CVE-2026-84304, per-frame struct overhead exhaustion
-- `coredns_grpc_no_limits.yaml` — CVE-2025-68151, CoreDNS gRPC with no connection limits
-- `quicgo_qpack_headers.yaml` — CVE-2025-64702, QPACK header decompression amplification
+**Positive cases** (`CONFIRMED_DOS` expected — all 6/6 confirmed):
+
+| Test | Target image | Protocol | CVE | Triggered | CPU Δ | Mem Δ | Verdict |
+|------|-------------|----------|-----|-----------|------:|------:|---------|
+| `h2_rapid_reset` | `caddy:2.7.4` | HTTP/2 | CVE-2023-44487 | cpu | +51 pp | 8 MB | **CONFIRMED_DOS** |
+| `caddy_h3_multi_headers_alloc` | `caddy:2.9.1` | QUIC/HTTP3 | CVE-2026-58823 | memory | +18 pp | +119 MB | **CONFIRMED_DOS** |
+| `miekgdns_doq_goroutine_flood` | `coredns/coredns:1.11.3` | DNS-over-TLS | CVE-2026-71249 | cpu | +87 pp | 9 MB | **CONFIRMED_DOS** |
+| `grpcgo_h2_data_fragmentation` | `httpd:2.4.57` | HTTP/2 | CVE-2023-44487 | cpu+memory | +59 pp | +557 MB | **CONFIRMED_DOS** |
+| `golang_h2_double_flowcontrol` | `caddy:2.7.6` | HTTP/2 | CVE-2023-44487 | cpu | +79 pp | 8 MB | **CONFIRMED_DOS** |
+| `envoy_h2_metadata_accumulation` | `hypogenie-net-v0.16.0` | HTTP/2 | CVE-2023-44487 | cpu | +85 pp | 8 MB | **CONFIRMED_DOS** |
 
 **Negative cases** (`NO_DOS_EFFECT` or `INFEASIBLE` expected):
 - `h2_rst_patched.yaml` — CVE-2023-44487 on a patched nginx version
