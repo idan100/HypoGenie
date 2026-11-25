@@ -726,7 +726,7 @@ def run(
 
     Returns dict with: verdict, baseline, attack, attack2, triggered, notes
     """
-    tls = port in (443, 8443)
+    tls = port in (443, 8443, 853)  # 853 = DNS-over-TLS
     phases: list[dict] = []
     thresholds_config = {
         "cpu_delta_pp":    _CPU_DELTA_PP,
