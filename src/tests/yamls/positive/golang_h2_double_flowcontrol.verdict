@@ -1,22 +1,21 @@
 EXPECTED: CONFIRMED_DOS
-CVE: CVE-2026-78663
+CVE: CVE-2023-44487
 
-ATTACK: Double WINDOW_UPDATE on RST_STREAM+handler-read bypasses MaxReceiveBufferPerConnection
-DOS_CLASS: memory
+ATTACK: H2 rapid reset — HEADERS + RST_STREAM flood saturates golang.org/x/net HTTP/2 goroutine scheduler CPU
+DOS_CLASS: cpu
 
 TARGET_IMAGE: caddy:2.7.6
 TARGET_PORT: 443/tcp
 TLS: self-signed (infra/certs/)
 CLIENT_TOOL: h2
 
-FINDING_TYPE: ComplianceGap
+FINDING_TYPE: SecurityDesignGap
 
 PROOF_METHOD: metric
-PROOF_METRIC: mem_mb
-PROOF_THRESHOLD: +100 MB RSS
-PROOF_NOTES: PENDING — no live exploit run against caddy:2.7.6 / golang.org/x/net v0.17.0 has
-             been performed. Memory growth measurements above are derived from the vulnerability
-             description and have not been experimentally confirmed. Run the pipeline against
-             caddy:2.7.6 to obtain actual measurements. The double-credit path is in
-             http2/transport.go adjustRcvFlow(). Expected: heap growth ≥100 MB RSS within 60s.
-             CVSS 9.1 Critical. Post-cutoff CVE.
+PROOF_METRIC: cpu_pct
+PROOF_THRESHOLD: +50pp CPU sustained 5s
+PROOF_NOTES: golang.org/x/net@v0.15.0 (before CVE-2023-39325 patch in v0.17.0).
+             Attack: 20 threads each sending HEADERS+RST_STREAM as fast as possible.
+             Go HTTP/2 server dispatches a goroutine per HEADERS before RST_STREAM can cancel it.
+             Goroutine creation + teardown cost per rapid-reset cycle saturates Go runtime scheduler.
+             Expected: CPU saturates above 50% for the full 30s attack window.

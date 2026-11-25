@@ -62,7 +62,9 @@ Given a target server product, version, and entry point (protocol + port), gener
 ## Product-specific notes
 - **caddy**: Use Caddyfile format. MUST include `{ auto_https off }` global block to disable
   automatic ACME certs (we provide custom certs). TLS block: `tls /certs/server.crt /certs/server.key`.
-  HTTP/2 is enabled automatically — do NOT add a `protocols` directive (it does not exist).
+  HTTP/2 AND HTTP/3 (QUIC) are both enabled automatically when TLS is configured — do NOT add a
+  `protocols` directive (it does not exist). This applies for protocol=HTTP/2, protocol=QUIC,
+  and protocol=HTTP/3: use the SAME Caddyfile template for all.
   config_path = /etc/caddy/Caddyfile. Use EXACTLY this template (do not add other directives):
   ```
   {
@@ -75,24 +77,72 @@ Given a target server product, version, and entry point (protocol + port), gener
   ```
 - **nginx**: Use nginx.conf format. config_path = /etc/nginx/nginx.conf.
   Wrap in `events {}` and `http { server { ... } }` blocks.
+  For HTTP/2 with TLS use this template:
+  ```
+  events {}
+  http {
+      server {
+          listen 443 ssl http2;
+          ssl_certificate     /certs/server.crt;
+          ssl_certificate_key /certs/server.key;
+          ssl_protocols       TLSv1.2 TLSv1.3;
+          location / { return 200 "ok"; }
+      }
+  }
+  ```
+- **httpd** / **apache/httpd** (httpd:*): Use httpd.conf format.
+  config_path = /usr/local/apache2/conf/httpd.conf.
+  To enable HTTP/2 with TLS, use EXACTLY this template (do not include AllowOverride or .htaccess):
+  ```
+  ServerName localhost
+  LoadModule mpm_event_module modules/mod_mpm_event.so
+  LoadModule http2_module modules/mod_http2.so
+  LoadModule ssl_module modules/mod_ssl.so
+  LoadModule unixd_module modules/mod_unixd.so
+  LoadModule authz_core_module modules/mod_authz_core.so
+  LoadModule mime_module modules/mod_mime.so
+  LoadModule log_config_module modules/mod_log_config.so
+  TypesConfig /dev/null
+  User daemon
+  Group daemon
+  Protocols h2 http/1.1
+  Listen 443
+  <VirtualHost *:443>
+      SSLEngine on
+      SSLCertificateFile    /certs/server.crt
+      SSLCertificateKeyFile /certs/server.key
+      SSLProtocol           TLSv1.2 TLSv1.3
+      Protocols             h2 http/1.1
+      <Location />
+          Require all granted
+      </Location>
+  </VirtualHost>
+  ```
+  ports = "443:443/tcp".
 - **coredns**: Use Corefile format. IMPORTANT notes:
-  1. config_path = /Corefile (CoreDNS working directory is /; reads Corefile from there,
-     NOT from /etc/coredns/).
+  1. config_path = /home/nonroot/Corefile (CoreDNS Docker image working directory is
+     /home/nonroot; it looks for Corefile relative to that directory at startup.
+     Mount at /home/nonroot/Corefile — NOT at /Corefile or /etc/coredns/).
   2. The standard `coredns/coredns` Docker image does NOT include the `doh` plugin.
      Do NOT use `doh`. Do NOT use `grpc` as a server listener.
   3. To serve DNS-over-TLS, the zone prefix MUST start with `tls://` — without it
      CoreDNS ignores the `tls` directive and listens as plain TCP DNS (probe will fail).
+     Use the port number from entry_point (e.g. `tls://.:853` for port 853).
   4. Use the built-in `erratic` plugin as the backend INSTEAD of `forward . 8.8.8.8`.
      `erratic` responds to all queries with NOERROR (no external DNS dependency) and
      accepts a `delay` parameter to hold each query goroutine for a fixed duration.
      This makes tests reliable in isolated environments and deterministic under load.
      Use `erratic { delay 5s }` for goroutine/memory accumulation attacks.
      Use `erratic` (no delay) for latency or connection-count attacks.
+  For DNS-over-TLS goroutine-exhaustion tests (dos_class=memory), use `erratic { delay 1 5s }`
+  to delay every query by 5 seconds, holding handler goroutines long enough for accumulation.
+  (`delay AMOUNT DURATION` = delay 1 out of AMOUNT queries by DURATION; `delay 1 5s` = every query.)
+  For other tests, use `erratic` (no delay) for fast responses.
   ```
-  tls://.:443 {
+  tls://.:853 {
       tls /certs/server.crt /certs/server.key
       erratic {
-          delay 5s
+          delay 1 5s
       }
       log
       errors
@@ -101,6 +151,9 @@ Given a target server product, version, and entry point (protocol + port), gener
 - **haproxy**: Use haproxy.cfg format. config_path = /etc/haproxy/haproxy.cfg.
 - **grpcgo-server** (hypogenie/grpcgo-server:*): Custom gRPC-Go image. Handles all configuration
   internally (TLS certs mounted at /certs/). Return config_path = "" and config = "".
+  ports = "443:443/tcp".
+- **hypogenie-net-v*** (hypogenie-net-v*:*): Custom Go HTTP/2 server built from golang.org/x/net.
+  Handles all configuration internally (TLS certs mounted at /certs/). Return config_path = "" and config = "".
   ports = "443:443/tcp".
 - **http3-server** (hypogenie/http3-server:*): Custom HTTP/3 server. Handles all configuration
   internally (TLS certs mounted at /certs/). Return config_path = "" and config = "".

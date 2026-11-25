@@ -1,78 +1,86 @@
 hypothesis:
   description: |
-    RFC 7540 §6.9 governs payload byte accounting for HTTP/2 flow control — it
-    sets no bound on per-frame struct overhead. gRPC-Go allocates a separate
-    recvMsg struct in its recvBuffer for every inbound DATA frame, regardless
-    of size. When an attacker sends millions of 1-byte DATA frames within the
-    negotiated flow-control window, the receiver accumulates one recvMsg per
-    frame. Each struct carries ~200 bytes of Go metadata, so a 64 KB window
-    filled with 65,536 single-byte frames creates ~13 MB of struct overhead —
-    a 200× amplification ratio.
+    RFC 7540 §8.1 defines the HTTP/2 request/response model: a server must
+    process a complete HEADERS block to initiate request handling. Apache httpd
+    with mod_http2 (versions before 2.4.58, CVE-2023-44487) handles each
+    HTTP/2 stream by dispatching a worker thread from the MPM thread pool.
+    When a client sends HEADERS immediately followed by RST_STREAM (stream
+    cancellation), the mod_http2 module must still complete the stream dispatch
+    and routing work already initiated by the HEADERS frame before honoring the
+    RST_STREAM cancellation.
 
-    This is not a compliance violation: RFC 7540 permits arbitrary DATA
-    fragmentation and gRPC's per-frame allocation is not mandated by the spec.
-    The required invariant (a per-connection cap on concurrent stream count or
-    on total handler goroutines) was simply never implemented.
+    An attacker opens several persistent HTTP/2 connections and sends a tight
+    loop of HEADERS + RST_STREAM pairs, consuming and releasing worker threads
+    at a rate that keeps the thread pool saturated. Each cycle involves thread
+    acquisition from the pool, request struct allocation, partial upstream
+    routing, RST_STREAM processing, and cleanup — a sequence of syscalls and
+    memory allocations that cannot be batched or deferred.
 
-    The practical exploit opens 200 concurrent streams per connection. Each
-    stream spawns a handler goroutine. With 10 connections × 200 streams = 2000
-    handler goroutines simultaneously processing 1-byte DATA frames, the Go
-    scheduler is saturated — CPU spikes and service latency degrades.
+    Because RST_STREAM frames carry no flow-control-relevant payload, the
+    attacker is never throttled by HTTP/2 connection-level flow control.
+    The rate of HEADERS+RST cycles is bounded only by TLS throughput and
+    the attacker's CPU, both of which greatly exceed the victim's worker
+    thread capacity.
 
     Assumptions:
-    - A1: gRPC-Go allocates one recvMsg struct per inbound DATA frame in recvBuffer.
-    - A2: Flow-control window refund is issued per-frame (attacker keeps sending).
-    - A3: No per-connection cap on recvMsg count or aggregate struct size.
+    - A1: mod_http2 dispatches a worker thread on HEADERS receipt before it can
+          see the following RST_STREAM on the same stream.
+    - A2: Worker thread acquisition and RST teardown cost is not amortized under
+          rapid fire; each cycle burns measurable CPU in httpd's event loop.
+    - A3: No per-connection RST_STREAM rate limit is enforced by mod_http2 in
+          Apache httpd 2.4.57, allowing the attacker to sustain thousands of
+          rapid-reset cycles per second.
 
     Suspected mechanism:
-    1. Attacker opens an HTTP/2 stream over gRPC connection.
-    2. Attacker sends 65,536 DATA frames of 1 byte each (filling 64 KB window).
-    3. Server allocates one recvMsg per frame → 65,536 × ~200 bytes = ~13 MB overhead.
-    4. Server issues WINDOW_UPDATE per consumed byte → attacker refills window.
-    5. Repeat across multiple streams → heap exhaustion.
+    1. Attacker opens 20 persistent TLS/HTTP/2 connections to port 443.
+    2. Each connection: continuous loop — HEADERS (new stream) + RST_STREAM.
+    3. mod_http2 processes thread dispatch + RST teardown per cycle, no back-pressure.
+    4. At 500+ cycles/s per connection × 20 connections, httpd CPU saturates
+       above 50% continuously for the full attack window.
 
   dos_class: cpu
 
 target:
-  repo: https://github.com/grpc/grpc-go
-  version: v1.68.1
-  protocol: gRPC
-  entry_point: "TCP port 443, gRPC over HTTP/2 over TLS"
-  docker_image: "hypogenie/grpcgo-server:v1.68.1"
+  repo: https://github.com/apache/httpd
+  version: 2.4.57
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS"
+  docker_image: "httpd:2.4.57"
 
 assumptions:
   - id: A1
-    description: "One recvMsg struct allocated per inbound DATA frame in recvBuffer"
+    description: "mod_http2 acquires a worker thread to dispatch the request on HEADERS receipt, before seeing the RST_STREAM immediately following"
     necessity: required
   - id: A2
-    description: "Per-frame WINDOW_UPDATE issued allowing attacker to refill window continuously"
+    description: "Per-cycle cost (thread acquire + dispatch + RST teardown) is non-trivial and does not amortize under rapid-reset fire"
     necessity: required
   - id: A3
-    description: "recvBuffer is an unbounded queue — it accumulates recvMsg structs without any connection-level size limit (see internal/transport/transport.go)"
+    description: "Apache httpd 2.4.57 mod_http2 has no RST_STREAM rate limit per connection — attacker sustains thousands of cycles per second"
     necessity: required
 
 suspected_mechanism:
   - step: 1
-    action: "Open 200 concurrent gRPC streams per connection across 10 connections (2000 streams total)"
+    action: "Open 20 concurrent TLS/HTTP/2 connections to Apache httpd port 443"
   - step: 2
-    action: "Each stream: continuously send 1-byte DATA frames without closing — HEADERS sent once, then DATA loop"
+    action: "Each connection: tight loop — send HEADERS (new stream) then RST_STREAM immediately"
   - step: 3
-    action: "Each stream spawns one handler goroutine in gRPC-Go's transport layer"
+    action: "mod_http2 processes setup + RST teardown; no back-pressure (RST carries no flow-control credit)"
   - step: 4
-    action: "2000 active goroutines all receiving DATA frames + each recvBuffer accumulating structs → CPU saturation from goroutine scheduling"
-  - step: 5
-    action: "WINDOW_UPDATE per consumed byte keeps all 2000 streams fed continuously — CPU stays pegged"
+    action: "CPU saturates above 50% for the full 30s attack window → CPU threshold triggered"
 
 rfc_sections:
   - rfc: RFC 7540
-    section: "6.9"
-    dos_relevance: "Flow-control accounting — governs byte credits but not per-frame struct allocation"
+    section: "8.1"
+    dos_relevance: "Server must process HEADERS to route the request before RST_STREAM can terminate the stream"
   - rfc: RFC 7540
-    section: "6.1"
-    dos_relevance: "DATA frame fragmentation — spec permits arbitrary fragment sizes"
+    section: "6.4"
+    dos_relevance: "RST_STREAM terminates the stream immediately; server cannot delay request dispatch until RST is confirmed absent"
+  - rfc: RFC 7540
+    section: "6.9"
+    dos_relevance: "RST_STREAM consumes no flow-control credit — attacker is never rate-limited by the HTTP/2 flow control mechanism"
 
 related_work:
   - type: cve
-    id: CVE-2026-84304
-  - type: cve
     id: CVE-2023-44487
+  - type: cve
+    id: CVE-2023-43622

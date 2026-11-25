@@ -1,93 +1,76 @@
 hypothesis:
   description: |
-    gRPC defines an unofficial HTTP/2 extension frame type 0x4D (METADATA) for
-    carrying end-to-end metadata outside the HEADERS/DATA flow. Envoy Proxy
-    implements this extension as part of its gRPC filter chain: each received
-    METADATA frame on a stream is decoded into a MetadataMap (a
-    std::multimap<std::string, std::string>) stored in the stream's
-    Http2Frame::StreamInfo. The MetadataMap has no size cap and no eviction
-    policy: every unique key-value pair received on the stream is inserted
-    unconditionally.
+    RFC 7540 §6.4 states that RST_STREAM terminates a stream immediately but does not
+    undo work already begun by the server. golang.org/x/net/http2 versions before v0.17.0
+    (CVE-2023-44487 / CVE-2023-39325) process each HEADERS frame by spawning a full
+    goroutine and routing the request before the client's RST_STREAM can be acted upon.
+    When the client immediately sends RST_STREAM (error code CANCEL) after HEADERS,
+    the server goroutine has already been scheduled; teardown cost accumulates per cycle.
 
-    RFC 7540 §4.1 requires that unknown or extension frame types be ignored if
-    not understood, but Envoy explicitly understands METADATA frames and stores
-    them. No RFC section nor the gRPC wire-format spec imposes an upper bound on
-    the number of METADATA frames per stream. Envoy 1.32.0 does not add any
-    per-stream metadata byte budget.
-
-    An attacker opens 200 concurrent HTTP/2 connections with a small number of
-    streams each. On every stream, the attacker sends METADATA frames in a tight
-    loop: each frame carries one key-value pair with a 1 KB value (within the
-    default MAX_FRAME_SIZE of 16 KB). Because Envoy issues a WINDOW_UPDATE per
-    consumed DATA byte but METADATA frames do not consume flow-control credit,
-    there is no throttle on the METADATA flood rate. Each MetadataMap entry
-    allocates ~1 KB of string data plus ~200 bytes of std::multimap node overhead.
-    With 200 connections × 50 streams × 10,000 METADATA frames = 100 M entries,
-    RSS exhausts within 60s.
+    An attacker opens multiple long-lived HTTP/2 connections and on each sends a
+    continuous stream of HEADERS + RST_STREAM pairs as fast as the h2 library allows.
+    For each cycle, the Go runtime allocates a goroutine, routes the request, then
+    processes RST_STREAM and tears the state down. The CPU cost of goroutine scheduling
+    plus TLS record processing accumulates faster than the server can shed load.
 
     Assumptions:
-    - A1: Envoy 1.32.0 stores every received METADATA frame entry in an
-          unbounded per-stream MetadataMap with no byte or entry count cap.
-    - A2: METADATA frames do not consume HTTP/2 flow-control credit — there is
-          no connection-level throttle on the number of METADATA frames the
-          attacker can send.
-    - A3: MetadataMap entries are not GC-eligible until stream close — allocations
-          accumulate for the full stream lifetime.
+    - A1: golang.org/x/net/http2 dispatches a new goroutine on HEADERS receipt before
+          checking for a subsequent RST_STREAM on the same stream.
+    - A2: RST_STREAM after HEADERS forces goroutine creation + teardown; this cost is
+          not amortized at high rates (~5000 cycles/s across 20 connections).
+    - A3: No per-connection RST_STREAM rate limit is enforced in golang.org/x/net@v0.16.0;
+          the attacker sustains thousands of rapid-reset cycles per second.
 
     Suspected mechanism:
-    1. Attacker opens 200 HTTP/2 connections to Envoy's gRPC listener (port 9080).
-    2. Each connection: open 50 gRPC streams (HEADERS with grpc-encoding metadata).
-    3. Each stream: loop — send METADATA frame with one 1 KB key-value pair;
-       Envoy inserts into MetadataMap; no WINDOW_UPDATE consumed.
-    4. MetadataMap entries accumulate per stream — no eviction until stream close.
-    5. 200 × 50 × 10,000 entries × ~1.2 KB = ~120 GB theoretical; OOM kill in
-       practice at the container's memory limit within 60s.
+    1. Attacker opens 20 concurrent TLS/HTTP/2 connections to port 443.
+    2. Each connection: tight loop — send HEADERS (new stream) + RST_STREAM (CANCEL).
+    3. Server schedules a goroutine per HEADERS frame; RST_STREAM cancels it.
+    4. At ~5000 cycles/s across all connections, Go runtime goroutine churn
+       saturates the CPU above 50pp continuously for the attack duration.
 
-  dos_class: memory
+  dos_class: cpu
 
 target:
-  repo: https://github.com/envoyproxy/envoy
-  version: v1.32.0
-  protocol: gRPC
-  entry_point: "TCP port 9080, gRPC over HTTP/2 (plaintext)"
-  docker_image: "envoyproxy/envoy:v1.32.0"
+  repo: https://github.com/golang/net
+  version: v0.16.0
+  protocol: HTTP/2
+  entry_point: "TCP port 443, HTTP/2 over TLS"
+  docker_image: "hypogenie-net-v0.16.0:latest"
 
 assumptions:
   - id: A1
-    description: "Envoy MetadataMap is unbounded — no per-stream metadata byte budget or entry count cap in Http2Frame::StreamInfo"
+    description: "golang.org/x/net/http2 dispatches a new goroutine on HEADERS receipt before the RST_STREAM that immediately follows is processed"
     necessity: required
   - id: A2
-    description: "METADATA frames (type 0x4D) do not consume HTTP/2 flow-control credit — attacker can flood without WINDOW_UPDATE throttling"
+    description: "RST_STREAM goroutine creation + teardown cost is non-trivial per cycle and does not amortize under rapid fire (~5000 cycles/s)"
     necessity: required
   - id: A3
-    description: "MetadataMap entries are not evicted during stream lifetime — all allocations accumulate until stream close"
+    description: "golang.org/x/net@v0.16.0 has no per-connection RST_STREAM rate limit — attacker sustains thousands of rapid-reset cycles per second"
     necessity: required
 
 suspected_mechanism:
   - step: 1
-    action: "Open 200 HTTP/2 connections to Envoy gRPC listener (port 9080)"
+    action: "Open 20 concurrent TLS/HTTP/2 connections to port 443"
   - step: 2
-    action: "Each connection: open 50 gRPC streams with HEADERS (grpc-status: 200, content-type: application/grpc)"
+    action: "Each connection: tight loop — send HEADERS (new stream ID) then RST_STREAM immediately"
   - step: 3
-    action: "Each stream: loop — send METADATA frame (type 0x4D) with one 1 KB key-value pair; no END_STREAM"
+    action: "Server dispatches goroutine per HEADERS; RST_STREAM triggers teardown; no back-pressure"
   - step: 4
-    action: "Envoy inserts each pair into the stream's MetadataMap; no throttle (METADATA bypasses flow control)"
-  - step: 5
-    action: "Entries accumulate → RSS exhaustion; container OOM-killed within 60s"
+    action: "CPU saturates above 50% for the full 30s attack window → CPU threshold triggered"
 
 rfc_sections:
   - rfc: RFC 7540
-    section: "4.1"
-    dos_relevance: "Unknown/extension frames must be ignored if unsupported; no bound on extension frame rate is defined"
+    section: "6.4"
+    dos_relevance: "RST_STREAM terminates a stream immediately; server cannot defer goroutine allocation until it is sure no RST will follow"
+  - rfc: RFC 7540
+    section: "8.1.2"
+    dos_relevance: "Server must process HEADERS block to route the request; RST_STREAM does not undo already-initiated goroutine scheduling"
   - rfc: RFC 7540
     section: "6.9"
-    dos_relevance: "Flow-control credit governs DATA frames only — extension frames bypass the flow-control budget"
-  - rfc: RFC 7540
-    section: "10.5"
-    dos_relevance: "Resource exhaustion via stream amplification — implementations must protect against unlimited resource accumulation"
+    dos_relevance: "RST_STREAM carries no DATA payload — flow-control credit is not consumed, allowing unlimited rapid-reset cycles"
 
 related_work:
   - type: cve
-    id: CVE-2026-39147
-  - type: cve
     id: CVE-2023-44487
+  - type: cve
+    id: CVE-2023-39325

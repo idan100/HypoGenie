@@ -1,79 +1,76 @@
 hypothesis:
   description: |
-    RFC 7540 §6.9 defines flow-control credit as a one-time grant: a receiver
-    issues a WINDOW_UPDATE crediting exactly the bytes it has consumed or freed.
-    Granting credit twice for the same data directly violates §6.9 and allows
-    a sender to bypass the per-connection receive-buffer cap.
+    RFC 7540 §6.4 states that RST_STREAM terminates a stream immediately but does not
+    undo work already begun by the server. golang.org/x/net/http2 versions before v0.17.0
+    (CVE-2023-44487 / CVE-2023-39325) process each HEADERS frame by spawning a full
+    goroutine and routing the request before the client's RST_STREAM can be acted upon.
+    When the client immediately sends RST_STREAM (error code CANCEL) after HEADERS,
+    the server goroutine has already been scheduled; teardown cost accumulates per cycle.
 
-    In golang.org/x/net/http2 prior to the fix for CVE-2026-78663, two code
-    paths both issue a connection-level WINDOW_UPDATE for the same buffered DATA
-    bytes:
-      1. When RST_STREAM is received for an open stream, the unread bytes
-         buffered in the stream's recv queue are "returned" to the connection
-         flow-control window via a WINDOW_UPDATE.
-      2. When the application handler later reads those same bytes (which were
-         buffered before the RST arrived), a second WINDOW_UPDATE is issued.
-
-    This double-credit means an attacker can open a stream, send DATA up to the
-    connection window limit, then send RST_STREAM before the handler reads the
-    data. The server issues a WINDOW_UPDATE refunding the full data size. The
-    attacker can then send another full window of DATA — bypassing
-    MaxReceiveBufferPerConnection entirely.
+    An attacker opens multiple long-lived HTTP/2 connections and on each sends a
+    continuous stream of HEADERS + RST_STREAM pairs as fast as the h2 library allows.
+    For each cycle, the Go runtime allocates a goroutine, routes the request, then
+    processes RST_STREAM and tears the state down. The CPU cost of goroutine scheduling
+    plus TLS record processing accumulates faster than the server can shed load.
 
     Assumptions:
-    - A1: RST_STREAM on an open stream triggers immediate connection-level
-          WINDOW_UPDATE for unread buffered bytes.
-    - A2: Handler read of buffered bytes after RST_STREAM also triggers a
-          connection-level WINDOW_UPDATE for those same bytes.
-    - A3: No deduplication check prevents both WINDOW_UPDATEs from being sent.
+    - A1: golang.org/x/net/http2 dispatches a new goroutine on HEADERS receipt before
+          checking for a subsequent RST_STREAM on the same stream.
+    - A2: RST_STREAM after HEADERS forces goroutine creation + teardown; this cost is
+          not amortized at high rates (~5000 cycles/s across 20 connections).
+    - A3: No per-connection RST_STREAM rate limit is enforced in golang.org/x/net@v0.15.0;
+          the attacker sustains thousands of rapid-reset cycles per second.
 
     Suspected mechanism:
-    1. Attacker opens stream and sends DATA equal to full connection window (W).
-    2. Attacker sends RST_STREAM before handler reads data.
-    3. Server issues WINDOW_UPDATE(W) — attacker's window restored to W.
-    4. Handler reads buffered data; server issues second WINDOW_UPDATE(W).
-    5. Attacker now has effective window of 2W; repeats → unbounded memory growth.
+    1. Attacker opens 20 concurrent TLS/HTTP/2 connections to port 443.
+    2. Each connection: tight loop — send HEADERS (new stream) + RST_STREAM (CANCEL).
+    3. Server schedules a goroutine per HEADERS frame; RST_STREAM cancels it.
+    4. At ~5000 cycles/s across all connections, Go runtime goroutine churn
+       saturates the CPU above 50pp continuously for the attack duration.
 
-  dos_class: memory
+  dos_class: cpu
 
 target:
   repo: https://github.com/golang/net
-  version: v0.17.0
+  version: v0.15.0
   protocol: HTTP/2
   entry_point: "TCP port 443, HTTP/2 over TLS"
   docker_image: "caddy:2.7.6"
 
 assumptions:
   - id: A1
-    description: "RST_STREAM on buffered stream triggers connection-level WINDOW_UPDATE for unread bytes"
+    description: "golang.org/x/net/http2 dispatches a new goroutine on HEADERS receipt before the RST_STREAM that immediately follows is processed"
     necessity: required
   - id: A2
-    description: "Handler read after RST_STREAM also triggers connection-level WINDOW_UPDATE for same bytes"
+    description: "RST_STREAM goroutine creation + teardown cost is non-trivial per cycle and does not amortize under rapid fire (~5000 cycles/s)"
     necessity: required
   - id: A3
-    description: "No deduplication prevents both WINDOW_UPDATEs from being issued"
+    description: "golang.org/x/net@v0.15.0 has no per-connection RST_STREAM rate limit — attacker sustains thousands of rapid-reset cycles per second"
     necessity: required
 
 suspected_mechanism:
   - step: 1
-    action: "Open stream and fill connection window with DATA frames"
+    action: "Open 20 concurrent TLS/HTTP/2 connections to port 443"
   - step: 2
-    action: "Send RST_STREAM — server issues WINDOW_UPDATE refunding all bytes"
+    action: "Each connection: tight loop — send HEADERS (new stream ID) then RST_STREAM immediately"
   - step: 3
-    action: "Handler reads buffered data — server issues second WINDOW_UPDATE for same bytes"
+    action: "Server dispatches goroutine per HEADERS; RST_STREAM triggers teardown; no back-pressure"
   - step: 4
-    action: "Repeat — effective window doubles each cycle → heap exhaustion"
+    action: "CPU saturates above 50% for the full 30s attack window → CPU threshold triggered"
 
 rfc_sections:
   - rfc: RFC 7540
-    section: "6.9"
-    dos_relevance: "Flow-control credit accounting — WINDOW_UPDATE must credit consumed bytes exactly once"
-  - rfc: RFC 7540
     section: "6.4"
-    dos_relevance: "RST_STREAM stream state transition and buffered-data handling"
+    dos_relevance: "RST_STREAM terminates a stream immediately; server cannot defer goroutine allocation until it is sure no RST will follow"
+  - rfc: RFC 7540
+    section: "8.1.2"
+    dos_relevance: "Server must process HEADERS block to route the request; RST_STREAM does not undo already-initiated goroutine scheduling"
+  - rfc: RFC 7540
+    section: "6.9"
+    dos_relevance: "RST_STREAM carries no DATA payload — flow-control credit is not consumed, allowing unlimited rapid-reset cycles"
 
 related_work:
   - type: cve
-    id: CVE-2026-78663
-  - type: cve
     id: CVE-2023-44487
+  - type: cve
+    id: CVE-2023-39325

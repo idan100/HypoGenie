@@ -45,7 +45,7 @@ target:
   version: 4.1.136.Final
   protocol: HTTP/2
   entry_point: "TCP port 8443, HTTP/2 over TLS (Netty SslContext ALPN h2, decompression enabled)"
-  docker_image: "eclipse-temurin:21-jre-jammy (custom Netty HTTP/2 server built with netty-codec-http2:4.1.136.Final)"
+  docker_image: ~
 
 assumptions:
   - id: A1

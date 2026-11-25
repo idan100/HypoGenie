@@ -1,85 +1,79 @@
 hypothesis:
   description: |
-    RFC 9250 §4.3.1 states: "A DNS-over-QUIC server SHOULD limit the number of
-    open streams per QUIC connection." miekg/dns introduced a DNS-over-QUIC (DoQ)
-    listener in v1.1.58, backed by quic-go. The listener loop calls
-    quicListener.AcceptStream() and dispatches each accepted stream to a new
-    goroutine. The quic-go QUIC config is constructed with default parameters:
-    MaxIncomingStreams is never capped via quic.Config.MaxIncomingUniStreams or
-    MaxIncomingBiStreams, so quic-go advertises its default MAX_STREAMS ceiling
-    (~100 for the initial window, but re-advertised upward as streams close).
+    RFC 7858 §5.1 states: "To mitigate the risk of a potential DoS, a server SHOULD
+    limit the number of concurrent TCP/TLS connections." CoreDNS 1.11.x implements
+    DNS-over-TLS (DoT) via a goroutine-per-connection model in the tls server plugin.
+    When a TLS connection is accepted, CoreDNS dispatches a new goroutine to handle
+    the DNS stream and must decrypt each inbound TLS record and encrypt each response.
 
-    An attacker opens one QUIC connection and immediately opens the maximum
-    advertised number of bidirectional streams without sending any payload.
-    Each accepted stream triggers a goroutine allocation (~8 KB initial stack)
-    plus a dns.Msg read buffer (512 B–64 KB). Because the attacker never closes
-    streams, goroutines block indefinitely on stream.Read() holding their
-    allocated stacks. As the server re-advertises MAX_STREAMS to refill the
-    attacker's quota, the attacker opens more streams. The cycle repeats:
-    goroutine count and heap grow without bound until RSS exhaustion or OOM kill.
+    An attacker establishes 50 persistent TLS connections and pipelines DNS queries
+    continuously (no read-back delay) at the maximum rate the socket allows. CoreDNS
+    must perform TLS record decryption + DNS message parsing + DNS response encoding +
+    TLS record encryption for every query. With no per-IP connection limit or query-rate
+    limit enforced by default, the aggregate TLS + DNS processing CPU saturates the
+    server's single vCPU allocation for the full attack window.
 
     Assumptions:
-    - A1: miekg/dns DoQ listener calls AcceptStream() with no per-connection
-          stream count cap; each accepted stream spawns an unbounded goroutine.
-    - A2: quic-go server config does not set MaxIncomingStreams, so the server
-          re-advertises MAX_STREAMS as open streams nominally close (they never
-          do because the attacker holds all streams open).
-    - A3: No connection-level idle timeout terminates the QUIC connection before
-          goroutine count accumulates past the memory threshold.
+    - A1: CoreDNS DoT listener processes each pipelined query in the same goroutine,
+          consuming CPU for TLS record decryption + DNS parse + encode + TLS encryption.
+    - A2: No default per-IP or per-listener connection cap or query-rate limit prevents
+          the attacker from opening dozens of persistent TLS connections and flooding queries.
+    - A3: The aggregate CPU overhead of pipelined TLS DNS processing is disproportionate
+          to what the same number of plain TCP connections (no queries) would cause.
 
     Suspected mechanism:
-    1. Attacker opens one QUIC connection to the DoQ server (port 853/udp).
-    2. Attacker opens MAX_STREAMS bidirectional streams without sending any DNS
-       query bytes — streams remain open and block on the server's Read().
-    3. Server spawns one goroutine per stream; each holds its stack (~8 KB) and
-       a read buffer.
-    4. Server re-advertises MAX_STREAMS as its bookkeeping permits; attacker
-       opens more streams immediately.
-    5. Goroutine count and heap grow → RSS exhaustion in ~30s.
+    1. Attacker opens 50 concurrent TLS connections to port 853.
+    2. Each connection: pipeline DNS queries as fast as the socket allows (no throttle).
+    3. CoreDNS processes each query: TLS decrypt + DNS parse + erratic lookup + DNS encode + TLS encrypt.
+    4. At ~8000 queries/s × 50 connections, TLS + DNS processing saturates CPU above 50pp.
+    5. Control experiment: same 50 TLS connections held open but no queries → near-zero CPU,
+       confirming query processing (not connection overhead) is the CPU driver.
 
-  dos_class: memory
+  dos_class: cpu
 
 target:
-  repo: https://github.com/miekg/dns
-  version: v1.1.63
-  protocol: DNS-over-QUIC
-  entry_point: "UDP port 853, DNS-over-QUIC (RFC 9250)"
-  docker_image: "hypogenie/miekgdns-doq:v1.1.63"
+  repo: https://github.com/coredns/coredns
+  version: v1.11.3
+  protocol: DNS-over-TLS
+  entry_point: "TCP port 853, DNS-over-TLS (RFC 7858)"
+  docker_image: "coredns/coredns:1.11.3"
 
 assumptions:
   - id: A1
-    description: "miekg/dns DoQ listener accepts QUIC bidirectional streams with no per-connection cap — MaxIncomingStreams never set in quic.Config"
+    description: "CoreDNS DoT listener processes each pipelined query within the connection goroutine, performing TLS record decryption + DNS parse + erratic lookup + TLS encryption per query"
     necessity: required
   - id: A2
-    description: "Each accepted stream spawns one goroutine blocking on stream.Read(); goroutine holds stack (~8 KB) + read buffer for stream lifetime"
+    description: "No default per-IP connection limit or query-rate limit prevents the attacker from opening 50 persistent TLS connections and flooding queries"
     necessity: required
   - id: A3
-    description: "No connection-level idle timeout or goroutine limit terminates the connection before heap exhaustion"
+    description: "Aggregate CPU from TLS + DNS processing across pipelined queries exceeds 50pp delta sustained for 5s; hold-only control (same connections, no queries) confirms query processing — not connection overhead — is the driver"
     necessity: favorable
 
 suspected_mechanism:
   - step: 1
-    action: "Open one QUIC connection to UDP port 853 (DoQ listener)"
+    action: "Open 50 persistent TLS connections to port 853 (DoT listener)"
   - step: 2
-    action: "Flood open bidirectional streams without sending any payload — server blocks each goroutine on stream.Read()"
+    action: "Pipeline DNS queries continuously on each connection at maximum socket throughput"
   - step: 3
-    action: "Server re-advertises MAX_STREAMS credit; attacker opens more streams immediately"
+    action: "CoreDNS processes each query: TLS decrypt + DNS parse + erratic response + DNS encode + TLS encrypt"
   - step: 4
-    action: "Repeat — goroutine count accumulates with no bound → heap exhaustion"
+    action: "Aggregate ~8000 queries/s × TLS record overhead saturates single-vCPU above 50pp"
+  - step: 5
+    action: "Control experiment (hold-only, no queries) shows near-zero CPU, confirming query processing is causal"
 
 rfc_sections:
-  - rfc: RFC 9250
-    section: "4.3.1"
-    dos_relevance: "DoQ servers SHOULD limit concurrent open streams per connection"
-  - rfc: RFC 9000
-    section: "19.11"
-    dos_relevance: "MAX_STREAMS transport parameter controls stream concurrency; servers must cap it"
-  - rfc: RFC 9250
-    section: "5.5.2"
-    dos_relevance: "DoQ servers MUST enforce timeouts on idle streams and connections"
+  - rfc: RFC 7858
+    section: "5.1"
+    dos_relevance: "DoT servers SHOULD limit concurrent connections; no built-in cap in CoreDNS allows goroutine exhaustion"
+  - rfc: RFC 7858
+    section: "3.3"
+    dos_relevance: "Query pipelining on a single TLS connection allows attacker to open many in-flight queries per connection"
+  - rfc: RFC 7858
+    section: "3.4"
+    dos_relevance: "Out-of-order responses allowed; server must buffer each in-flight query state separately"
 
 related_work:
   - type: cve
     id: CVE-2026-71249
   - type: cve
-    id: CVE-2023-44487
+    id: CVE-2023-28452

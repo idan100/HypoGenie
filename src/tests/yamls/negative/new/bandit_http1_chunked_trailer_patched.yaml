@@ -47,7 +47,7 @@ target:
   version: "1.11.1"
   protocol: HTTP/1.1
   entry_point: "TCP port 4000 (Bandit HTTP/1.1 server via Plug)"
-  docker_image: "elixir:1.17-otp-27-debian-slim (custom Bandit server: mix deps.get with bandit ~> 1.11.1)"
+  docker_image: ~
 
 assumptions:
   - id: A1
