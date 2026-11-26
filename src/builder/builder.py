@@ -28,6 +28,8 @@ from .prompts import (
     SETUP_CRITIC_USER_TEMPLATE,
     DOCKERFILE_DEVELOPER_SYSTEM,
     DOCKERFILE_DEVELOPER_USER_TEMPLATE,
+    DOCKERFILE_FIX_SYSTEM,
+    DOCKERFILE_FIX_USER_TEMPLATE,
 )
 
 _CERTS_DIR = Path(__file__).parent.parent.parent / "infra" / "certs"
@@ -53,6 +55,17 @@ def _extract_json(raw: str) -> str:
             if depth == 0:
                 return raw[start : i + 1]
     return raw[start:]
+
+
+def _port_args(ports_str: str) -> list[str]:
+    """Convert a ports string like '443:443/tcp 443:443/udp' to ['-p', '443:443/tcp', ...]
+    Tolerates LLM responses that include '-p' flags in the string itself."""
+    args = []
+    for token in ports_str.split():
+        if token.startswith("-"):
+            continue  # skip any -p flags the LLM added
+        args += ["-p", token]
+    return args
 
 
 def _image_exists_locally(image: str) -> bool:
@@ -101,18 +114,47 @@ def _dockerfile_build(product: str, version: str, entry_point: str,
     if not dockerfile:
         raise RuntimeError("LLM returned empty Dockerfile")
 
-    # Write Dockerfile and app files to run_dir
-    (run_dir / "Dockerfile").write_text(dockerfile)
-    for filename, content in app_files.items():
-        (run_dir / filename).write_text(content)
+    def _write_files(df: str, files: dict) -> None:
+        (run_dir / "Dockerfile").write_text(df)
+        for fname, fcontent in files.items():
+            dest = run_dir / fname
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(fcontent)
+
+    _write_files(dockerfile, app_files)
 
     tag = f"hypogenie-{product}-{version}:latest".replace("/", "-").lower()
-    result = subprocess.run(
-        ["docker", "build", "-t", tag, str(run_dir)],
-        capture_output=True, text=True, timeout=600
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Source build failed:\n{result.stderr.strip()[:600]}")
+    for attempt in range(3):
+        result = subprocess.run(
+            ["docker", "build", "-t", tag, str(run_dir)],
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode == 0:
+            break
+        # Combine stdout+stderr: compilation errors typically appear in stdout
+        build_error = (result.stdout + "\n" + result.stderr).strip()
+        if attempt == 2:
+            raise RuntimeError(f"Source build failed:\n{build_error[:600]}")
+        print(f"  [builder:{_run_id}] Build attempt {attempt+1} failed — asking LLM to fix ...")
+        app_files_text = "\n\n".join(
+            f"{fname}:\n{content}" for fname, content in app_files.items()
+        ) or "(none)"
+        fix_user = DOCKERFILE_FIX_USER_TEMPLATE.format(
+            build_error=build_error[-3000:],  # tail: most relevant errors are at end
+            dockerfile=dockerfile,
+            app_files_text=app_files_text,
+        )
+        raw = _llm.call_llm(
+            DOCKERFILE_FIX_SYSTEM, fix_user,
+            role_env="BUILDER_FIX_MODEL", max_tokens=4096, json_mode=True
+        )
+        d2 = json.loads(_extract_json(raw))
+        dockerfile = d2.get("dockerfile", dockerfile)
+        app_files = d2.get("app_files", app_files)
+        config_path = d2.get("config_path", config_path)
+        ports = d2.get("ports", ports)
+        _write_files(dockerfile, app_files)
+
     print(f"  [builder:{_run_id}] Source build succeeded: {tag}")
     return tag, {"config_path": config_path, "ports": ports}
 
@@ -216,9 +258,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
             subprocess.run(["docker", "tag", image, docker_image], capture_output=True)
             image = docker_image
             if not source_setup.get("config_path"):
-                port_args = []
-                for mapping in source_setup["ports"].split():
-                    port_args += ["-p", mapping]
+                port_args = _port_args(source_setup["ports"])
                 cmd = [
                     "docker", "run", "-d",
                     "--name", f"hypogenie-{_run_id}",
@@ -257,9 +297,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
                 # App handles config internally — skip config file mount
                 conf_file = run_dir / "server.conf"
                 conf_file.write_text("")
-                port_args = []
-                for mapping in source_setup["ports"].split():
-                    port_args += ["-p", mapping]
+                port_args = _port_args(source_setup["ports"])
                 cmd = [
                     "docker", "run", "-d",
                     "--name", f"hypogenie-{_run_id}",
@@ -328,9 +366,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
                     extras.append(tcp_equiv)
         if extras:
             raw_ports = raw_ports + " " + " ".join(extras)
-    port_args = []
-    for mapping in raw_ports.split():
-        port_args += ["-p", mapping]
+    port_args = _port_args(raw_ports)
 
     certs_dir = str(_CERTS_DIR)
     config_path = setup["config_path"]

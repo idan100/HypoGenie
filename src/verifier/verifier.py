@@ -84,22 +84,74 @@ _TLS_CAL_DURATION = 15    # seconds
 _QUIC_CAL_RATE     = 20   # QUIC handshakes/s during calibration
 _QUIC_CAL_DURATION = 15   # seconds
 
+# Matched-calibration: re-run TLS calibration at the attack's actual connection rate
+# when the attack rate differs from the fixed Phase 1b rate by more than this factor.
+# This gives an empirical, rate-matched per-connection TLS overhead estimate.
+_TLS_RECAL_FACTOR  = 2.0  # re-calibrate when |attack_rate / cal_rate| > 2×
+_TLS_RECAL_DURATION = 10  # seconds (shorter than Phase 1b to save time)
+
 
 class Verdict:
-    CONFIRMED_DOS     = "CONFIRMED_DOS"
-    INCONCLUSIVE      = "INCONCLUSIVE"
-    NO_DOS_EFFECT     = "NO_DOS_EFFECT"
-    ENVIRONMENT_ERROR = "ENVIRONMENT_ERROR"
-    INFEASIBLE        = "INFEASIBLE"
-    INVALID_TEST      = "INVALID_TEST"   # experiment setup was invalid; result not meaningful
-    DEFECT            = "DEFECT"         # code issue confirmed but not exploitable as DoS
-    REJECTED          = "REJECTED"       # false positive: control test shows transport overhead
+    CONFIRMED_DOS          = "CONFIRMED_DOS"
+    INCONCLUSIVE           = "INCONCLUSIVE"
+    NO_DOS_EFFECT          = "NO_DOS_EFFECT"
+    ENVIRONMENT_ERROR      = "ENVIRONMENT_ERROR"
+    INFEASIBLE             = "INFEASIBLE"
+    INVALID_TEST           = "INVALID_TEST"            # experiment setup was invalid; result not meaningful
+    ATTACK_UNREPRESENTABLE = "ATTACK_UNREPRESENTABLE"  # client-side limitation prevents expressing the attack
+    ATTACK_BLOCKED         = "ATTACK_BLOCKED"          # server-side mitigation blocked the attack
+    DEFECT                 = "DEFECT"                  # code issue confirmed but not exploitable as DoS
+    REJECTED               = "REJECTED"                # false positive: control test shows transport overhead
 
     # Hypothesis-level verdicts (computed after the verifier from measurement + assumption evidence)
     DOS_CONFIRMED                  = "DOS_CONFIRMED"               # reproducible, causally attributed DoS
     HYPOTHESIS_DISPROVEN           = "HYPOTHESIS_DISPROVEN"        # necessary assumptions falsified
     HYPOTHESIS_PARTIALLY_DISPROVEN = "HYPOTHESIS_PARTIALLY_DISPROVEN"  # one path disproven; others untested
     HYPOTHESIS_INCONCLUSIVE        = "HYPOTHESIS_INCONCLUSIVE"     # insufficient evidence either way
+
+
+def _classify_invalid_reason(reason: str) -> str:
+    """
+    Map an exploit-invalid reason string to the appropriate semantic verdict.
+
+    Three distinct outcomes — only the last two are evidence-bearing:
+      ATTACK_UNREPRESENTABLE — the client library or tooling cannot express
+          this attack.  This is a test-infrastructure limitation, NOT evidence
+          that the target is patched or resistant.
+      ATTACK_BLOCKED — the server explicitly rejected or rate-limited the attack
+          at the protocol layer.  This IS evidence of server-side mitigation.
+      INVALID_TEST — misconfigured test: wrong port, no connection, bad certs,
+          malformed script.  Result is meaningless; fix the setup and retry.
+
+    Never conflate ATTACK_UNREPRESENTABLE with patch effectiveness.
+    """
+    r = reason.lower()
+
+    # Server-side block / rate-limit signals — checked first because they are
+    # more specific; e.g. "refused stream" (server H2 enforcement) must not be
+    # masked by "connection refused" (OS-level client failure).
+    _blocked_tokens = (
+        "blocked", "rate limit", "rate-limit", "rejected by server",
+        "max concurrent", "stream limit", "refused by", "policy",
+        "server reset", "goaway", "go_away", "stream closed by server",
+        "enhance your calm", "refused stream",
+    )
+    if any(tok in r for tok in _blocked_tokens):
+        return Verdict.ATTACK_BLOCKED
+
+    # Client-side library limitations or malformed-test signals.
+    # These are NOT evidence of patch effectiveness.
+    _unrepresentable_tokens = (
+        "alpn", "h2 library", "protocol not supported", "ssl", "library",
+        "import", "module", "no module named", "syntax error", "typeerror",
+        "attributeerror", "h2.exceptions", "hyperframe", "encoding",
+        "script crashed", "failed to connect", "connection refused",
+        "timed out", "timeout",
+    )
+    if any(tok in r for tok in _unrepresentable_tokens):
+        return Verdict.ATTACK_UNREPRESENTABLE
+
+    return Verdict.INVALID_TEST
 
 
 def _safe_mean(lst):
@@ -888,9 +940,10 @@ def run(
 
     if attack_metrics.get("_invalid"):
         note = attack_metrics.get("_invalid_reason", "exploit script failed pre-execution validation")
-        print(f"[verifier:{_run_id}] Exploit invalid — {note}; returning INVALID_TEST (no escalation)")
+        _invalid_verdict = _classify_invalid_reason(note)
+        print(f"[verifier:{_run_id}] Exploit invalid — {note}; returning {_invalid_verdict} (no escalation)")
         return {
-            "verdict":    Verdict.INVALID_TEST,
+            "verdict":    _invalid_verdict,
             "baseline":   baseline,
             "attack":     attack_metrics,
             "attack2":    {},
@@ -902,15 +955,16 @@ def run(
 
     # Footer Rule 1: PROTOCOL_NEGOTIATED must be "h2" for HTTP/2 and gRPC exploits.
     # If the TLS handshake negotiated something else (e.g. "http/1.1"), no h2 frames
-    # were processed and the result is meaningless.
+    # were processed and the result is meaningless.  This is a client-side TLS/ALPN
+    # limitation — it is NOT evidence that the target is patched.
     _proto_neg = attack_metrics.get("_protocol_negotiated")
     _plan_proto = getattr(plan, "protocol", "HTTP/2")
     if _proto_neg is not None and _plan_proto in ("HTTP/2", "gRPC") and _proto_neg != "h2":
         note = (f"ALPN negotiated '{_proto_neg}' instead of 'h2'; "
                 f"server did not speak HTTP/2 — no attack frames were processed")
-        print(f"[verifier:{_run_id}] Footer Rule 1 FAIL — {note}; INVALID_TEST")
+        print(f"[verifier:{_run_id}] Footer Rule 1 FAIL — {note}; ATTACK_UNREPRESENTABLE")
         return {
-            "verdict":    Verdict.INVALID_TEST,
+            "verdict":    Verdict.ATTACK_UNREPRESENTABLE,
             "baseline":   baseline,
             "attack":     attack_metrics,
             "attack2":    {},
@@ -956,10 +1010,11 @@ def run(
             pprof_data = _pprof_box_e[0]
         if attack_metrics2.get("_invalid"):
             note2 = attack_metrics2.get("_invalid_reason", "exploit invalid on escalation")
-            print(f"[verifier:{_run_id}] Escalated exploit invalid — {note2}; INVALID_TEST")
+            _esc_verdict = _classify_invalid_reason(note2)
+            print(f"[verifier:{_run_id}] Escalated exploit invalid — {note2}; {_esc_verdict}")
             phases.append(p2_phase)
             return {
-                "verdict": Verdict.INVALID_TEST,
+                "verdict": _esc_verdict,
                 "baseline": baseline, "attack": attack_metrics2, "attack2": {},
                 "triggered": [], "phases": phases,
                 "thresholds_config": thresholds_config,
@@ -999,6 +1054,37 @@ def run(
         attack_metrics = attack_metrics2
     else:
         phases.append(p2_phase)
+
+    # ── Phase 1c: Matched TLS calibration (optional, runs after Phase 2) ─────────
+    # Phase 1b calibrates at _TLS_CAL_RATE (100/s).  If the attack used a
+    # substantially different connection rate (more than _TLS_RECAL_FACTOR×), the
+    # per-connection TLS estimate may be inaccurate due to rate-dependent parallelism
+    # effects.  Running a matched calibration at the attack's actual rate gives an
+    # empirical baseline that is used by _check_differential's net-app attribution path.
+    # Skipped when: no TLS, no footer data, rate is similar to Phase 1b, or QUIC.
+    if tls and not is_quic:
+        _atk_conns_1c = attack_metrics.get("_connections_attempted", 0) or 0
+        _atk_life_1c  = attack_metrics.get("_avg_lifetime_s", 30.0) or 30.0
+        _short_lived_1c = _atk_life_1c < 2.0
+        if _short_lived_1c and _atk_conns_1c > 0:
+            _actual_rate_1c = _atk_conns_1c / attack_duration_s
+            _cal_rate_1c    = _TLS_CAL_RATE
+            _rate_ratio_1c  = max(_actual_rate_1c, 1.0) / max(_cal_rate_1c, 1.0)
+            if _rate_ratio_1c > _TLS_RECAL_FACTOR or _rate_ratio_1c < 1.0 / _TLS_RECAL_FACTOR:
+                _recal_rate = max(5, min(int(_actual_rate_1c), 300))
+                print(f"[verifier:{_run_id}] Phase 1c — matched TLS calibration "
+                      f"({_TLS_RECAL_DURATION}s at {_recal_rate}/s, "
+                      f"attack was {_actual_rate_1c:.0f}/s vs Phase 1b {_cal_rate_1c}/s) ...")
+                _recal_cpu  = _run_tls_calibration(container_id, host, port,
+                                                   rate=_recal_rate,
+                                                   duration=_TLS_RECAL_DURATION)
+                _idle_cpu_1c = _safe_mean(baseline["cpu_pct"])
+                _new_per_conn = max(0.0, _recal_cpu - _idle_cpu_1c) / _recal_rate
+                print(f"[verifier:{_run_id}] Phase 1c matched cal: cpu={_recal_cpu:.1f}% "
+                      f"idle={_idle_cpu_1c:.1f}% per_conn={_new_per_conn:.5f}% "
+                      f"(was {tls_cpu_per_conn_s:.5f}%)")
+                tls_cpu_per_conn_s = _new_per_conn
+                baseline["tls_cpu_per_conn_s"] = round(tls_cpu_per_conn_s, 5)
 
     # ── Phase 3: Repeatability ─────────────────────────────────────────────────
     p3_start = _now_iso()
@@ -1355,12 +1441,13 @@ def run(
         attack2 = exploit_fn(plan, new_cid, host, port, attack_duration_s)
         if attack2.get("_invalid"):
             note3 = attack2.get("_invalid_reason", "exploit invalid on Phase 3 repeat")
-            print(f"[verifier:{_run_id}] Phase 3 exploit invalid — {note3}; INVALID_TEST")
+            _p3_verdict = _classify_invalid_reason(note3)
+            print(f"[verifier:{_run_id}] Phase 3 exploit invalid — {note3}; {_p3_verdict}")
             p3_phase["ended_at"] = _now_iso()
             p3_phase["outcome"] = "invalid_exploit"
             phases.append(p3_phase)
             return {
-                "verdict": Verdict.INVALID_TEST,
+                "verdict": _p3_verdict,
                 "baseline": baseline, "attack": attack_metrics, "attack2": attack2,
                 "triggered": [], "phases": phases,
                 "thresholds_config": thresholds_config,

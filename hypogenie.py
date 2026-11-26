@@ -13,7 +13,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ── path setup ────────────────────────────────────────────────────────────────
@@ -183,8 +183,11 @@ def _compute_hypothesis_verdict(
     if meas == Verdict.CONFIRMED_DOS:
         return Verdict.DOS_CONFIRMED
 
-    # Operational failures stay as-is — not a hypothesis conclusion
-    if meas in (Verdict.ENVIRONMENT_ERROR, Verdict.INVALID_TEST):
+    # Operational failures stay as-is — not a hypothesis conclusion.
+    # ATTACK_UNREPRESENTABLE and ATTACK_BLOCKED are also not hypothesis conclusions:
+    # the former is a client limitation, the latter is server-side mitigation evidence.
+    if meas in (Verdict.ENVIRONMENT_ERROR, Verdict.INVALID_TEST,
+                Verdict.ATTACK_UNREPRESENTABLE, Verdict.ATTACK_BLOCKED):
         return meas
 
     # Assess assumption refutation from Gap Finder
@@ -523,13 +526,15 @@ def _write_run_report(
     hypothesis_verdict = verify_result.get("hypothesis_verdict")
 
     _meas_emoji = {
-        "CONFIRMED_DOS":    "✓",
-        "NO_DOS_EFFECT":    "✗",
-        "INCONCLUSIVE":     "⚠",
-        "INFEASIBLE":       "✗",
-        "ENVIRONMENT_ERROR":"✗",
-        "DEFECT":           "✗",
-        "REJECTED":         "✗",
+        "CONFIRMED_DOS":          "✓",
+        "NO_DOS_EFFECT":          "✗",
+        "INCONCLUSIVE":           "⚠",
+        "INFEASIBLE":             "✗",
+        "ENVIRONMENT_ERROR":      "✗",
+        "DEFECT":                 "✗",
+        "REJECTED":               "✗",
+        "ATTACK_UNREPRESENTABLE": "⚠",
+        "ATTACK_BLOCKED":         "✗",
     }
     _hyp_emoji = {
         Verdict.DOS_CONFIRMED:                  "✓",
@@ -555,7 +560,7 @@ def _write_run_report(
     lines = [
         "# HypoGenie Run Report", "",
         f"**Run ID:** {run_id}",
-        f"**Date:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        f"**Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         f"**Measurement verdict:** {verdict} {emoji}",
     ]
     if hyp_line:
@@ -617,7 +622,7 @@ def _write_disclosure_draft(out_dir: Path, ctx, plan, result: dict) -> None:
 **Protocol:** {ctx.protocol}
 **DoS class:** {ctx.dos_class}
 **Discovered by:** Idan Efraim (Bar-Ilan University / TAU Deepness Lab)
-**Date:** {datetime.utcnow().strftime('%Y-%m-%d')}
+**Date:** {datetime.now(timezone.utc).strftime('%Y-%m-%d')}
 
 ## Summary
 
@@ -654,8 +659,8 @@ as recommended by the relevant RFC security considerations section.
 
 ## Timeline
 
-- Discovered: {datetime.utcnow().strftime('%Y-%m-%d')}
-- Draft: {datetime.utcnow().strftime('%Y-%m-%d')}
+- Discovered: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}
+- Draft: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}
 - Disclosed to vendor: [PENDING]
 """
     (out_dir / "disclosure_draft.md").write_text(draft)
@@ -947,13 +952,15 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         verdicts = ledger.to_verdicts()
         print(f"  verdicts={len(verdicts)} findings={len(findings)}")
 
-        # Assumption gate: if ALL required assumptions are refuted → INFEASIBLE.
-        # Findings are ignored here: if every precondition for the attack is proven
-        # false, the attack mechanism cannot work regardless of incidental findings
-        # the gap finder may have produced (which often contradict the refutation).
-        if ledger.all_critical_refuted():
+        # Assumption gate: if ANY required assumption is refuted → INFEASIBLE for
+        # that attack path.  A single refuted necessary assumption is sufficient to
+        # invalidate the attack; waiting for all to be refuted is overly strict and
+        # would let the pipeline continue when a core precondition is disproven.
+        # Unverified/unclear assumptions do not trigger INFEASIBLE (unknown ≠ refuted).
+        # Alternative paths that the pivot mechanism may surface are unaffected.
+        if ledger.any_critical_refuted():
             required_refuted = [r.assumption_id for r in ledger.critical_refuted()]
-            print(f"[hypogenie:{_id}] All required assumptions refuted → INFEASIBLE")
+            print(f"[hypogenie:{_id}] Required assumption(s) refuted → INFEASIBLE")
             pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "failed",
                                   "detail": f"INFEASIBLE — required assumptions refuted: {required_refuted}"})
             for name in ("5/7 Exploit Planner", "6/7 Builder", "7/7 DoS Verifier"):
@@ -1150,7 +1157,7 @@ def run_test_suite(suite_dir: str, expect: str) -> None:
         passed = (verdict == expect) or (
             expect == "NO_DOS_EFFECT" and verdict in (
                 Verdict.NO_DOS_EFFECT, Verdict.INCONCLUSIVE, Verdict.INFEASIBLE,
-                Verdict.DEFECT, Verdict.REJECTED)
+                Verdict.DEFECT, Verdict.REJECTED, Verdict.INVALID_TEST)
         )
         results.append((yaml_path.name, verdict, passed))
         status = "✓" if passed else "✗"

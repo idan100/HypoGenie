@@ -269,24 +269,55 @@ class LifecycleRunner:
     # ── sidecar ───────────────────────────────────────────────────────────────
 
     def _start_sidecar(self) -> None:
+        from lifecycle.applicability import _find_free_port
         backend_script = str(Path(__file__).parent / "backend.py")
-        self._sidecar_proc = subprocess.Popen(
-            [_VENV_PYTHON, backend_script, "--port", str(self.plan.sidecar_port)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        deadline = time.time() + 8.0
-        while time.time() < deadline:
-            try:
-                self._read_metrics()
-                print(f"[lifecycle:{_run_id}] sidecar ready on "
-                      f"port {self.plan.sidecar_port}", flush=True)
-                return
-            except Exception:
-                time.sleep(0.1)
+        last_exc: Exception | None = None
+
+        for attempt in range(3):
+            port = self.plan.sidecar_port
+            if attempt > 0:
+                # Previous attempt failed — pick a new port and update the plan.
+                port = _find_free_port()
+                self.plan.sidecar_port = port
+                print(f"[lifecycle:{_run_id}] sidecar retry {attempt} on port {port}",
+                      flush=True)
+
+            # Kill any previous sidecar process from a failed attempt.
+            if self._sidecar_proc is not None and self._sidecar_proc.poll() is None:
+                self._sidecar_proc.terminate()
+                self._sidecar_proc = None
+
+            self._sidecar_proc = subprocess.Popen(
+                [_VENV_PYTHON, backend_script, "--port", str(port)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            # Allow 4s per attempt — fast enough to detect bind failure (< 100ms).
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                # Detect bind failure: process exits immediately on EADDRINUSE.
+                if self._sidecar_proc.poll() is not None:
+                    last_exc = RuntimeError(
+                        f"Lifecycle sidecar exited immediately on port {port} "
+                        f"(rc={self._sidecar_proc.returncode}); likely EADDRINUSE"
+                    )
+                    break
+                try:
+                    self._read_metrics()
+                    print(f"[lifecycle:{_run_id}] sidecar ready on port {port}",
+                          flush=True)
+                    return
+                except Exception:
+                    time.sleep(0.1)
+            else:
+                last_exc = RuntimeError(
+                    f"Lifecycle sidecar did not respond on port {port} within 4s."
+                )
+
         raise RuntimeError(
-            f"Lifecycle sidecar did not start on port {self.plan.sidecar_port} within 8s."
+            f"Lifecycle sidecar failed to start after 3 attempts. "
+            f"Last error: {last_exc}"
         )
 
     # ── container ─────────────────────────────────────────────────────────────

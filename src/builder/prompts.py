@@ -20,6 +20,68 @@ Given a target library/project, version, and entry point, generate:
   4. RUN go build
   Do NOT use "go mod download" before "go mod tidy".
 - For Python libraries: use python:3.11-slim; install the exact version.
+- For Python/Twisted HTTP/2 servers: install twisted[tls] and h2 packages.
+  NEVER import twisted.web.http2 directly — it is a private module.
+  CRITICAL: NEVER use reactor.listenSSL() for HTTP/2 — that transport does NOT expose
+  negotiatedProtocol, so Twisted falls back to HTTP/1.1 and ignores the h2 ALPN result.
+  ALWAYS use TLSMemoryBIOFactory + reactor.listenTCP() instead. Use this pattern:
+    from twisted.internet import reactor
+    from twisted.internet.ssl import CertificateOptions
+    from twisted.protocols.tls import TLSMemoryBIOFactory
+    from twisted.web.server import Site
+    from twisted.web import resource
+    from OpenSSL.crypto import load_certificate, load_privatekey, FILETYPE_PEM
+    with open('/certs/server.crt','rb') as f: cert = load_certificate(FILETYPE_PEM, f.read())
+    with open('/certs/server.key','rb') as f: key  = load_privatekey(FILETYPE_PEM, f.read())
+    # CRITICAL: use acceptableProtocols (NOT alpnProtocols) for ALPN
+    ssl_ctx = CertificateOptions(certificate=cert, privateKey=key,
+                                 acceptableProtocols=[b'h2', b'http/1.1'])
+    tls_factory = TLSMemoryBIOFactory(ssl_ctx, isClient=False, wrappedFactory=Site(RootResource()))
+    reactor.listenTCP(8443, tls_factory)
+    reactor.run()
+  TLSMemoryBIOFactory exposes negotiatedProtocol on the transport, which Twisted's HTTP
+  layer reads to activate HTTP/2 (H2Connection) instead of HTTP/1.1 (HTTPChannel).
+  pem package is optional; use OpenSSL.crypto for cert loading.
+- For Elixir/Bandit HTTP/1.1 servers: Bandit 1.11.x requires Elixir ~> 1.17.
+  ALWAYS use elixir:1.17-otp-27-alpine (or debian) as the build base image.
+  NEVER use elixir:1.15 or older — Bandit 1.11.x is incompatible with Elixir < 1.17.
+  Use {bandit, "~> 1.11"} in mix.exs deps to pin to 1.11.x, NOT "~> 1.0".
+  ALWAYS use mix release for packaging (NOT mix escript.build — that breaks OTP apps).
+  Proper structure:
+    mix.exs: deps [{:bandit, "~> 1.11"}, {:plug, "~> 1.14"}], app [{mod: {App, []}}]
+    lib/app.ex: use Application; def start(_,_) do Bandit.start_link(plug: MyPlug, port: 4000) end
+    lib/my_plug.ex: use Plug.Router; plug :match; plug :dispatch; get "/" do send_resp(conn, 200, "ok") end
+  For multi-stage Dockerfile: build stage uses elixir:1.17-otp-27-alpine, runtime stage
+  copies _build/prod/rel/<app>/ and launches with bin/<app> start.
+  EXPOSE 4000 and ports = "4000:4000/tcp".
+- For Java/Netty HTTP/2 servers: use maven:3.9.6-eclipse-temurin-21 for build.
+  IMPORTANT Netty HTTP/2 API (4.x): use Http2FrameCodecBuilder and Http2MultiplexHandler.
+  Do NOT extend Http2ConnectionHandler or implement Http2FrameListener directly — those
+  constructors changed and the listener interface has onUnknownFrame() that must be
+  implemented. NEVER use SelfSignedCertificate — it requires BouncyCastle and may
+  fail on many JDK versions. ALWAYS load TLS certs from /certs/server.crt and
+  /certs/server.key (they are mounted into the container):
+    File certFile = new File("/certs/server.crt");
+    File keyFile  = new File("/certs/server.key");
+  The correct pipeline pattern is:
+    SslContext ssl = SslContextBuilder.forServer(certFile, keyFile)
+        .sslProvider(SslProvider.JDK)   // IMPORTANT: force JDK SSL; tcnative is NOT available
+        .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+        .applicationProtocolConfig(new ApplicationProtocolConfig(
+            Protocol.ALPN, SelectorFailureBehavior.NO_ADVERTISE,
+            SelectedListenerFailureBehavior.ACCEPT, ApplicationProtocolNames.HTTP_2))
+        .build();
+    // In the channel pipeline:
+    pipeline.addLast(ssl.newHandler(ch.alloc()));
+    pipeline.addLast(new ApplicationProtocolNegotiationHandler(ApplicationProtocolNames.HTTP_2) {
+        protected void configurePipeline(ChannelHandlerContext ctx, String protocol) {
+            ctx.pipeline().addLast(Http2FrameCodecBuilder.forServer().build());
+            ctx.pipeline().addLast(new Http2MultiplexHandler(new ChildChannelHandler()));
+        }
+    });
+  ChildChannelHandler extends SimpleChannelInboundHandler<Http2HeadersFrame> and
+  reads the stream, writes a DATA response, and closes.
+  pom.xml should use <netty.version>VERSION</netty.version> with netty-all artifact.
 - config_path: return the path where a server config would be mounted, or "" if the
   application code already handles all configuration.
 - ports: space-separated "host:container/proto" mappings, e.g. "443:443/tcp".
@@ -43,6 +105,50 @@ Repo URL: {repo_url}
 
 Generate a Dockerfile and application files to run a TLS server for this target.
 The server should use exactly the library version stated above and serve the stated protocol.
+"""
+
+DOCKERFILE_FIX_SYSTEM = """You are a Docker and server-setup expert.
+You previously generated a Dockerfile and application files, but the Docker build failed.
+Fix ONLY the compilation/build errors shown. Keep the same overall structure and logic.
+For Java/Netty: NEVER use SelfSignedCertificate — always load from File("/certs/server.crt")
+and File("/certs/server.key"). ALWAYS call .sslProvider(SslProvider.JDK) on SslContextBuilder
+(tcnative is NOT available). NEVER pass a boolean where Http2Headers is expected; use
+new DefaultHttp2Headers() as the headers argument in DefaultHttp2HeadersFrame constructor.
+For Python/Twisted HTTP/2: NEVER use reactor.listenSSL() — it doesn't expose negotiatedProtocol.
+ALWAYS use TLSMemoryBIOFactory + reactor.listenTCP():
+  from twisted.protocols.tls import TLSMemoryBIOFactory
+  tls_factory = TLSMemoryBIOFactory(ssl_ctx, isClient=False, wrappedFactory=Site(root))
+  reactor.listenTCP(8443, tls_factory)
+For Elixir/Bandit: ALWAYS use elixir:1.17-otp-27-alpine, {bandit, "~> 1.11"}, mix release.
+NEVER use elixir:1.15 or escript.build.
+Return the corrected files in the same JSON format as before.
+
+## Output format (JSON only, no other text)
+{
+  "dockerfile": "<full Dockerfile content as a string>",
+  "app_files": {
+    "<filename>": "<file content>"
+  },
+  "config_path": "<in-container path or empty string>",
+  "ports": "<space-separated port mappings>"
+}
+"""
+
+DOCKERFILE_FIX_USER_TEMPLATE = """The following Docker build failed with this error:
+
+--- BUILD ERROR ---
+{build_error}
+---
+
+Here are the files that were generated:
+
+Dockerfile:
+{dockerfile}
+
+App files:
+{app_files_text}
+
+Fix the errors and return corrected files in the same JSON format.
 """
 
 SETUP_DEVELOPER_SYSTEM = """You are a server configuration expert.

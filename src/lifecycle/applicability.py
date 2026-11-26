@@ -161,9 +161,28 @@ def assess(ctx, findings: list = None, plan=None) -> LifecycleApplicability:
     )
 
 
-def _find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))
+def _find_free_port(retries: int = 10, low: int = 40000, high: int = 59999) -> int:
+    """Return an available TCP port in [low, high].
+
+    Uses a bind-and-release approach.  The returned port is free at the time of
+    return but may be claimed before the caller binds it (inherent TOCTOU).
+    Using a randomised range in the ephemeral zone reduces collision probability
+    compared to relying on OS port 0 assignment from a low base.
+    Multiple retries handle the rare collision window.
+    """
+    import random
+    for _ in range(retries):
+        port = random.randint(low, high)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+                return port
+        except OSError:
+            continue
+    # Fallback: let OS pick a port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 

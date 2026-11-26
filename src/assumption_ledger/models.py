@@ -226,6 +226,18 @@ class AssumptionLedger:
             r.status == AssumptionStatus.REFUTED for r in required
         )
 
+    def any_critical_refuted(self) -> bool:
+        """True when at least one required assumption is REFUTED.
+
+        A single refuted required assumption invalidates its attack path —
+        there is no need for all required assumptions to be refuted.
+        Unverified/unclear assumptions are excluded: unknown ≠ refuted.
+        """
+        return any(
+            r.is_critical and r.status == AssumptionStatus.REFUTED
+            for r in self._records.values()
+        )
+
     # ── serialisation ─────────────────────────────────────────────────────────
 
     def to_verdicts(self) -> list:

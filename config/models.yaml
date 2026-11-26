@@ -12,9 +12,10 @@ profiles:
 
 # ── Optional per-role overrides ───────────────────────────────────────────────
 # Takes precedence over the active profile.  Format: "provider:model"
-# Example:
-#   EXPLOITER_MODEL: "anthropic:claude-opus-4-5"
-role_overrides: {}
+role_overrides:
+  # Use a stronger Anthropic model for Dockerfile fix retries — Haiku often
+  # can't resolve complex library API mismatches (e.g. Netty Http2Headers).
+  BUILDER_FIX_MODEL: "anthropic:claude-sonnet-4-5"
 
 # ── API key env-var names ─────────────────────────────────────────────────────
 anthropic:
