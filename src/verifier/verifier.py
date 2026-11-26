@@ -760,6 +760,7 @@ def run(
     # differential attribution
     control_exploit_fn: Callable | None = None,
     benign_exploit_fn: Callable | None = None,
+    persist_exploit_fn: Callable | None = None,
     has_code_findings: bool = False,
     protocol: str = "",
     lifecycle_validation_plan=None,  # LifecycleValidationPlan | None — reserved for future use
@@ -1259,25 +1260,66 @@ def run(
                               f"— proceeding to Phase 3")
                         # fall through to Phase 3
                     else:
-                        note = (f"Control test inconclusive (ratio in ambiguous zone 0.50–0.80): "
-                                f"{diff_reason}. Cannot attribute overhead to application logic.")
-                        if _p2c_alt_ratio is not None:
-                            note += (f" Complete-request baseline: benign_ratio={_p2c_alt_ratio:.3f} "
-                                    f"(≥{_BENIGN_CONFIRM_RATIO:.0%} — not disproportionate).")
-                        if pprof_data:
-                            note += (f" pprof: {_pprof_app:.1f}% application-layer, "
-                                    f"{pprof_data['transport_pct']:.1f}% transport "
-                                    f"(< {_PPROF_APP_ATTR_PCT:.0f}% app threshold).")
-                        print(f"[verifier:{_run_id}] INCONCLUSIVE — {note}")
-                        return {
-                            "verdict": Verdict.INCONCLUSIVE,
-                            "baseline": baseline, "attack": attack_metrics,
-                            "attack2": control_metrics,
-                            "triggered": triggered, "phases": phases,
-                            "thresholds_config": thresholds_config,
-                            "notes": note,
-                            "pprof": pprof_data,
-                        }
+                        # Phase 2d-alt: persistent-connection disambiguation.
+                        # Runs HEADERS+RST_STREAM on ONE long-lived TLS connection per thread,
+                        # eliminating TLS reconnect overhead as a confound.  If CPU remains
+                        # elevated (>= _PERSIST_CPU_THRESHOLD pp above baseline) → signal is
+                        # genuine RST processing cost, not TLS noise → proceed to Phase 3.
+                        _PERSIST_CPU_THRESHOLD = 15.0  # pp above baseline to confirm
+                        _persist_confirmed = False
+                        if persist_exploit_fn is not None:
+                            print(f"[verifier:{_run_id}] Phase 2d-alt — Persistent-connection "
+                                  f"disambiguation ({attack_duration_s}s, no TLS reconnects) ...")
+                            _persist_m = persist_exploit_fn(
+                                attack_metrics, new_cid, host, port, attack_duration_s
+                            )
+                            _per_base  = _safe_mean(baseline.get("cpu_pct", []))
+                            _per_cpu   = _safe_mean(_persist_m.get("cpu_pct", []))
+                            _per_delta = _per_cpu - _per_base
+                            p2c_phase["persist_alt"] = {
+                                "persist_cpu_pct":   round(_per_cpu, 2),
+                                "baseline_cpu_pct":  round(_per_base, 2),
+                                "cpu_delta_pp":      round(_per_delta, 2),
+                                "threshold_pp":      _PERSIST_CPU_THRESHOLD,
+                            }
+                            print(f"[verifier:{_run_id}] Phase 2d-alt persist_cpu={_per_cpu:.1f}% "
+                                  f"baseline={_per_base:.1f}% delta={_per_delta:.1f}pp "
+                                  f"(threshold={_PERSIST_CPU_THRESHOLD}pp)")
+                            if _per_delta >= _PERSIST_CPU_THRESHOLD:
+                                _persist_confirmed = True
+                                diff_reason += (
+                                    f"; persistent-connection test: cpu_delta={_per_delta:.1f}pp "
+                                    f"(≥{_PERSIST_CPU_THRESHOLD}pp without TLS reconnects)"
+                                )
+                                print(f"[verifier:{_run_id}] Phase 2d-alt confirmed RST processing "
+                                      f"overhead — proceeding to Phase 3")
+
+                        if _persist_confirmed:
+                            pass  # fall through to Phase 3
+                        else:
+                            note = (f"Control test inconclusive (ratio in ambiguous zone 0.50–0.80): "
+                                    f"{diff_reason}. Cannot attribute overhead to application logic.")
+                            if _p2c_alt_ratio is not None:
+                                note += (f" Complete-request baseline: benign_ratio={_p2c_alt_ratio:.3f} "
+                                        f"(≥{_BENIGN_CONFIRM_RATIO:.0%} — not disproportionate).")
+                            if pprof_data:
+                                note += (f" pprof: {_pprof_app:.1f}% application-layer, "
+                                        f"{pprof_data['transport_pct']:.1f}% transport "
+                                        f"(< {_PPROF_APP_ATTR_PCT:.0f}% app threshold).")
+                            if persist_exploit_fn is not None and not _persist_confirmed:
+                                _pd = p2c_phase.get("persist_alt", {})
+                                note += (f" Persistent-connection test: cpu_delta={_pd.get('cpu_delta_pp',0):.1f}pp "
+                                        f"(< {_PERSIST_CPU_THRESHOLD}pp threshold — TLS noise not ruled out).")
+                            print(f"[verifier:{_run_id}] INCONCLUSIVE — {note}")
+                            return {
+                                "verdict": Verdict.INCONCLUSIVE,
+                                "baseline": baseline, "attack": attack_metrics,
+                                "attack2": control_metrics,
+                                "triggered": triggered, "phases": phases,
+                                "thresholds_config": thresholds_config,
+                                "notes": note,
+                                "pprof": pprof_data,
+                            }
                 else:
                     # Transport overhead confirmed (ratio >= 0.80): DEFECT or REJECTED.
                     if has_code_findings:

@@ -27,12 +27,14 @@ from processor.yaml_parser import parse
 from spec_processor.spec_processor import run as spec_run
 from gap_finder.gap_finder import run as gap_run
 from exploit_planner.exploit_planner import run as plan_run
+from exploit_planner.models import ExploitPlan, Step
 from assumption_ledger.models import AssumptionLedger
 from builder.builder import build, teardown
 from exploiter.exploiter import run as exploit_run
 from verifier.verifier import run as verify_run, Verdict
 from exploiter.exploiter import make_control_fn as _make_control_fn
 from exploiter.exploiter import make_benign_fn as _make_benign_fn
+from exploiter.exploiter import make_persist_fn as _make_persist_fn
 import llm_client as _llm
 from lifecycle.applicability import assess as _lc_assess, build_plan as _lc_build_plan
 from lifecycle.model import LifecycleMode, LifecycleResult
@@ -227,6 +229,27 @@ def _compute_hypothesis_verdict(
 def _product_from_repo(repo_url: str) -> str:
     """Extract product name from GitHub URL."""
     return repo_url.rstrip("/").split("/")[-1]
+
+
+def _plan_from_pivot(pivot: dict, base_plan: "ExploitPlan") -> "ExploitPlan":
+    """Reconstruct an ExploitPlan from a pivot_candidates entry."""
+    steps = [
+        Step(n=s.get("n", i+1), action=s.get("action", ""),
+             quic_frame=s.get("quic_frame", ""),
+             expected_server_response=s.get("expected_server_response", ""),
+             rationale=s.get("rationale", ""))
+        for i, s in enumerate(pivot.get("attack_sequence", []))
+    ]
+    return ExploitPlan(
+        finding_type=base_plan.finding_type,
+        finding_ref=pivot.get("finding_ref") or pivot.get("label", "pivot"),
+        assumptions_relied_on=base_plan.assumptions_relied_on,
+        attack_sequence=steps,
+        expected_effect=pivot.get("expected_effect") or base_plan.expected_effect,
+        severity=pivot.get("severity") or base_plan.severity,
+        pivot_note=pivot.get("label"),
+        protocol=base_plan.protocol,
+    )
 
 
 def _fmt_phase_thresholds(phase_dict: dict) -> list:
@@ -959,8 +982,21 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         # Unverified/unclear assumptions do not trigger INFEASIBLE (unknown ≠ refuted).
         # Alternative paths that the pivot mechanism may surface are unaffected.
         if ledger.any_critical_refuted():
-            required_refuted = [r.assumption_id for r in ledger.critical_refuted()]
+            refuted_records = ledger.critical_refuted()
+            required_refuted = [r.assumption_id for r in refuted_records]
+            # Build per-assumption evidence summary for the notes field.
+            refuted_details = []
+            for rec in refuted_records:
+                ev_snippets = (rec.evidence.contradicting_evidence
+                               or rec.evidence.source_refs or [])
+                ev_str = "; ".join(ev_snippets[:2]) if ev_snippets else "no source snippet"
+                refuted_details.append(f"{rec.assumption_id}: {ev_str}")
+            infeasible_notes = (
+                f"PATCH CONFIRMED — required assumption(s) refuted by source analysis: "
+                + " | ".join(refuted_details)
+            )
             print(f"[hypogenie:{_id}] Required assumption(s) refuted → INFEASIBLE")
+            print(f"[hypogenie:{_id}] {infeasible_notes}")
             pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "failed",
                                   "detail": f"INFEASIBLE — required assumptions refuted: {required_refuted}"})
             for name in ("5/7 Exploit Planner", "6/7 Builder", "7/7 DoS Verifier"):
@@ -969,7 +1005,9 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
                                      "detail": "Skipped (INFEASIBLE)"})
             result = {"verdict": Verdict.INFEASIBLE, "baseline": {}, "attack": {},
                       "attack2": {}, "triggered": [], "phases": [], "thresholds_config": {},
-                      "notes": f"Refuted: {required_refuted}",
+                      "notes": infeasible_notes,
+                      "infeasible_reason": "ASSUMPTIONS_REFUTED_BY_PATCH",
+                      "refuted_assumptions": required_refuted,
                       "hypothesis_verdict": Verdict.HYPOTHESIS_DISPROVEN}
             _write_outputs(out_dir, ctx, None, result, verdicts, findings,
                            ledger=ledger, pipeline_log=pipeline_log)
@@ -1051,6 +1089,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
 
         _control_fn = _make_control_fn(ctx.protocol, ctx.dos_class)
         _benign_fn  = _make_benign_fn(ctx.protocol, ctx.dos_class)
+        _persist_fn = _make_persist_fn(ctx.protocol, ctx.dos_class)
 
         conf_file   = str(_WORKSPACE / _id / "server.conf")
         verify_result = verify_run(
@@ -1065,11 +1104,60 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             env_vars=container_info.get("env_vars", {}),
             control_exploit_fn=_control_fn,
             benign_exploit_fn=_benign_fn,
+            persist_exploit_fn=_persist_fn,
             has_code_findings=len(findings) > 0,
             protocol=ctx.protocol,
         )
 
         verdict = verify_result["verdict"]
+
+        # ── 7a. Pivot retry: if base exploit returned INVALID_TEST (attack not representable),
+        #    try each pivot candidate as an alternative attack plan.
+        #    Pivots represent structural variants (e.g. "bypass rate-limiter") — the base
+        #    plan failing to send frames is exactly when alternative angles are most useful.
+        _pivot_tried = False
+        if verdict == Verdict.INVALID_TEST and plan and plan.pivot_candidates:
+            viable_pivots = [
+                pv for pv in plan.pivot_candidates
+                if pv.get("attack_sequence") and pv.get("status") != "DUPLICATE_OF_ORIGINAL"
+            ]
+            print(f"[hypogenie:{_id}] Base exploit INVALID_TEST — trying {len(viable_pivots)} pivot(s)...")
+            for pv in viable_pivots:
+                label = pv.get("label", "pivot")
+                print(f"[hypogenie:{_id}] Pivot attempt: {label}")
+                try:
+                    pivot_plan = _plan_from_pivot(pv, plan)
+                    pivot_result = verify_run(
+                        pivot_plan, container_id, host, port,
+                        exploit_fn=_exploit_fn,
+                        image=container_info.get("image", ""),
+                        container_name=f"hypogenie-{_id}",
+                        ports=container_info.get("ports", ""),
+                        certs_dir=str(_CERTS_DIR),
+                        conf_file=conf_file,
+                        config_path=container_info.get("config_path", ""),
+                        env_vars=container_info.get("env_vars", {}),
+                        control_exploit_fn=_control_fn,
+                        benign_exploit_fn=_benign_fn,
+                        persist_exploit_fn=_persist_fn,
+                        has_code_findings=len(findings) > 0,
+                        protocol=ctx.protocol,
+                    )
+                    pivot_verdict = pivot_result.get("verdict")
+                    frames = pivot_result.get("attack", {}).get("exploit_frames_sent", 0) or 0
+                    print(f"[hypogenie:{_id}] Pivot '{label}': verdict={pivot_verdict} frames={frames}")
+                    _pivot_tried = True
+                    if pivot_verdict not in (Verdict.INVALID_TEST, Verdict.ENVIRONMENT_ERROR):
+                        verify_result = pivot_result
+                        plan = pivot_plan
+                        verdict = pivot_verdict
+                        print(f"[hypogenie:{_id}] Pivot '{label}' succeeded — using pivot result")
+                        break
+                except Exception as e:
+                    print(f"[hypogenie:{_id}] Pivot '{label}' error: {e}")
+            if _pivot_tried and verdict == Verdict.INVALID_TEST:
+                print(f"[hypogenie:{_id}] All pivots returned INVALID_TEST — base verdict stands")
+
         hypothesis_verdict = _compute_hypothesis_verdict(
             verify_result, verdicts, plan, ctx, ledger=ledger if 'ledger' in dir() else None
         )
