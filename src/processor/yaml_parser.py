@@ -174,6 +174,7 @@ def parse(yaml_path: str) -> HypothesisContext:
                 server_config=str(svc.get("server_config", "") or ""),
                 command=list(raw_cmd),
                 env_vars=dict(svc.get("env", {}) or {}),
+                ports=str(svc.get("ports", "") or ""),
             ))
         target_roles = [s for s in services if s.role == "target"]
         if len(target_roles) != 1:

@@ -1,61 +1,38 @@
 hypothesis:
   description: |
     RFC 9000 §4.6 controls peer-initiated stream concurrency through cumulative
-    stream limits advertised using initial_max_streams_bidi /
-    initial_max_streams_uni transport parameters and subsequently increased
-    through MAX_STREAMS frames. As documented in quic_max_streams_v3, quic-go
-    v0.59.1 recycles stream credit at transport-level closure before
-    application-level request processing completes, enabling rapid QUIC stream
-    churn.
+    stream limits. When Caddy (caddy:2.11.4, quic-go v0.59.1) acts as an HTTP/3
+    reverse proxy, two independent resource accumulation axes exist:
 
-    When Caddy is configured as an HTTP/3 → HTTP/1.1 reverse proxy, the stream
-    churn vulnerability gains a second independent resource accumulation axis
-    that is not present in the direct-server case:
+    - Layer 1 (quic-go): stream credit is recycled at transport-level closure
+      before application-level processing completes, enabling the client to open
+      more streams than the server intends to permit.
 
-    - Layer 1 (quic-go, same as v3): stream credit is recycled at transport-level
-      stream closure before application-level request processing completes. This
-      allows the client to open more new streams than the server intends to
-      permit, increasing stream churn and CPU consumption from HTTP/3 goroutines.
+    - Layer 2 (Caddy proxy, the focus of this test): each HTTP/3 stream that
+      Caddy begins proxying opens an HTTP/1.1 connection to the backend and
+      spawns a proxy goroutine. If the client cancels the QUIC stream with
+      STOP_SENDING before the backend responds, the proxy goroutine continues
+      waiting for the upstream reply. HTTP/1.1 has no stream-level cancellation
+      primitive; cancelling would require closing the backend TCP connection,
+      which Caddy's connection pool avoids. The goroutine blocks until the
+      upstream responds or the proxy timeout fires.
 
-    - Layer 2 (Caddy reverse proxy, new): each HTTP/3 stream that Caddy begins
-      proxying causes Caddy to open or reuse an HTTP/1.1 connection to the
-      upstream and to spawn a proxy goroutine that manages the in-flight backend
-      request. If the client cancels the QUIC stream before the upstream responds,
-      the proxy goroutine continues waiting for the upstream. Caddy does not
-      propagate the client-side cancellation to the in-flight backend HTTP/1.1
-      request promptly: HTTP/1.1 has no stream-level cancellation primitive, and
-      cancelling requires closing the backend TCP connection, which Caddy's
-      connection pool incentivises avoiding. The proxy goroutine therefore blocks
-      until the upstream responds or the proxy timeout fires.
+    The key measurement is at the BACKEND, not the proxy. The backend tracks
+    concurrent in-flight requests via an active_requests counter. Under attack:
+      - client opens QUIC stream → proxy goroutine starts → backend begins work
+      - client sends STOP_SENDING → QUIC stream closes at proxy
+      - backend active_requests REMAINS elevated (proxy goroutine still waiting)
+    If active_requests grows proportionally to stream churn rate, Layer 2 is
+    confirmed independently of the quic-go stream credit bug.
 
-    The two layers compound: Layer 1 enables higher stream churn by recycling
-    stream credit prematurely, and Layer 2 ensures each newly created-and-cancelled
-    stream leaves a proxy goroutine alive waiting for the upstream. Under sustained
-    attack, goroutines accumulate at two levels simultaneously (quic-go transport
-    goroutines and Caddy proxy goroutines), causing memory and CPU exhaustion
-    faster than in the direct-server case.
+    Test topology:
+      [attack client on host]  →  UDP :443 QUIC h3  →
+      [proxy: caddy:2.11.4, --cpus=1]  →  HTTP/1.1 TCP (Docker bridge)  →
+      [backend: python:3.11-slim, 50ms sleep, /metrics exposed on host :18080]
 
-    Layer 2 is independently exploitable without the Layer 1 quic-go bug: an
-    attacker who can open and cancel QUIC streams at the declared initial limit
-    can still accumulate proxy goroutines if the upstream is slow enough that
-    cancellation arrives before the upstream responds.
-
-    Test topology (two containers on a shared Docker bridge network):
-      [attack client on host]
-              |
-              | UDP :443, QUIC h3
-              v
-      [proxy container — caddy:2.11.4]  --cpus=1  <- CPU measured here
-              |
-              | HTTP/1.1 TCP, Docker bridge (hostname: backend)
-              v
-      [backend container — python:3.11-slim]
-        sleeps 50ms per request before responding
-
-    The 50ms upstream delay creates a window during which the client can send
-    STOP_SENDING, causing the QUIC stream to close while the proxy goroutine
-    remains alive waiting for the backend. The backend is on the shared Docker
-    bridge network and reachable from the proxy as 'backend:8080'.
+    The backend exposes GET /metrics → {"active": N} on port 18080 (host-mapped).
+    The exploit script sends rapid STOP_SENDING streams and polls /metrics to
+    measure the peak active count. CPU on the proxy container is a secondary signal.
 
     Assumptions:
     - A1: The implementation can be forced to grant MAX_STREAMS credit on
@@ -72,8 +49,8 @@ hypothesis:
     - A5: No application-layer stream-churn or reset-rate limit exists on the
           HTTP/3 frontend or proxy layer.
     - A6: The client can predict the server's packet numbers for RESET_STREAM
-          frames sent in response to STOP_SENDING frames, and time premature
-          ACKs to accelerate stream closure without triggering protocol violations.
+          frames and time premature ACKs to accelerate stream closure without
+          triggering protocol violations.
     - A7: The client can predict the server's MAX_STREAMS frames and prematurely
           open streams using expected credit, increasing stream churn rate.
 
@@ -102,20 +79,46 @@ target:
     - name: backend
       role: upstream
       docker_image: "python:3.11-slim"
+      ports: "18080:8080/tcp"
       command:
         - "python3"
         - "-c"
         - |
-          import time
+          import time, threading, json
           from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          _lock = threading.Lock()
+          _active = 0
+          _peak = 0
+
           class H(BaseHTTPRequestHandler):
               def do_GET(self):
-                  time.sleep(0.05)
-                  self.send_response(200)
-                  self.end_headers()
-                  self.wfile.write(b"OK\n")
+                  global _active, _peak
+                  if self.path == '/metrics':
+                      with _lock:
+                          data = json.dumps({"active": _active, "peak": _peak}).encode()
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/json')
+                      self.end_headers()
+                      self.wfile.write(data)
+                      return
+                  with _lock:
+                      _active += 1
+                      if _active > _peak:
+                          _peak = _active
+                  try:
+                      time.sleep(0.05)
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(b"OK\n")
+                  finally:
+                      with _lock:
+                          _active -= 1
               def log_message(self, *a): pass
-          HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+
+          srv = HTTPServer(("0.0.0.0", 8080), H)
+          srv.daemon_threads = True
+          srv.serve_forever()
 
 assumptions:
   - id: A1
@@ -139,31 +142,56 @@ assumptions:
     necessity: favorable
 
   - id: A6
-    description: "The client can predict the server's packet numbers used for carrying RESET_STREAM frames sent in response to STOP_SENDING frames, and time premature ACK frames to accelerate stream closure without triggering protocol violations."
+    description: "The client can predict the server's packet numbers used for carrying RESET_STREAM frames sent in response to STOP_SENDING frames, and time premature ACK frames to accelerate stream closure."
     necessity: favorable
 
   - id: A7
-    description: "The client can predict the server's MAX_STREAMS frames and prematurely open streams using the stream credit it expects to receive before it explicitly receives it, increasing stream churn rate while keeping the server from detecting violations."
+    description: "The client can predict the server's MAX_STREAMS frames and prematurely open streams using the stream credit it expects to receive before it explicitly receives it."
     necessity: favorable
 
 suspected_mechanism:
   - step: 1
-    action: "The client establishes a QUIC connection to the proxy container's HTTP/3 endpoint on :443 and repeatedly opens short-lived bidirectional streams carrying HTTP/3 GET requests."
+    action: >
+      Start attack: open multiple QUIC connections to localhost:443 using aioquic
+      with ALPN h3. For each connection, obtain stream IDs and send HTTP/3 HEADERS
+      frames (method GET, path /, scheme https) WITHOUT end_stream=True — the
+      stream must remain open so STOP_SENDING can be sent.
 
   - step: 2
-    action: "For each incoming HTTP/3 stream, Caddy dispatches a proxy goroutine that acquires a backend HTTP/1.1 connection from the pool and forwards the request to backend:8080. The backend sleeps 50ms before responding, leaving the proxy goroutine alive during that window."
+    action: >
+      Immediately after sending HEADERS (do NOT wait for a response), send
+      STOP_SENDING on the same stream ID with error code 0. This tells the server
+      the client no longer wants the response and triggers Caddy to send
+      RESET_STREAM. The QUIC stream closes at the transport level.
+      In aioquic: call proto._quic.stop_stream(stream_id, error_code=0)
+      then proto.transmit() immediately after sending headers.
 
   - step: 3
-    action: "Before the backend responds (within the 50ms sleep window), the client sends a STOP_SENDING frame on the QUIC stream. quic-go responds with RESET_STREAM and closes the stream at the transport level, recycling the stream credit prematurely (A1). The client immediately opens a new stream using the recycled credit."
+    action: >
+      After each STOP_SENDING, immediately open a new stream and repeat. Use
+      asyncio with concurrent tasks (not threads) so many streams can be in
+      flight simultaneously within a single event loop. Target rate: 100-500
+      STOP_SENDING cancellations per second total across all connections.
+      Do NOT use end_stream=True (FIN) — that sends a complete request; we need
+      STOP_SENDING (cancellation) to test whether the backend proxy goroutine
+      is left alive after the QUIC stream is cancelled.
 
   - step: 4
-    action: "Caddy's proxy goroutine for the cancelled stream continues waiting for the backend's HTTP/1.1 response because HTTP/1.1 has no stream-level abort (A3). The goroutine holds a backend connection in the pool and blocks until the 50ms sleep completes."
-
-  - step: 5
-    action: "Under sustained attack: stream credit recycling enables high churn rate; at any point in time there are N = churn_rate * 0.05s proxy goroutines alive simultaneously. Measure: Caddy container CPU via docker stats. Increase churn rate until CPU saturates at --cpus=1 (100% of one core)."
-
-  - step: 6
-    action: "Control experiment: adjust upstream sleep to 0ms (replace time.sleep(0.05) with no sleep). Proxy goroutines should retire immediately — CPU should drop to baseline level. This isolates Layer 2 (proxy goroutine accumulation) from Layer 1 (quic-go stream credit recycling)."
+    action: >
+      While attacking, poll GET http://localhost:18080/metrics every 0.5 seconds
+      using the requests library (or urllib). Log the "active" field — this is
+      the number of backend requests currently in flight. If A3 holds, "active"
+      will grow above 0 and stay elevated (around churn_rate * 0.05s) even though
+      all QUIC streams were cancelled with STOP_SENDING. Report peak "active" count
+      and average "active" count during the attack in the footer output.
+      Print the footer lines in this exact format:
+        [HYPOGENIE:PROTOCOL_NEGOTIATED=h3]
+        [HYPOGENIE:CONNECTIONS_ATTEMPTED=N]
+        [HYPOGENIE:CONNECTIONS_TERMINATED_BY_SERVER=N]
+        [HYPOGENIE:AVG_LIFETIME_S=N]
+        [HYPOGENIE:BACKEND_PEAK_ACTIVE=N]
+        [HYPOGENIE:BACKEND_AVG_ACTIVE=N]
+        [HYPOGENIE:STREAMS_CANCELLED=N]
 
 rfc_sections:
   - rfc: RFC 9000
@@ -172,7 +200,7 @@ rfc_sections:
 
   - rfc: RFC 9000
     section: "3.5"
-    dos_relevance: "Describes solicited stream state transitions involving RESET_STREAM and STOP_SENDING. The gap between transport-level stream closure and in-flight backend proxy request completion is the core of the Layer 2 accumulation mechanism."
+    dos_relevance: "Describes solicited stream state transitions involving RESET_STREAM and STOP_SENDING. The gap between QUIC stream closure and in-flight backend proxy request completion is the core of the Layer 2 accumulation mechanism."
 
   - rfc: RFC 9000
     section: "19.11"
@@ -180,7 +208,7 @@ rfc_sections:
 
   - rfc: RFC 9114
     section: "4.1.1"
-    dos_relevance: "Describes HTTP/3 request cancellation. When the client cancels via STOP_SENDING, the proxy layer must decide whether and how quickly to propagate that cancellation to the upstream HTTP/1.1 connection. RFC 9114 does not mandate prompt upstream cancellation, leaving proxy implementations vulnerable to goroutine accumulation."
+    dos_relevance: "Describes HTTP/3 request cancellation via STOP_SENDING. The proxy layer must decide whether to propagate cancellation to the upstream HTTP/1.1 connection; RFC 9114 does not mandate it, leaving proxy implementations vulnerable to goroutine accumulation."
 
 related_work:
   - type: cve

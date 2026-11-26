@@ -468,6 +468,7 @@ def _start_aux_service(svc, network_name: str) -> str:
             f"Cannot pull aux service image {image!r} for service {svc.name!r}"
         )
 
+    aux_port_args = _port_args(svc.ports) if svc.ports else []
     cmd = [
         "docker", "run", "-d",
         "--name",     f"hypogenie-{_run_id}-{svc.name}",
@@ -475,6 +476,7 @@ def _start_aux_service(svc, network_name: str) -> str:
         "--network",  network_name,
         "--add-host=host.docker.internal:host-gateway",
     ]
+    cmd += aux_port_args
     for k, v in svc.env_vars.items():
         cmd += ["-e", f"{k}={v}"]
     cmd.append(image)

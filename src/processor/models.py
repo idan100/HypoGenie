@@ -24,6 +24,7 @@ class ServiceSpec:
     server_config: str = ""             # config hint passed to Setup Developer LLM (target only)
     command: list[str] = field(default_factory=list)        # overrides Docker CMD if non-empty
     env_vars: dict[str, str] = field(default_factory=dict)  # additional env vars
+    ports: str = ""        # space-separated "host:container/proto" mappings, e.g. "18080:8080/tcp"
 
 
 @dataclass
