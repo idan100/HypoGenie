@@ -1295,9 +1295,60 @@ def main():
     parser.add_argument("--expect", default="CONFIRMED_DOS",
                         choices=["CONFIRMED_DOS", "NO_DOS_EFFECT"],
                         help="Expected verdict for test-suite mode")
+    parser.add_argument(
+        "--suggest-next",
+        metavar="VERDICT_PATH",
+        help=(
+            "Path to a verdict.json (or its parent output directory) from a previous run. "
+            "Reads pivot candidates and generates new hypothesis YAMLs for each viable pivot. "
+            "Writes suggested_<pivot_id>.yaml files into a 'suggested/' subdirectory next to "
+            "the verdict.json. Does not run the pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--suggest-out",
+        metavar="DIR",
+        default=None,
+        help="Override output directory for --suggest-next (default: suggested/ next to verdict.json)",
+    )
+    parser.add_argument(
+        "--suggest-max",
+        metavar="N",
+        type=int,
+        default=3,
+        help="Max number of suggestions to generate (default: 3)",
+    )
     args = parser.parse_args()
 
-    if args.test_suite:
+    if args.suggest_next:
+        from suggest_next.suggest_next import run as _suggest_run
+        suggestions = _suggest_run(
+            args.suggest_next,
+            out_dir=args.suggest_out,
+            max_suggestions=args.suggest_max,
+        )
+        if suggestions:
+            print(f"\nGenerated {len(suggestions)} hypothesis suggestion(s):")
+            for s in suggestions:
+                out_root = args.suggest_out or str(
+                    (Path(args.suggest_next) / "suggested"
+                     if Path(args.suggest_next).is_dir()
+                     else Path(args.suggest_next).parent / "suggested")
+                )
+                fname = f"suggested_{s.pivot_id.lower().replace(' ', '_')}.yaml"
+                fpath = Path(out_root) / fname
+                print(f"  [{s.source_verdict}→] {s.pivot_id}: {s.pivot_label}")
+                print(f"    {fpath}")
+                if s.warnings:
+                    for w in s.warnings:
+                        print(f"    ⚠ {w}")
+            print(
+                "\nTo run a suggestion:\n"
+                f"  python3 hypogenie.py --input <suggested_file.yaml>"
+            )
+        else:
+            print("No suggestions generated.")
+    elif args.test_suite:
         run_test_suite(args.test_suite, args.expect)
     elif args.input:
         run_single(args.input)
