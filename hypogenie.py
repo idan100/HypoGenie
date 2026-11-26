@@ -946,6 +946,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
     findings: list = []
     lifecycle_result: "LifecycleResult | None" = None
     pipeline_log: list = []
+    _assumptions_refuted_flag: bool = False
 
     try:
         # ── 1. YAML Parser ─────────────────────────────────────────────────────
@@ -975,47 +976,41 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         verdicts = ledger.to_verdicts()
         print(f"  verdicts={len(verdicts)} findings={len(findings)}")
 
-        # Assumption gate: if ANY required assumption is refuted → INFEASIBLE for
-        # that attack path.  A single refuted necessary assumption is sufficient to
-        # invalidate the attack; waiting for all to be refuted is overly strict and
-        # would let the pipeline continue when a core precondition is disproven.
-        # Unverified/unclear assumptions do not trigger INFEASIBLE (unknown ≠ refuted).
-        # Alternative paths that the pivot mechanism may surface are unaffected.
-        if ledger.any_critical_refuted():
-            refuted_records = ledger.critical_refuted()
-            required_refuted = [r.assumption_id for r in refuted_records]
-            # Build per-assumption evidence summary for the notes field.
-            refuted_details = []
-            for rec in refuted_records:
-                ev_snippets = (rec.evidence.contradicting_evidence
-                               or rec.evidence.source_refs or [])
-                ev_str = "; ".join(ev_snippets[:2]) if ev_snippets else "no source snippet"
-                refuted_details.append(f"{rec.assumption_id}: {ev_str}")
-            infeasible_notes = (
-                f"PATCH CONFIRMED — required assumption(s) refuted by source analysis: "
-                + " | ".join(refuted_details)
+        # Print per-assumption status table so the terminal always shows each verdict.
+        _assumption_status_lines = []
+        for _rec in ledger.all():
+            _ev = ("; ".join((_rec.evidence.contradicting_evidence
+                              or _rec.evidence.supporting_evidence
+                              or _rec.evidence.source_refs)[:1]) or "—")[:100]
+            _assumption_status_lines.append(
+                f"    {_rec.assumption_id} [{_rec.necessity}] {_rec.status.value} — {_ev}"
             )
-            print(f"[hypogenie:{_id}] Required assumption(s) refuted → INFEASIBLE")
-            print(f"[hypogenie:{_id}] {infeasible_notes}")
-            pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "failed",
-                                  "detail": f"INFEASIBLE — required assumptions refuted: {required_refuted}"})
-            for name in ("5/7 Exploit Planner", "6/7 Builder", "7/7 DoS Verifier"):
-                n, lbl = name.split(" ", 1)
-                pipeline_log.append({"stage": n, "name": lbl, "status": "skipped",
-                                     "detail": "Skipped (INFEASIBLE)"})
-            result = {"verdict": Verdict.INFEASIBLE, "baseline": {}, "attack": {},
-                      "attack2": {}, "triggered": [], "phases": [], "thresholds_config": {},
-                      "notes": infeasible_notes,
-                      "infeasible_reason": "ASSUMPTIONS_REFUTED_BY_PATCH",
-                      "refuted_assumptions": required_refuted,
-                      "hypothesis_verdict": Verdict.HYPOTHESIS_DISPROVEN}
-            _write_outputs(out_dir, ctx, None, result, verdicts, findings,
-                           ledger=ledger, pipeline_log=pipeline_log)
-            return result
+        print(f"  Assumption analysis ({len(ledger.all())} total):")
+        for _line in _assumption_status_lines:
+            print(_line)
+
+        # When required assumptions are refuted the pipeline does NOT stop.
+        # The Exploit Planner (stage 5) will enumerate bypass/pivot candidates
+        # specifically aimed at circumventing the patch.  The verifier (stage 7)
+        # then provides empirical confirmation of whether any bypass works.
+        # Only if the builder/verifier cannot run does the run end early.
+        _assumptions_refuted_flag = ledger.any_critical_refuted()
+        if _assumptions_refuted_flag:
+            _refuted_ids = [r.assumption_id for r in ledger.critical_refuted()]
+            print(f"[hypogenie:{_id}] Required assumption(s) refuted: {_refuted_ids} — "
+                  f"continuing to Exploit Planner for patch-bypass pivot enumeration")
+            pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "warn",
+                                  "detail": (f"assumptions refuted: {_refuted_ids}; "
+                                             f"proceeding to pivot enumeration")})
+        else:
+            pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "ok",
+                                  "detail": ""})
 
         n_confirmed = sum(1 for v in verdicts if v.status == "confirmed")
-        pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "ok",
-                              "detail": f"{len(findings)} finding(s), {n_confirmed}/{len(verdicts)} assumptions confirmed"})
+        # Append detail line only when no warn entry was already added above.
+        if not _assumptions_refuted_flag:
+            pipeline_log.append({"stage": "4/7", "name": "Gap Finder", "status": "ok",
+                                  "detail": f"{len(findings)} finding(s), {n_confirmed}/{len(verdicts)} assumptions confirmed"})
 
         # ── 4b. Lifecycle applicability assessment ─────────────────────────────
         # Runs after Gap Finder (findings are inputs) and before Exploit Planner
@@ -1162,6 +1157,41 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             verify_result, verdicts, plan, ctx, ledger=ledger if 'ledger' in dir() else None
         )
         verify_result["hypothesis_verdict"] = hypothesis_verdict
+
+        # Annotate when assumptions were statically refuted but we ran anyway.
+        _ledger_ref = ledger if 'ledger' in dir() else None
+        if _assumptions_refuted_flag:
+            _refuted_ids = [r.assumption_id for r in _ledger_ref.critical_refuted()] if _ledger_ref else []
+            if verdict == Verdict.CONFIRMED_DOS:
+                verify_result["patch_bypass"] = True
+                verify_result["notes"] = (
+                    f"PATCH BYPASS CONFIRMED — required assumption(s) {_refuted_ids} were "
+                    f"refuted by source analysis but exploit SUCCEEDED. "
+                    + (verify_result.get("notes") or "")
+                )
+            else:
+                verify_result["patch_bypass"] = False
+                verify_result["notes"] = (
+                    f"PATCH CONFIRMED — required assumption(s) {_refuted_ids} refuted by "
+                    f"source analysis AND exploit attempt found no effect. "
+                    + (verify_result.get("notes") or "")
+                )
+
+        # Per-assumption status in result for every run.
+        if _ledger_ref is not None:
+            verify_result["assumption_analysis"] = [
+                {
+                    "id":        r.assumption_id,
+                    "necessity": r.necessity,
+                    "status":    r.status.value,
+                    "evidence":  ("; ".join(
+                        (r.evidence.contradicting_evidence
+                         or r.evidence.supporting_evidence
+                         or r.evidence.source_refs)[:2]) or "—")[:200],
+                }
+                for r in _ledger_ref.all()
+            ]
+
         print(f"\n[hypogenie:{_id}] *** VERDICT: {verdict} | HYPOTHESIS: {hypothesis_verdict} ***\n")
         verifier_status = "ok" if verdict == Verdict.CONFIRMED_DOS else (
             "warn" if verdict == Verdict.INCONCLUSIVE else "failed"
