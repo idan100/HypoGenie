@@ -516,7 +516,7 @@ class AttributionEngine:
     """
 
     # Protocols for which make_control_fn provides a usable differential control
-    _PROTOCOLS_WITH_CONTROLS: frozenset[str] = frozenset({"HTTP/2", "gRPC", "QUIC", "DNS-over-TLS", "DNS/TLS"})
+    _PROTOCOLS_WITH_CONTROLS: frozenset[str] = frozenset({"HTTP/2", "gRPC", "QUIC", "DNS-over-TLS", "DNS/TLS", "TCP"})
 
     def __init__(self):
         self._extractor = WorkloadExtractor()
