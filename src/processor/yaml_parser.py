@@ -1,7 +1,7 @@
 import warnings
 import yaml
 from pathlib import Path
-from .models import HypothesisContext, Assumption, RFCSection
+from .models import HypothesisContext, Assumption, RFCSection, ServiceSpec
 
 VALID_DOS_CLASSES = {
     "resource_exhaustion",   # CWE-400, CWE-770, CWE-774 — connection/fd/thread pool limits
@@ -148,6 +148,40 @@ def parse(yaml_path: str) -> HypothesisContext:
     docker_image = tgt.get("docker_image", None)
     server_config = tgt.get("server_config", "") or ""
 
+    # ── services (multi-container topology) ────────────────────────────────────
+    services_raw = tgt.get("services", []) or []
+    services: list[ServiceSpec] = []
+    if services_raw:
+        for i, svc in enumerate(services_raw):
+            if not isinstance(svc, dict):
+                raise ValueError(f"target.services[{i}] must be a mapping")
+            svc_name = str(svc.get("name", "")).strip()
+            svc_image = str(svc.get("docker_image", "")).strip()
+            svc_role = str(svc.get("role", "")).strip()
+            if not svc_name:
+                raise ValueError(f"target.services[{i}] is missing 'name'")
+            if not svc_image:
+                raise ValueError(f"target.services[{i}] ({svc_name!r}) is missing 'docker_image'")
+            if not svc_role:
+                raise ValueError(f"target.services[{i}] ({svc_name!r}) is missing 'role'")
+            raw_cmd = svc.get("command", []) or []
+            if isinstance(raw_cmd, str):
+                raw_cmd = [raw_cmd]
+            services.append(ServiceSpec(
+                name=svc_name,
+                docker_image=svc_image,
+                role=svc_role,
+                server_config=str(svc.get("server_config", "") or ""),
+                command=list(raw_cmd),
+                env_vars=dict(svc.get("env", {}) or {}),
+            ))
+        target_roles = [s for s in services if s.role == "target"]
+        if len(target_roles) != 1:
+            raise ValueError(
+                f"target.services must have exactly one entry with role=target, "
+                f"got {len(target_roles)}"
+            )
+
     # ── suspected_mechanism ────────────────────────────────────────────────────
     # list of {step: int, action: str} dicts; silently ignored if absent or malformed
     suspected_mechanism = []
@@ -177,6 +211,7 @@ def parse(yaml_path: str) -> HypothesisContext:
         related_work=related_work,
         docker_image=docker_image,
         server_config=server_config,
+        services=services,
         suspected_mechanism=suspected_mechanism,
         validation=validation,
     )

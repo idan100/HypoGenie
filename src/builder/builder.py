@@ -225,18 +225,24 @@ def _setup_critic(product: str, entry_point: str, setup: dict) -> bool:
 
 def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
           docker_image: str | None = None, protocol: str = "HTTP/2",
-          repo_url: str = "", server_config_hint: str = "") -> dict:
+          repo_url: str = "", server_config_hint: str = "",
+          services: list | None = None) -> dict:
     """
-    Build and start a server container for the given product/version.
+    Build and start a server container (or multi-container environment) for the
+    given product/version.
 
-    Args:
-        product:     e.g. "nginx"
-        version:     e.g. "1.25.3"
-        entry_point: human description of the protocol/port, e.g. "TCP port 443, HTTPS"
+    When `services` is a non-empty list of ServiceSpec objects, delegates to
+    _build_multi() which creates a Docker bridge network, starts all supporting
+    services first, then starts the role='target' service with ports exposed.
+    docker_image and server_config_hint are ignored in that case.
 
     Returns:
-        dict with keys: container_id, image, config_path, ports, run_dir
+        dict with keys: container_id, image, config_path, ports, run_dir,
+        and optionally aux_container_ids and network_name for multi-container runs.
     """
+    if services:
+        return _build_multi(services, protocol, entry_point, product, version, repo_url)
+
     run_dir = _WORKSPACE / _run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -263,6 +269,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
                     "docker", "run", "-d",
                     "--name", f"hypogenie-{_run_id}",
                     "--cpus", "1",
+                    "--add-host=host.docker.internal:host-gateway",
                     "-v", f"{_CERTS_DIR}/server.crt:/certs/server.crt:ro",
                     "-v", f"{_CERTS_DIR}/server.key:/certs/server.key:ro",
                 ] + port_args + [image]
@@ -302,6 +309,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
                     "docker", "run", "-d",
                     "--name", f"hypogenie-{_run_id}",
                     "--cpus", "1",
+                    "--add-host=host.docker.internal:host-gateway",
                     "-v", f"{_CERTS_DIR}/server.crt:/certs/server.crt:ro",
                     "-v", f"{_CERTS_DIR}/server.key:/certs/server.key:ro",
                 ] + port_args + [image]
@@ -376,6 +384,7 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
         "docker", "run", "-d",
         "--name", f"hypogenie-{_run_id}",
         "--cpus", "1",
+        "--add-host=host.docker.internal:host-gateway",
         "-v", f"{certs_dir}/server.crt:/certs/server.crt:ro",
         "-v", f"{certs_dir}/server.key:/certs/server.key:ro",
     ]
@@ -405,11 +414,212 @@ def build(product: str, version: str, entry_point: str = "TCP port 443, HTTPS",
     }
 
 
-def teardown(container_id: str) -> None:
-    """Stop and remove a container."""
-    print(f"  [builder:{_run_id}] Stopping {container_id[:12]} ...")
+def _stop_container(container_id: str) -> None:
     subprocess.run(["docker", "stop", container_id], capture_output=True, timeout=30)
-    subprocess.run(["docker", "rm", container_id], capture_output=True, timeout=30)
+    subprocess.run(["docker", "rm",   container_id], capture_output=True, timeout=30)
     if container_id in _running_containers:
         _running_containers.remove(container_id)
-    print(f"  [builder:{_run_id}] Container removed.")
+
+
+def teardown(container_info: "dict | str") -> None:
+    """Stop and remove container(s) and any shared Docker network.
+
+    Accepts either a container_id string (backward compat) or the dict
+    returned by build() / _build_multi(), which may include aux_container_ids
+    and a network_name to remove.
+    """
+    if isinstance(container_info, str):
+        print(f"  [builder:{_run_id}] Stopping {container_info[:12]} ...")
+        _stop_container(container_info)
+        print(f"  [builder:{_run_id}] Container removed.")
+        return
+
+    primary = container_info.get("container_id")
+    if primary:
+        print(f"  [builder:{_run_id}] Stopping primary {primary[:12]} ...")
+        _stop_container(primary)
+
+    for aux_id in container_info.get("aux_container_ids", []):
+        print(f"  [builder:{_run_id}] Stopping aux container {aux_id[:12]} ...")
+        _stop_container(aux_id)
+
+    network = container_info.get("network_name")
+    if network:
+        print(f"  [builder:{_run_id}] Removing network {network} ...")
+        subprocess.run(["docker", "network", "rm", network],
+                       capture_output=True, timeout=30)
+
+    print(f"  [builder:{_run_id}] Teardown complete.")
+
+
+# ── multi-container build ─────────────────────────────────────────────────────
+
+def _start_aux_service(svc, network_name: str) -> str:
+    """Pull and start a non-target service on the shared Docker network.
+
+    svc is a ServiceSpec (or any object with .name, .docker_image, .command,
+    .env_vars attributes).  Returns the container_id.
+    """
+    image = svc.docker_image
+    if _image_exists_locally(image):
+        print(f"  [builder:{_run_id}] Aux image {image} found locally.")
+    elif not _docker_pull(image):
+        raise RuntimeError(
+            f"Cannot pull aux service image {image!r} for service {svc.name!r}"
+        )
+
+    cmd = [
+        "docker", "run", "-d",
+        "--name",     f"hypogenie-{_run_id}-{svc.name}",
+        "--hostname", svc.name,
+        "--network",  network_name,
+        "--add-host=host.docker.internal:host-gateway",
+    ]
+    for k, v in svc.env_vars.items():
+        cmd += ["-e", f"{k}={v}"]
+    cmd.append(image)
+    if svc.command:
+        cmd += list(svc.command)
+
+    print(f"  [builder:{_run_id}] Starting aux '{svc.name}': {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"docker run failed for aux service {svc.name!r}: "
+            f"{result.stderr.strip()[:400]}"
+        )
+    cid = result.stdout.strip()
+    print(f"  [builder:{_run_id}] Aux '{svc.name}' started: {cid[:12]}")
+    return cid
+
+
+def _build_multi(services: list, protocol: str, entry_point: str,
+                 product: str, version: str, repo_url: str) -> dict:
+    """Build and start a multi-container environment described by a services list.
+
+    Exactly one service must have role='target'; all others are started first
+    (so backends are ready when the target proxy connects).  Only the target
+    has its ports exposed to the host and is CPU-constrained to 1 core.
+    Returns the same dict shape as build() plus aux_container_ids and network_name.
+    """
+    import time as _time
+
+    run_dir = _WORKSPACE / _run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create an isolated bridge network for this run
+    network_name = f"hypogenie-net-{_run_id}"
+    r = subprocess.run(
+        ["docker", "network", "create", network_name],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create Docker network {network_name!r}: {r.stderr.strip()}"
+        )
+    print(f"  [builder:{_run_id}] Created network: {network_name}")
+
+    target_svc = next(s for s in services if s.role == "target")
+    aux_svcs   = [s for s in services if s.role != "target"]
+
+    aux_container_ids: list[str] = []
+
+    # Start supporting services before the target so they're reachable on DNS
+    for svc in aux_svcs:
+        cid = _start_aux_service(svc, network_name)
+        aux_container_ids.append(cid)
+        _running_containers.append(cid)
+
+    if aux_container_ids:
+        _time.sleep(1)  # give backends a moment to bind their ports
+
+    # Resolve target image
+    image = target_svc.docker_image
+    effective_product = image.split(":")[0].split("/")[-1]
+    effective_version = image.split(":")[-1] if ":" in image else version
+
+    if _image_exists_locally(image):
+        print(f"  [builder:{_run_id}] Target image {image} found locally.")
+    elif not _docker_pull(image):
+        print(f"  [builder:{_run_id}] Pull failed — falling back to source build ...")
+        image, _ = _dockerfile_build(
+            effective_product, effective_version, entry_point, protocol, repo_url, run_dir
+        )
+
+    # Generate server config for the target via LLM
+    setup = _setup_developer(
+        effective_product, effective_version, entry_point,
+        server_config_hint=target_svc.server_config,
+    )
+    critic_ok = _setup_critic(effective_product, entry_point, setup)
+    if not critic_ok:
+        user_retry = (
+            SETUP_DEVELOPER_USER_TEMPLATE.format(
+                product=effective_product, version=effective_version,
+                entry_point=entry_point,
+            )
+            + "\n\nIMPORTANT: The config MUST reference /certs/server.crt and /certs/server.key exactly."
+        )
+        print(f"  [builder:{_run_id}] Retrying Setup Developer with cert path hint ...")
+        raw = _llm.call_llm(
+            SETUP_DEVELOPER_SYSTEM, user_retry,
+            role_env="BUILDER_MODEL", json_mode=True,
+        )
+        setup = json.loads(_extract_json(raw))
+        if not _setup_critic(effective_product, entry_point, setup):
+            raise RuntimeError("Setup Developer could not produce valid cert paths after retry")
+
+    conf_file = run_dir / "server.conf"
+    conf_file.write_text(setup["config"])
+    print(f"  [builder:{_run_id}] Target config written to {conf_file}")
+
+    # Build docker run for target — same QUIC TCP+UDP port dedup as single-container path
+    raw_ports = setup["ports"]
+    if protocol.upper().startswith("QUIC"):
+        existing = set(raw_ports.split())
+        extras = [m[:-4] + "/tcp" for m in existing
+                  if m.endswith("/udp") and m[:-4] + "/tcp" not in existing]
+        if extras:
+            raw_ports = raw_ports + " " + " ".join(extras)
+    port_args = _port_args(raw_ports)
+
+    config_path = setup["config_path"]
+    env_vars    = {**setup.get("env_vars", {}), **target_svc.env_vars}
+
+    cmd = [
+        "docker", "run", "-d",
+        "--name",     f"hypogenie-{_run_id}-{target_svc.name}",
+        "--hostname", target_svc.name,
+        "--network",  network_name,
+        "--cpus",     "1",
+        "--add-host=host.docker.internal:host-gateway",
+        "-v", f"{str(_CERTS_DIR)}/server.crt:/certs/server.crt:ro",
+        "-v", f"{str(_CERTS_DIR)}/server.key:/certs/server.key:ro",
+    ]
+    for k, v in env_vars.items():
+        cmd += ["-e", f"{k}={v}"]
+    if config_path:
+        cmd += ["-v", f"{conf_file}:{config_path}:ro"]
+    cmd += port_args + [image]
+    if target_svc.command:
+        cmd += list(target_svc.command)
+
+    print(f"  [builder:{_run_id}] Starting target container: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(f"docker run failed for target: {result.stderr.strip()[:400]}")
+
+    container_id = result.stdout.strip()
+    _running_containers.append(container_id)
+    print(f"  [builder:{_run_id}] Target container started: {container_id[:12]}")
+
+    return {
+        "container_id":      container_id,
+        "image":             image,
+        "config_path":       config_path,
+        "ports":             setup["ports"],
+        "run_dir":           str(run_dir),
+        "env_vars":          env_vars,
+        "aux_container_ids": aux_container_ids,
+        "network_name":      network_name,
+    }

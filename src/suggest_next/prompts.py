@@ -13,14 +13,43 @@ hypothesis:
      why this new angle might still work despite the patch, and what the
      pipeline should observe.>
 
-  dos_class: <cpu | memory | resource_exhaustion | disk_exhaustion | infinite_loop>
+  # One of: memory | cpu | connection | resource_exhaustion | resource_lifecycle
+  #         | missing_throttling | state_machine_abuse | excessive_iteration
+  #         | algorithmic_complexity | decompression_bomb | disk_exhaustion
+  #         | infinite_loop | recursion | regex | bandwidth
+  dos_class: resource_exhaustion
 
 target:
   repo: <GitHub repo URL, unchanged from original>
   version: <version string, unchanged from original>
   protocol: <protocol, unchanged from original>
   entry_point: <entry point, unchanged from original>
-  docker_image: <docker image, unchanged or null if none>
+
+  # ── Option A: single container (most hypotheses) ───────────────────────────
+  docker_image: <docker image tag, unchanged from original or null if none>
+  server_config: |           # optional config hint for the target server; omit if not needed
+    <nginx.conf / Caddyfile / haproxy.cfg / …>
+
+  # ── Option B: multi-container (use INSTEAD of docker_image/server_config) ──
+  # Use when the new pivot requires a separate upstream, sidecar, or database.
+  # Exactly one service must have role: target — that is the DoS target.
+  # All others are started first; each is reachable by its name as a DNS hostname.
+  #
+  # services:
+  #   - name: proxy
+  #     role: target
+  #     docker_image: "<image>:<tag>"
+  #     server_config: |
+  #       reverse_proxy upstream:8080
+  #   - name: upstream
+  #     role: upstream          # any label except "target"
+  #     docker_image: "<image>:<tag>"
+  #     command:                # overrides image CMD; useful for inline scripts
+  #       - "python3"
+  #       - "-c"
+  #       - "..."
+  #     env:
+  #       KEY: value
 
 assumptions:
   - id: A1
@@ -57,6 +86,9 @@ Rules:
   assumptions from the original that were REFUTED.
 - dos_class must match what the pivot is actually trying to do.
 - suspected_mechanism steps should be concrete packet/connection actions, not vague.
+- Use Option B (services) only when the pivot explicitly requires a multi-container
+  architecture (e.g., testing a reverse proxy path, an upstream amplification, or a
+  sidecar resource leak). For single-server pivots, use Option A.
 - If the original was tested and found INCONCLUSIVE, describe in the description
   what the ambiguity was and why this new angle should resolve it.
 """

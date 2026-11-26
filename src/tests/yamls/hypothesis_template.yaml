@@ -1,60 +1,114 @@
 hypothesis:
   description: |
-    <One-paragraph summary of the vulnerability mechanism. Explain the RFC gap
-    or design choice that enables the attack, and what the server does (or fails
-    to do) that makes it exploitable.>
+    <2-4 paragraph description of the attack mechanism.>
+
+    Explain the RFC gap or implementation policy that enables the attack,
+    what the server does (or fails to do) that makes it exploitable, and
+    what the pipeline should observe to confirm the DoS.
 
     Assumptions:
-    - A1: <State what must be true about the target implementation for the attack
-          to work. Phrase absence assumptions as "no X exists" rather than "X is absent".>
-    - A2: <Per-request / per-connection resource that is not bounded or reclaimed promptly.>
+    - A1: <What must be true about the target implementation for the attack
+          to work. Phrase absence assumptions as "no X exists".>
+    - A2: <Per-request / per-connection resource that is not bounded or
+          reclaimed promptly.>
     - A3: <Optional: absence of a global cap or rate limit.>
 
-  # One of: memory | cpu | connection | bandwidth | resource_exhaustion
+  # One of: memory | cpu | connection | resource_exhaustion | resource_lifecycle
+  #         | missing_throttling | state_machine_abuse | excessive_iteration
+  #         | algorithmic_complexity | decompression_bomb | disk_exhaustion
+  #         | infinite_loop | recursion | regex | bandwidth
   dos_class: resource_exhaustion
 
 target:
   repo: https://github.com/<org>/<repo>
   version: v0.0.0
-  # One of: HTTP/2 | HTTP/3 | QUIC | gRPC | DNS-over-TLS | TLS | TCP | UDP
+  # One of: HTTP/2 | HTTP/3 | QUIC | gRPC | DNS-over-TLS | DNS-over-QUIC | TCP | UDP
   protocol: HTTP/2
+  # Human-readable description of what the attack client connects to
   entry_point: "TCP port 443, TLS ALPN h2"
-  # Use an image from: docker.io, hypogenie/* local images, or a standard image tag
+
+  # ── Single-container target ──────────────────────────────────────────────────
+  # Use when the DoS target is one container (the most common case).
+  # docker_image: pull from Docker Hub or use a local tag.
+  # server_config: optional config hint forwarded to the Setup Developer LLM.
+  #   The LLM uses it to generate the actual config file (nginx.conf, Caddyfile, …).
+  #   Omit the key entirely if the image configures itself.
   docker_image: "<image>:<tag>"
-  # Optional: omit if the image handles configuration internally
   server_config: |
-    # Paste the server config block here (nginx.conf, caddy config, etc.)
+    # Paste a config template here (nginx.conf, Caddyfile, haproxy.cfg, …).
     # Remove this key entirely if not needed.
+
+  # ── Multi-container target (use instead of docker_image / server_config) ─────
+  # Use when the hypothesis requires a separate upstream, sidecar, or database —
+  # any architecture with more than one container.
+  #
+  # HypoGenie creates a Docker bridge network for the run, starts every service
+  # whose role is NOT "target" first, then starts the target. All services are
+  # reachable by their `name` as a DNS hostname within the network.
+  #
+  # Rules:
+  #   - Exactly one service must have role: target.
+  #     That service gets --cpus=1, host port bindings, and is the DoS target.
+  #   - All other services get no CPU cap and no host port bindings.
+  #   - server_config is forwarded to the Setup Developer LLM for the target only.
+  #   - command overrides the image's default CMD (useful for inline scripts).
+  #   - env sets environment variables for that service.
+  #
+  # services:
+  #   - name: proxy             # container DNS name on the shared network
+  #     role: target            # REQUIRED: exactly one service must have role: target
+  #     docker_image: "<image>:<tag>"
+  #     server_config: |        # LLM hint — may reference other services by DNS name
+  #       reverse_proxy upstream:8080
+  #
+  #   - name: upstream          # reachable as "upstream" from within the network
+  #     role: upstream          # any label except "target"
+  #     docker_image: "<image>:<tag>"
+  #     command:                # optional: overrides the image CMD
+  #       - "python3"
+  #       - "-c"
+  #       - |
+  #         import time
+  #         from http.server import BaseHTTPRequestHandler, HTTPServer
+  #         class H(BaseHTTPRequestHandler):
+  #             def do_GET(self):
+  #                 time.sleep(0.05)      # 50ms upstream delay
+  #                 self.send_response(200); self.end_headers()
+  #                 self.wfile.write(b"OK\n")
+  #             def log_message(self, *a): pass
+  #         HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+  #     env:                    # optional: environment variables
+  #       MY_VAR: "value"
 
 assumptions:
   - id: A1
-    description: "<Single sentence: what this assumption claims about the implementation>"
+    description: "<Single sentence: what this assumption claims about the implementation.>"
     # required = attack fails if refuted | favorable = weakens attack if refuted
     necessity: required
   - id: A2
-    description: "<Single sentence>"
+    description: "<Single sentence.>"
     necessity: required
   - id: A3
-    description: "<Single sentence>"
+    description: "<Single sentence.>"
     necessity: favorable
 
 suspected_mechanism:
   - step: 1
-    action: "<Concrete attacker action: what frame/packet/connection is opened>"
+    action: "<Concrete attacker action: what frame/packet/connection is opened.>"
   - step: 2
-    action: "<What the server does in response (the vulnerable behavior)>"
+    action: "<What the server does in response (the vulnerable behavior).>"
   - step: 3
-    action: "<How that server behavior accumulates / compounds under repeated steps>"
+    action: "<How that server behavior accumulates / compounds under repeated steps.>"
   - step: 4
-    action: "<The end state: what resource is exhausted and why the server cannot recover>"
+    action: "<The end state: what resource is exhausted and why the server cannot recover.>"
 
 rfc_sections:
   - rfc: RFC 0000
     section: "X.Y"
-    dos_relevance: "<What the RFC says and why the implementation's choice creates exposure>"
+    dos_relevance: "<What the RFC says and why the implementation's choice creates exposure.>"
   - rfc: RFC 0000
     section: "X.Y"
-    dos_relevance: "<Second relevant section>"
+    dos_relevance: "<Second relevant section.>"
 
 # Optional: remove entire block if no prior art
 related_work:

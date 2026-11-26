@@ -121,17 +121,26 @@ def _derive_evidence_tier(
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _release_stale_containers() -> None:
-    """Stop and remove any leftover hypogenie-* containers before starting a new run."""
+    """Stop and remove any leftover hypogenie-* containers and networks."""
     result = subprocess.run(
         ["docker", "ps", "-q", "--filter", "name=hypogenie-"],
         capture_output=True, text=True, timeout=10,
     )
     ids = result.stdout.split()
-    if not ids:
-        return
-    print(f"  [hypogenie] releasing {len(ids)} stale container(s): {ids}")
-    subprocess.run(["docker", "stop"] + ids, capture_output=True, timeout=30)
-    subprocess.run(["docker", "rm"]  + ids, capture_output=True, timeout=30)
+    if ids:
+        print(f"  [hypogenie] releasing {len(ids)} stale container(s): {ids}")
+        subprocess.run(["docker", "stop"] + ids, capture_output=True, timeout=30)
+        subprocess.run(["docker", "rm"]  + ids, capture_output=True, timeout=30)
+
+    nets = subprocess.run(
+        ["docker", "network", "ls", "-q", "--filter", "name=hypogenie-net-"],
+        capture_output=True, text=True, timeout=10,
+    )
+    net_ids = nets.stdout.split()
+    if net_ids:
+        print(f"  [hypogenie] removing {len(net_ids)} stale network(s): {net_ids}")
+        subprocess.run(["docker", "network", "rm"] + net_ids,
+                       capture_output=True, timeout=30)
 
 
 def _clone_repo(repo_url: str, version: str, dest: Path) -> str:
@@ -1067,6 +1076,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
             protocol=ctx.protocol,
             repo_url=ctx.repo_url,
             server_config_hint=getattr(ctx, "server_config", ""),
+            services=ctx.services or None,
         )
         container_id   = container_info["container_id"]
         port           = _port_from_entry_point(ctx.entry_point)
@@ -1252,7 +1262,7 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
     finally:
         if container_info.get("container_id"):
             try:
-                teardown(container_info["container_id"])
+                teardown(container_info)
             except Exception:
                 pass
 

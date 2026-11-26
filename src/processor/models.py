@@ -17,6 +17,16 @@ class RFCSection:
 
 
 @dataclass
+class ServiceSpec:
+    name: str              # container hostname on the shared Docker network
+    docker_image: str
+    role: str              # "target" = DoS target (CPU measured, ports exposed); any other = supporting
+    server_config: str = ""             # config hint passed to Setup Developer LLM (target only)
+    command: list[str] = field(default_factory=list)        # overrides Docker CMD if non-empty
+    env_vars: dict[str, str] = field(default_factory=dict)  # additional env vars
+
+
+@dataclass
 class HypothesisContext:
     description: str
     dos_class: str
@@ -27,8 +37,10 @@ class HypothesisContext:
     assumptions: list[Assumption] = field(default_factory=list)
     rfc_sections: list[RFCSection] = field(default_factory=list)
     related_work: list[dict] = field(default_factory=list)
-    docker_image: Optional[str] = None   # optional override; skips Hub pull + source build
-    server_config: str = ""              # optional server config hint for Setup Developer
+    docker_image: Optional[str] = None   # single-container override; ignored when services is set
+    server_config: str = ""              # single-container config hint; ignored when services is set
+    # multi-container topology; when non-empty, docker_image and server_config are ignored
+    services: list[ServiceSpec] = field(default_factory=list)
     # list[dict] from YAML suspected_mechanism block (step + action keys)
     suspected_mechanism: list[dict] = field(default_factory=list)
     # validation.resource_lifecycle.mode: "auto" | "enabled" | "disabled"
