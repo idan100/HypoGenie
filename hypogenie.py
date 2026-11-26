@@ -902,6 +902,10 @@ def _write_outputs(out_dir: Path, ctx, plan, verify_result: dict,
 
         # lifecycle validation
         "lifecycle_validation": _serialize_lifecycle(lifecycle_result),
+
+        # patch-bypass annotation (set when assumptions were refuted but exploit ran anyway)
+        "patch_bypass":        verify_result.get("patch_bypass"),
+        "assumption_analysis": verify_result.get("assumption_analysis"),
     }
     (out_dir / "verdict.json").write_text(json.dumps(_clean(verdict_data), indent=2))
 
@@ -1080,7 +1084,8 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
         def _exploit_fn(p, cid, h, prt, dur):
             return exploit_run(p, container_id=cid, host=h, port=prt, attack_duration_s=dur,
                                protocol=ctx.protocol, dos_class=ctx.dos_class,
-                               entry_point=ctx.entry_point)
+                               entry_point=ctx.entry_point,
+                               skip_skeleton=_assumptions_refuted_flag)
 
         _control_fn = _make_control_fn(ctx.protocol, ctx.dos_class)
         _benign_fn  = _make_benign_fn(ctx.protocol, ctx.dos_class)
@@ -1152,6 +1157,16 @@ def run_single(yaml_path: str, run_id_override: str | None = None) -> dict:
                     print(f"[hypogenie:{_id}] Pivot '{label}' error: {e}")
             if _pivot_tried and verdict == Verdict.INVALID_TEST:
                 print(f"[hypogenie:{_id}] All pivots returned INVALID_TEST — base verdict stands")
+
+        # In patch-bypass mode, REJECTED (transport overhead, no code issue) means the
+        # attack is indistinguishable from TLS noise — the patch holds — treat as NO_DOS_EFFECT.
+        if _assumptions_refuted_flag and verdict == Verdict.REJECTED:
+            verify_result["verdict"] = Verdict.NO_DOS_EFFECT
+            verdict = Verdict.NO_DOS_EFFECT
+            verify_result["notes"] = (
+                (verify_result.get("notes") or "") +
+                " [Reclassified REJECTED→NO_DOS_EFFECT: assumptions refuted + attack indistinguishable from transport overhead]"
+            )
 
         hypothesis_verdict = _compute_hypothesis_verdict(
             verify_result, verdicts, plan, ctx, ledger=ledger if 'ledger' in dir() else None

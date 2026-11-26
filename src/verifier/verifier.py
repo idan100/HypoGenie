@@ -942,6 +942,18 @@ def run(
     if attack_metrics.get("_invalid"):
         note = attack_metrics.get("_invalid_reason", "exploit script failed pre-execution validation")
         _invalid_verdict = _classify_invalid_reason(note)
+        # If the server terminated nearly all connections and no thresholds triggered,
+        # the patch/rate-limiter is actively rejecting the attack — treat as NO_DOS_EFFECT.
+        _conn_att  = attack_metrics.get("connections_attempted", 0) or 0
+        _conn_term = attack_metrics.get("connections_terminated_by_server", 0) or 0
+        if (
+            _conn_att >= 50
+            and _conn_term >= 0.9 * _conn_att
+            and not triggered
+        ):
+            _invalid_verdict = Verdict.NO_DOS_EFFECT
+            note += (f"; server terminated {_conn_term}/{_conn_att} connections — "
+                     f"reclassified→NO_DOS_EFFECT (server protecting)")
         print(f"[verifier:{_run_id}] Exploit invalid — {note}; returning {_invalid_verdict} (no escalation)")
         return {
             "verdict":    _invalid_verdict,
@@ -1012,6 +1024,20 @@ def run(
         if attack_metrics2.get("_invalid"):
             note2 = attack_metrics2.get("_invalid_reason", "exploit invalid on escalation")
             _esc_verdict = _classify_invalid_reason(note2)
+            # If the server terminated nearly all connections and no thresholds triggered
+            # in Phase 2, the server is actively protecting itself — that is NO_DOS_EFFECT,
+            # not a client-side tooling limitation (ATTACK_UNREPRESENTABLE).
+            _conn_att2  = attack_metrics2.get("connections_attempted", 0) or 0
+            _conn_term2 = attack_metrics2.get("connections_terminated_by_server", 0) or 0
+            if (
+                _esc_verdict == Verdict.ATTACK_UNREPRESENTABLE
+                and _conn_att2 >= 50
+                and _conn_term2 >= 0.9 * _conn_att2
+                and not triggered   # first attempt had no threshold crossings
+            ):
+                _esc_verdict = Verdict.NO_DOS_EFFECT
+                note2 += (f"; server terminated {_conn_term2}/{_conn_att2} connections — "
+                          f"reclassified ATTACK_UNREPRESENTABLE→NO_DOS_EFFECT (patch protecting)")
             print(f"[verifier:{_run_id}] Escalated exploit invalid — {note2}; {_esc_verdict}")
             phases.append(p2_phase)
             return {

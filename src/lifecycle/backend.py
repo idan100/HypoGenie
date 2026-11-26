@@ -59,9 +59,8 @@ _outstanding_cleanups = 0
 
 
 def _reset() -> None:
-    global (_active, _completed, _cancelled, _cleanup_pending,
-            _context_cancelled, _op_terminated, _resource_released,
-            _outstanding_cleanups)
+    global _active, _completed, _cancelled, _cleanup_pending
+    global _context_cancelled, _op_terminated, _resource_released, _outstanding_cleanups
     with _lock:
         (_active, _completed, _cancelled, _cleanup_pending,
          _context_cancelled, _op_terminated, _resource_released,
@@ -139,9 +138,8 @@ class _Handler(BaseHTTPRequestHandler):
           4. On cancel: fires context_cancelled, op_terminated, resource_released.
           5. On completion: sends "DONE\\n" final chunk.
         """
-        global (_active, _completed, _cancelled, _cleanup_pending,
-                _context_cancelled, _op_terminated, _resource_released,
-                _outstanding_cleanups)
+        global _active, _completed, _cancelled, _cleanup_pending
+        global _context_cancelled, _op_terminated, _resource_released, _outstanding_cleanups
 
         with _lock:
             _active += 1
@@ -216,9 +214,8 @@ class _Handler(BaseHTTPRequestHandler):
     # ── /work — legacy blocking endpoint ─────────────────────────────────────
 
     def _handle_work(self, duration_s: float) -> None:
-        global (_active, _completed, _cancelled, _cleanup_pending,
-                _context_cancelled, _op_terminated, _resource_released,
-                _outstanding_cleanups)
+        global _active, _completed, _cancelled, _cleanup_pending
+        global _context_cancelled, _op_terminated, _resource_released, _outstanding_cleanups
 
         with _lock:
             _active += 1
